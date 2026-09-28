@@ -22,6 +22,9 @@ import io.github.libxposed.api.XposedInterface;
  *
  * <p>H2 {@code GallerySFSFileTransferManager.doUpload}：文件真正上行小米云的出口，
  * 用于观测兜底——替换模式生效后这里不应再被触发，一旦触发说明出现了未覆盖的旁路。
+ *
+ * <p>H3 {@code SyncStateInfo.getDirtyCount}：相册界面上"正在同步 N 个照片和视频"里那个 N。
+ * 纯显示口径，不参与同步调度（调度用的是 {@code SyncStateUtil.getDirtyCount}）。
  */
 public final class GalleryHooks {
 
@@ -35,6 +38,8 @@ public final class GalleryHooks {
             "com.miui.gallery.cloud.e2ee.CloudGalleryFileUploadControllerBase";
     private static final String CLS_PROGRESS_LISTENER =
             "cn.kuaipan.android.kss.transferclient.TransferProgressListener";
+    private static final String CLS_SYNC_STATE_INFO =
+            "com.miui.gallery.base.syncstate.SyncStateInfo";
 
     private final XposedInterface mXposed;
     private final ClassLoader mClassLoader;
@@ -55,6 +60,7 @@ public final class GalleryHooks {
         hooks.installInvokeListHook();
         hooks.installUploadOutletHook();
         hooks.installAppStartHook();
+        hooks.installDirtyCountHook();
         return hooks;
     }
 
@@ -182,6 +188,66 @@ public final class GalleryHooks {
         } catch (Throwable t) {
             Logger.e("event=hook_failed method=GalleryApp.onCreate", t);
         }
+    }
+
+    /**
+     * 接管相册界面上那句"正在同步 N 个照片和视频"里的 N。
+     *
+     * <p>那个 N 来自 {@code SyncStateInfo.getDirtyCount()}，也就是数据库里
+     * {@code localFlag IN (7,8)} 的行数。替换模式下相册一批只交给我们 3 项（枚举是一批一批来的），
+     * 这 3 项传完之前 localFlag 一直是 7/8，于是数字永远停在 3 —— 后面还积压着几千项，
+     * 界面上完全看不出来。改成本模块队列的（在传 + 排队）之后才是真的"还剩多少要传"。
+     *
+     * <p>只改显示：同步调度用的是 {@code SyncStateUtil.getDirtyCount}（走
+     * {@code MiSyncProcessInfoImpl} 的 SQL），不经过这个 getter，所以不会因为报了个大数字
+     * 就被反复唤起同步任务。相册自己的 {@code updateDirtyCount} 照常按真实行数更新内部状态，
+     * 我们只是把读出来的值换掉。
+     */
+    private void installDirtyCountHook() {
+        try {
+            Class<?> infoCls = mClassLoader.loadClass(CLS_SYNC_STATE_INFO);
+            Method getDirtyCount = infoCls.getDeclaredMethod("getDirtyCount");
+            getDirtyCount.setAccessible(true);
+            mXposed.hook(getDirtyCount)
+                    .setId("gallery_dirty_count")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        try {
+                            int[] override = overrideDirtyCount();
+                            if (override != null) {
+                                return override;
+                            }
+                        } catch (Throwable t) {
+                            Logger.w("event=dirty_count_hook_failed detail=" + t);
+                        }
+                        return chain.proceed();
+                    });
+            Logger.i("event=hook_registered method=SyncStateInfo.getDirtyCount");
+        } catch (NoSuchMethodException e) {
+            Logger.e("event=method_not_found method=SyncStateInfo.getDirtyCount", e);
+        } catch (ClassNotFoundException e) {
+            Logger.e("event=class_not_found class=" + CLS_SYNC_STATE_INFO, e);
+        } catch (Throwable t) {
+            Logger.e("event=hook_failed method=SyncStateInfo.getDirtyCount", t);
+        }
+    }
+
+    /**
+     * 该报给相册的"还剩多少要传"，不该接管时返回 null 表示沿用宿主自己的数字。
+     *
+     * <p>三条不接管的理由：非替换模式（原链路照常在跑，宿主的账是对的）、队列还没建、
+     * 队列不健康（已经放行原链路，这时候宿主的口径才是真的）。
+     */
+    private int[] overrideDirtyCount() {
+        Config config = mConfig;
+        if (config == null || !config.isReplace() || !config.isReady()) {
+            return null;
+        }
+        UploadQueue queue = mQueue;
+        if (queue == null || !queue.isHealthy()) {
+            return null;
+        }
+        return queue.queuedCounts();
     }
 
     /**

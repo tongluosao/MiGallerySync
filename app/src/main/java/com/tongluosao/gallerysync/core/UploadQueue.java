@@ -308,6 +308,32 @@ public final class UploadQueue {
         return mConsecutiveFailures.get();
     }
 
+    /**
+     * 队列里还没传完的项，按 [照片数, 视频数] 分开。
+     *
+     * <p>给宿主用：相册界面上那句"正在同步 N 个照片和视频"取的是它自己的
+     * {@code SyncStateInfo.getDirtyCount()}，也就是数据库里 {@code localFlag IN (7,8)} 的行数。
+     * 替换模式下相册每批只交给我们 3 项（枚举是一批一批来的），那 3 项传完之前 localFlag 一直
+     * 是 7/8，于是那个数字永远停在 3，完全看不出后面还积压着几千项。接管它之后这个数字
+     * 才是真的"还剩多少要传"。
+     *
+     * <p>在传的项本来就在 {@link #mPending} 里（刻意不移出），所以这里不用另外加。
+     */
+    public int[] queuedCounts() {
+        synchronized (mLock) {
+            int photos = 0;
+            int videos = 0;
+            for (Task task : mPending.values()) {
+                if (task.video) {
+                    videos++;
+                } else {
+                    photos++;
+                }
+            }
+            return new int[]{photos, videos};
+        }
+    }
+
     /** 从绝对路径取文件名。只切最后一个斜杠，比 new File(path).getName() 省一次分配 */
     private static String baseName(String path) {
         int slash = path.lastIndexOf('/');
