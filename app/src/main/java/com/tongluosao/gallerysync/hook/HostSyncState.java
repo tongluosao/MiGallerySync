@@ -56,6 +56,12 @@ public final class HostSyncState {
     private final Constructor<?> mRequestCtor;
     private final Object mPowerForceType;
 
+    /**
+     * 正在上传的路数。上传队列是 3 路并发，不能再用一个布尔表示"在传" ——
+     * 任何一路先结束就把状态置假的话，宿主的 {@code UploadStatusController.mCount}
+     * 会在另外两路还在传时归零，原生界面立刻从"正在备份"退回"未备份"。
+     */
+    private int mActive;
     private boolean mUploading;
     private long mLastRefresh;
     private long mLastRequest;
@@ -115,8 +121,13 @@ public final class HostSyncState {
         return new HostSyncState(loader);
     }
 
-    /** 标记"正在上传"。重复调用只生效一次，计数必须与 endUpload 严格配对 */
+    /**
+     * 标记"正在上传"。按引用计数：只有第一路进来时才真的告诉宿主。
+     *
+     * <p>必须与 {@link #endUpload} 严格配对（调用方用 {@code try/finally} 把整个上传包住）。
+     */
     public synchronized void beginUpload() {
+        mActive++;
         if (mUploading || mController == null) {
             return;
         }
@@ -129,7 +140,25 @@ public final class HostSyncState {
         }
     }
 
+    /**
+     * 交还一路。**这里刻意不告诉宿主"传完了"** —— 一整批传输期间宿主的界面应当一直是
+     * "正在备份"，每两张之间闪一下会很难看。真正收尾由 {@link #endAll} 在队列真空闲时做。
+     */
     public synchronized void endUpload() {
+        if (mActive > 0) {
+            mActive--;
+        }
+    }
+
+    /**
+     * 队列真空闲：强制收尾，让宿主知道这一轮结束了。
+     *
+     * <p>与 {@link #endUpload} 的分工是：前者只减引用（并发下"谁最后结束"不确定），
+     * 后者由队列在"一项都没人在传"时调用。少了它，宿主界面会一直挂在"正在上传"上，
+     * 停在一个不再变化的数字上。
+     */
+    public synchronized void endAll() {
+        mActive = 0;
         if (!mUploading || mController == null) {
             return;
         }
