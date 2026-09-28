@@ -8,7 +8,6 @@
     <string name="section_webdav">WebDAV</string>
     <string name="section_behavior">同步</string>
     <string name="section_appearance">界面</string>
-    <string name="section_module">模块</string>
 
     <string name="hint_base_url">服务器地址</string>
     <string name="hint_username">用户名</string>
@@ -44,7 +43,6 @@
     <string name="theme_mode_dark">深色</string>
 
     <string name="action_test">测试连接</string>
-    <string name="action_hot_reload">热重载</string>
     <string name="action_show">显示</string>
     <string name="action_hide">隐藏</string>
 
@@ -56,11 +54,4 @@
     <string name="msg_test_auth">认证失败：用户名或密码不对</string>
     <string name="msg_test_not_writable">服务器可达，但这个目录收不了文件：%1$s</string>
     <string name="msg_fill_url">请先填写服务器地址</string>
-
-    <string name="summary_module">更新本模块后，让正在运行的相册直接加载新代码，不必强停相册</string>
-    <string name="msg_reloading">热重载中…</string>
-    <string name="msg_reload_no_service">框架未连接，无法热重载</string>
-    <string name="msg_reload_no_target">相册没在运行，下次启动就是新代码</string>
-    <string name="msg_reload_ok">相册进程 %1$d 已加载新代码</string>
-    <string name="msg_reload_failed">热重载失败：%1$s</string>
 </resources>

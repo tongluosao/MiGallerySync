@@ -34,7 +34,6 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.tongluosao.gallerysync.R
-import com.tongluosao.gallerysync.ui.SettingsModel.ReloadState
 import com.tongluosao.gallerysync.ui.SettingsModel.TestState
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
@@ -157,12 +156,6 @@ private fun SettingsScreen(model: SettingsModel) {
                     AppearanceSection(model)
                 }
             }
-
-            item(key = "section_module") {
-                SettingsSection(stringResource(R.string.section_module)) {
-                    ModuleSection(model)
-                }
-            }
         }
     }
 }
@@ -268,24 +261,6 @@ private fun RowScope.TestResultText(state: TestState) {
 }
 
 @Composable
-private fun RowScope.ReloadResultText(state: ReloadState) {
-    val text = when (state) {
-        ReloadState.Idle -> null
-        ReloadState.Running -> stringResource(R.string.msg_reloading)
-        ReloadState.NoService -> stringResource(R.string.msg_reload_no_service)
-        ReloadState.NoTarget -> stringResource(R.string.msg_reload_no_target)
-        is ReloadState.Done -> stringResource(R.string.msg_reload_ok, state.pid)
-        is ReloadState.Failed -> stringResource(R.string.msg_reload_failed, state.detail)
-    }
-    val color = when (state) {
-        is ReloadState.Done -> MiuixTheme.colorScheme.primary
-        ReloadState.Running, ReloadState.NoTarget -> MiuixTheme.colorScheme.onSurfaceVariantSummary
-        else -> MiuixTheme.colorScheme.error
-    }
-    if (text != null) ResultText(text, color)
-}
-
-@Composable
 private fun RowScope.ResultText(text: String, color: Color) {
     Text(
         text = text,
@@ -364,34 +339,6 @@ private fun AppearanceSection(model: SettingsModel) {
             summary = stringResource(R.string.summary_theme_mode),
             onSelectedIndexChange = model::onThemeModeChange
         )
-    }
-}
-
-/**
- * 热重载。改了模块代码后不必杀掉相册进程：让框架在运行中的进程里加载新一代代码。
- * 按钮在框架未连接时禁用——那时写入和重载都到不了对端。
- */
-@Composable
-private fun ModuleSection(model: SettingsModel) {
-    Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
-        HintLine(stringResource(R.string.summary_module))
-        Row(
-            modifier = Modifier.padding(horizontal = ScreenMargin),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(BlockGap)
-        ) {
-            Button(
-                onClick = model::hotReload,
-                enabled = model.ready && model.reloadState !is ReloadState.Running,
-                minWidth = 96.dp,
-                colors = ButtonDefaults.buttonColorsPrimary(
-                    disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                )
-            ) {
-                Text(text = stringResource(R.string.action_hot_reload))
-            }
-            ReloadResultText(model.reloadState)
-        }
     }
 }
 

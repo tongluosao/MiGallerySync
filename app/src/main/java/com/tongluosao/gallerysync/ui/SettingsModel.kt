@@ -8,7 +8,6 @@ import com.tongluosao.gallerysync.App
 import com.tongluosao.gallerysync.core.Config
 import com.tongluosao.gallerysync.core.Logger
 import com.tongluosao.gallerysync.core.WebDavClient
-import io.github.libxposed.service.HotReloadResult
 import io.github.libxposed.service.XposedService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,9 +68,6 @@ class SettingsModel : CoroutineScope {
         get() = LAYOUT_VALUES[layoutIndex] == Config.LAYOUT_FLAT
 
     var testState by mutableStateOf<TestState>(TestState.Idle)
-        private set
-
-    var reloadState by mutableStateOf<ReloadState>(ReloadState.Idle)
         private set
 
     /** 写入失败（service 掉线或 binder 异常）时置真，下一次成功写入清零 */
@@ -211,51 +207,6 @@ class SettingsModel : CoroutineScope {
             } catch (t: Throwable) {
                 // 删不掉只是留了个探针文件，不影响"可写入"这个结论
                 Logger.w("event=ui_probe_cleanup_failed", t)
-            }
-        }
-    }
-
-    /**
-     * 为正在运行的相册进程加载新一代模块代码。LSPosed 2.1.0 的管理端没有这个入口，
-     * 只能模块自己经 service 触发；没有它，每次更新模块都要杀掉相册进程才生效。
-     */
-    fun hotReload() {
-        if (reloadState is ReloadState.Running) {
-            return
-        }
-        val service = App.getService()
-        if (service == null) {
-            reloadState = ReloadState.NoService
-            return
-        }
-        val targets = try {
-            service.runningTargets.filter { it.processName == TARGET_PROCESS }
-        } catch (t: Throwable) {
-            Logger.w("event=ui_running_targets_failed", t)
-            reloadState = ReloadState.Failed(t.message ?: t.javaClass.simpleName)
-            return
-        }
-        if (targets.isEmpty()) {
-            reloadState = ReloadState.NoTarget
-            return
-        }
-        reloadState = ReloadState.Running
-        for (target in targets) {
-            try {
-                // 回调在 binder 线程上回来，界面状态必须切回主线程再改
-                service.hotReloadModule(target, null) { _, result ->
-                    launch(Dispatchers.Main) {
-                        Logger.i("event=ui_hot_reload pid=" + target.pid + " status=" + result.status())
-                        reloadState = if (result.status() == HotReloadResult.Status.SUCCEEDED) {
-                            ReloadState.Done(target.pid)
-                        } else {
-                            ReloadState.Failed(result.message() ?: result.status().name)
-                        }
-                    }
-                }
-            } catch (t: Throwable) {
-                Logger.w("event=ui_hot_reload_failed", t)
-                reloadState = ReloadState.Failed(t.message ?: t.javaClass.simpleName)
             }
         }
     }
@@ -405,15 +356,6 @@ class SettingsModel : CoroutineScope {
         data class Failure(val detail: String) : TestState
     }
 
-    sealed interface ReloadState {
-        data object Idle : ReloadState
-        data object Running : ReloadState
-        data object NoService : ReloadState
-        data object NoTarget : ReloadState
-        data class Done(val pid: Int) : ReloadState
-        data class Failed(val detail: String) : ReloadState
-    }
-
     companion object {
         /** 备份模式的落盘值，顺序必须与界面选项一致 */
         val MODE_VALUES = listOf(Config.MODE_REPLACE, Config.MODE_MIRROR, Config.MODE_OFF)
@@ -429,8 +371,6 @@ class SettingsModel : CoroutineScope {
         private const val KEY_THEME_MODE = "ui_theme_mode"
         private const val DEBOUNCE_MS = 500L
         private const val PROBE_NAME = ".migallerysync_probe"
-        /** 热重载只针对相册主进程，其它同名子进程里没有装 Hook */
-        private const val TARGET_PROCESS = "com.miui.gallery"
 
         private fun modeIndexOf(value: String?): Int {
             val index = MODE_VALUES.indexOf(value)
