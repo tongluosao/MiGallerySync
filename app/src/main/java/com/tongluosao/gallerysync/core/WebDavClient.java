@@ -105,6 +105,23 @@ public final class WebDavClient {
     private String mResolvedHost;
     private InetAddress mResolvedAddress;
 
+    /**
+     * 请求体发送进度回调。挂在实例上而不是改成 {@code put()} 的参数：每个 worker 各持一个
+     * 客户端、且同一时刻只服务一个任务，实例字段天然就绑定了"当前在传的是哪一项"，
+     * 不必把回调一路穿过 {@code send/exchange} 的签名。
+     */
+    public interface ProgressListener {
+        /** @param sent 已写进 socket 的字节（不含响应） @param total 本次请求体的总字节 */
+        void onProgress(long sent, long total);
+    }
+
+    /** worker 线程写、自己读，跨线程可见性用 volatile */
+    private volatile ProgressListener mProgressListener;
+
+    public void setProgressListener(ProgressListener listener) {
+        mProgressListener = listener;
+    }
+
     public WebDavClient(String baseUrl, String username, String password) {
         mBaseUrl = trimTrailingSlash(baseUrl);
         mAuthHeader = buildAuthHeader(username, password);
@@ -579,17 +596,34 @@ public final class WebDavClient {
         return host + ":" + port;
     }
 
-    private static void writeBody(OutputStream out, File file, byte[] body, long length)
+    /**
+     * 把请求体写出去；文件按 64KB 一块读、边读边发，每块回调一次进度。
+     *
+     * <p>由 static 改成实例方法就是为了这个回调：它是"当前这一项传到哪了"的唯一来源
+     * （{@code put()} 要等整个请求体发完、服务器复核过才返回，那时才知道结果已经太晚）。
+     *
+     * <p>回调在下游必须自己节流 —— 这里一个 600MB 的视频会回调上万次。
+     *
+     * <p>重发（keep-alive 连接被关后重试、404/409 补建目录后重试）会让 sent 归零重涨，
+     * 客户端看到进度条回退一次。这比假装前进诚实，也说明那一项确实重传了。
+     */
+    private void writeBody(OutputStream out, File file, byte[] body, long length)
             throws IOException {
         if (length <= 0) {
             return;
         }
         if (file != null) {
+            ProgressListener listener = mProgressListener;
             try (BufferedInputStream in = new BufferedInputStream(new FileInputStream(file))) {
                 byte[] buf = new byte[64 * 1024];
                 int read;
+                long sent = 0;
                 while ((read = in.read(buf)) != -1) {
                     out.write(buf, 0, read);
+                    sent += read;
+                    if (listener != null) {
+                        listener.onProgress(sent, length);
+                    }
                 }
             }
         } else if (body != null) {

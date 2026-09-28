@@ -140,10 +140,55 @@ public final class UploadQueue {
      */
     private boolean mIdleNotified;
 
+    /**
+     * 把在传状态发给模块 App 的进度页。
+     *
+     * <p>由队列自己建而不是让 Hook 侧注入：队列知道每一项的开始/结束与字节数，进度帧要的
+     * 就是这些；Hook 侧只负责把队列挂起来，多一层转手没有意义。
+     */
+    private final UploadProgressPublisher mPublisher;
+
     private UploadQueue(Context context, Config config) {
         mContext = context.getApplicationContext();
         mConfig = config;
         load();
+        mPublisher = UploadProgressPublisher.start(mContext);
+        mPublisher.setQueueView(new UploadProgressPublisher.QueueView() {
+            @Override
+            public int pendingCount() {
+                synchronized (mLock) {
+                    // mPending 里含着正在传的那几项（它们刻意不移出，见 mInflight 的注释），
+                    // 对客户端来说"还没轮到"要把它们减掉，否则总项数会多算 3
+                    return Math.max(mPending.size() - mInflight.size(), 0);
+                }
+            }
+
+            @Override
+            public long pendingBytes() {
+                synchronized (mLock) {
+                    // 先全量求和再减掉在传的那几个，而不是逐项 contains 判断：
+                    // 后者要为每个 pending 项拼一次去重键字符串（路径+大小+时间），
+                    // 全量首备时 pending 上万个，心跳每 500ms 一次就是每秒上万次分配。
+                    // 在传最多 3 个，反查的代价可以忽略
+                    long total = 0;
+                    for (Task task : mPending.values()) {
+                        total += task.size;
+                    }
+                    for (String key : mInflight) {
+                        Task task = mPending.get(key);
+                        if (task != null) {
+                            total -= task.size;
+                        }
+                    }
+                    return Math.max(total, 0);
+                }
+            }
+
+            @Override
+            public boolean healthy() {
+                return isHealthy();
+            }
+        });
         startWorkers();
     }
 
@@ -179,6 +224,9 @@ public final class UploadQueue {
             progress.endAll();
         }
         releaseClient();
+        // 心跳线程也得停：它是 daemon 不会拖住进程退出，但留着的话热重载后新旧两条
+        // 心跳会一起发帧，客户端收到的进度会在两套数据之间跳
+        mPublisher.stop();
         Logger.i("event=queue_shutdown pending=" + pending
                 + " workers=" + UPLOAD_CONCURRENCY);
         for (Thread worker : mWorkers) {
@@ -476,17 +524,27 @@ public final class UploadQueue {
             if (progress != null) {
                 progress.beginUpload();
             }
+            // 进度页靠这一条把卡片放上去。放在"本地文件还在不在"的检查之后：
+            // 文件没了的项会被直接从队列里删掉，不该在界面上闪一下
+            mPublisher.taskStart(taskKey, file.getName(), task.path, task.size, task.video);
+            boolean ok = false;
+            // 提到 try 外面：finally 里要用它清掉进度回调
+            WebDavClient client = null;
             try {
-                WebDavClient client = clientFor(config, index);
+                client = clientFor(config, index);
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
                 String remoteDir = remoteDirFor(config, task);
                 String remotePath = WebDavClient.joinPath(remoteDir, file.getName());
+                // 每 64KB 一块回调，下游按 500ms 节流后才发广播 —— lambda 每任务只建一次，
+                // 不在那个循环里分配对象
+                client.setProgressListener((sent, total) -> mPublisher.taskBytes(taskKey, sent));
                 // 绝不预先建目录：OpenList 挂网盘的后端会把 `PUT <dir>/`（空请求体）当成
                 // "创建一个 0 字节的文件"，名字撞车时驱动再自动改名成 dir(1)/dir(2)…，
                 // 真目录被同名文件一挡，后续文件 PUT 就随机 405/423 —— 探测反而制造了故障。
                 // 能自动补父目录的服务器（alist / OpenList / CloudDrive2）本来就不需要这一步；
                 // 不需要的由 put() 在 404/409 时补建一次。
                 client.put(remotePath, file);
+                ok = true;
                 synchronized (mLock) {
                     mPending.remove(taskKey);
                     mDone.put(taskKey, System.currentTimeMillis());
@@ -535,6 +593,11 @@ public final class UploadQueue {
                 if (progress != null) {
                     progress.endUpload();
                 }
+                // 迟到的字节回调由 publisher 自己按 key 丢掉，这里清掉只是不留悬空引用
+                if (client != null) {
+                    client.setProgressListener(null);
+                }
+                mPublisher.taskEnd(taskKey, ok);
             }
         } finally {
             // 任何返回路径都必须把这一项从"在传"里摘掉：漏了的话它既不会被重试也不会被跳过，
