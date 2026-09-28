@@ -21,6 +21,9 @@ libxposed-service = { group = "io.github.libxposed", name = "service", version.r
 # Miuix 的 Android 目标产物，纯 Android 模块直接可用，不需要整套 KMP 工程
 miuix-ui = { group = "top.yukonga.miuix.kmp", name = "miuix-ui-android", version.ref = "miuix" }
 miuix-preference = { group = "top.yukonga.miuix.kmp", name = "miuix-preference-android", version.ref = "miuix" }
+# 图标单独一个模块：MiuixIcons 这个 object 在 miuix-core 里，具体图标是它的扩展属性，
+# 只有引了这个才有（miuix-ui 自带的 icon/basic 只有返回箭头之类几个）
+miuix-icons = { group = "top.yukonga.miuix.kmp", name = "miuix-icons-android", version.ref = "miuix" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 
 [plugins]

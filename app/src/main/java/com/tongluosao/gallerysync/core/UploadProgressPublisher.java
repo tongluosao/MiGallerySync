@@ -43,7 +43,23 @@ public final class UploadProgressPublisher {
     private static final long SESSION_GAP_MS = 30_000;
 
     /**
-     * 队列侧的两个数字，由 {@link UploadQueue} 提供。
+     * 一帧里最多带多少个排队中的项。
+     *
+     * <p>全量首备时队列里能有上万项，全塞进广播就是每帧几百 KB。列表本身是给人看的，
+     * 60 条已经够滚半天了，剩下的用 {@code pending} 计数告诉客户端"还有多少没列出来"。
+     */
+    private static final int MAX_PENDING_ITEMS = 60;
+
+    /**
+     * 排队列表最长多久重传一次。
+     *
+     * <p>正常情况下靠版本号判断（只有增删才重传），这个兜底是为了客户端后开的情况：
+     * 界面刚打开时如果列表恰好没变过，它就一条也看不到，只能等到下次队列增删。
+     */
+    private static final long PENDING_REFRESH_MS = 3_000;
+
+    /**
+     * 队列侧的几个数字与列表，由 {@link UploadQueue} 提供。
      *
      * <p>用接口而不是直接持有 UploadQueue：队列的字段都在它自己的锁里，进度线程不该
      * 伸手进去翻，让队列自己在锁内算好交出来。
@@ -55,8 +71,36 @@ public final class UploadProgressPublisher {
         /** 还没轮到的项的总字节 */
         long pendingBytes();
 
+        /**
+         * 还没轮到的项，按队列顺序最多 [limit] 个。
+         *
+         * <p>进度页要把"还在排队的还有哪些"也显示出来，不然只能看到正在传的 3 张，
+         * 完全看不出后面还积压了多少。
+         */
+        List<PendingItem> pendingItems(int limit);
+
+        /** {@link #pendingItems} 的结构版本；变了才需要重传整张列表 */
+        int pendingVersion();
+
         /** WebDAV 是否可用；false 时进度页要说明"这一轮已交回小米云" */
         boolean healthy();
+    }
+
+    /** 队列里一张还没轮到的照片。字段与 {@link Active} 对齐，客户端可以共用一套解析 */
+    public static final class PendingItem {
+        public final String key;
+        public final String name;
+        public final String path;
+        public final long size;
+        public final boolean video;
+
+        public PendingItem(String key, String name, String path, long size, boolean video) {
+            this.key = key;
+            this.name = name;
+            this.path = path;
+            this.size = size;
+            this.video = video;
+        }
     }
 
     /** 一张正在传的照片 */
@@ -96,6 +140,14 @@ public final class UploadProgressPublisher {
     /** 本轮会话已完成 */
     private int mDoneItems;
     private long mDoneBytes;
+
+    /**
+     * 上一次序列化好的排队列表对应的队列版本，以及上次重建的时刻。
+     *
+     * <p>只有心跳线程碰它，不需要加锁。初始版本给 MIN_VALUE，保证第一帧一定带上列表。
+     */
+    private int mLastPendingVersion = Integer.MIN_VALUE;
+    private long mLastPendingAt;
 
     private UploadProgressPublisher(Context context) {
         mContext = context.getApplicationContext();
@@ -295,6 +347,12 @@ public final class UploadProgressPublisher {
         root.put("state", state);
         root.put("active", activeArray);
         root.put("pending", pendingCount);
+        // 排队列表：只在队列增删过、或隔几秒兜一次底的时候才重新序列化。整张列表十几 KB，
+        // 2Hz 地发等于把 Binder 当水管用；平时这一项就省掉了，客户端沿用上一份
+        JSONArray pendingArray = pendingArrayFor(view, pendingCount);
+        if (pendingArray != null) {
+            root.put("pl", pendingArray);
+        }
         // 会话总量 = 已完成 + 正在传 + 还没轮到。中途新入队的项也计入，所以进度条可能
         // 微退 —— 诚实优于假装单调
         root.put("sDoneItems", doneItems);
@@ -302,5 +360,46 @@ public final class UploadProgressPublisher {
         root.put("sDoneBytes", doneBytes);
         root.put("sTotalBytes", doneBytes + activeBytes + pendingBytes);
         return root.toString();
+    }
+
+    /**
+     * 取（必要时重建）排队列表的 JSON。
+     *
+     * @return 需要重传时返回新的数组，否则返回 null 表示"沿用上一份"
+     */
+    private JSONArray pendingArrayFor(QueueView view, int pendingCount) {
+        if (view == null) {
+            return null;
+        }
+        int version = view.pendingVersion();
+        long now = System.currentTimeMillis();
+        boolean changed = version != mLastPendingVersion;
+        if (!changed && now - mLastPendingAt < PENDING_REFRESH_MS) {
+            return null;
+        }
+        mLastPendingVersion = version;
+        mLastPendingAt = now;
+        // 队列空了就明确发一个空数组：客户端要靠它把列表清掉，不能只靠"这一帧没带 pl"
+        if (pendingCount <= 0) {
+            return new JSONArray();
+        }
+        JSONArray array = new JSONArray();
+        try {
+            for (PendingItem item : view.pendingItems(MAX_PENDING_ITEMS)) {
+                JSONObject obj = new JSONObject();
+                obj.put("k", item.key);
+                obj.put("n", item.name);
+                obj.put("p", item.path);
+                obj.put("s", item.size);
+                obj.put("vid", item.video);
+                obj.put("dir", ProgressProtocol.DIR_UP);
+                array.put(obj);
+            }
+        } catch (Throwable t) {
+            // 队列侧取列表失败不该让整帧作废：这一帧少一段，下一帧再试
+            Logger.w("event=progress_pending_failed detail=" + t);
+            return null;
+        }
+        return array;
     }
 }

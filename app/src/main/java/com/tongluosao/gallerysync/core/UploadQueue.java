@@ -141,6 +141,15 @@ public final class UploadQueue {
     private boolean mIdleNotified;
 
     /**
+     * {@link #mPending} 的结构版本，每次增删都要加一。
+     *
+     * <p>进度页要显示"还在排队的有哪些"，整张列表序列化出来有十几 KB，2Hz 地发等于把
+     * Binder 当水管用。带上版本号之后，客户端只在版本变了（或隔几秒兜一次底）才重传列表，
+     * 平时的帧还是几百字节。
+     */
+    private volatile int mPendingVersion;
+
+    /**
      * 把在传状态发给模块 App 的进度页。
      *
      * <p>由队列自己建而不是让 Hook 侧注入：队列知道每一项的开始/结束与字节数，进度帧要的
@@ -182,6 +191,31 @@ public final class UploadQueue {
                     }
                     return Math.max(total, 0);
                 }
+            }
+
+            @Override
+            public List<UploadProgressPublisher.PendingItem> pendingItems(int limit) {
+                synchronized (mLock) {
+                    List<UploadProgressPublisher.PendingItem> out =
+                            new ArrayList<>(Math.min(limit, mPending.size()));
+                    for (Task task : mPending.values()) {
+                        if (out.size() >= limit) {
+                            break;
+                        }
+                        if (mInflight.contains(task.key())) {
+                            // 正在传的那几个在进度页上是单独的大卡片，这里不再列一遍
+                            continue;
+                        }
+                        out.add(new UploadProgressPublisher.PendingItem(
+                                task.key(), baseName(task.path), task.path, task.size, task.video));
+                    }
+                    return out;
+                }
+            }
+
+            @Override
+            public int pendingVersion() {
+                return mPendingVersion;
             }
 
             @Override
@@ -272,6 +306,12 @@ public final class UploadQueue {
     /** 当前连续失败次数，仅用于日志 */
     public int consecutiveFailures() {
         return mConsecutiveFailures.get();
+    }
+
+    /** 从绝对路径取文件名。只切最后一个斜杠，比 new File(path).getName() 省一次分配 */
+    private static String baseName(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash >= 0 && slash + 1 < path.length() ? path.substring(slash + 1) : path;
     }
 
     /** 上传成功后补写相册落册标记的实现；为 null 时不记（镜像模式由宿主自己记） */
@@ -378,6 +418,7 @@ public final class UploadQueue {
                 mIdleSyncDelay = IDLE_SYNC_BASE;
                 // 队列重新有活，下次真空闲要重新通报一次收尾
                 mIdleNotified = false;
+                mPendingVersion++;
                 // 入队是每个批次一次，不是每张照片一次，这里直接落盘
                 writeStateLocked();
                 mLock.notifyAll();
@@ -516,6 +557,7 @@ public final class UploadQueue {
                 Logger.w("event=upload_skip reason=local_file_missing path=" + task.path);
                 synchronized (mLock) {
                     mPending.remove(taskKey);
+                    mPendingVersion++;
                     saveThrottledLocked();
                 }
                 return;
@@ -547,6 +589,7 @@ public final class UploadQueue {
                 ok = true;
                 synchronized (mLock) {
                     mPending.remove(taskKey);
+                    mPendingVersion++;
                     mDone.put(taskKey, System.currentTimeMillis());
                     trimDoneLocked();
                     saveThrottledLocked();

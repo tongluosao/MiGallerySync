@@ -39,122 +39,69 @@ import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
-import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
-import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.ScrollBehavior
 import top.yukonga.miuix.kmp.basic.SmallTitle
-import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TextFieldDefaults
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
-import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
-import top.yukonga.miuix.kmp.theme.ThemeController
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 
 /**
- * 排版基线：卡片与输入框统一 12dp 外边距，卡片内文字与 Preference 自带 16dp 内边距，
- * 两者相加正好落在 SmallTitle 默认的 28dp 内缩上——标题、卡片文字、提示文字同一条竖线。
+ * 设置页的滚动区。主题控制器、顶栏与底栏都由 [MainScreen] 持有，
+ * 本页只负责列表本身，切页时才不会连底栏一起重建。
  */
-private val ScreenMargin = 12.dp
-
-/** 提示文字与卡片内文字对齐（12 + 16） */
-private val HintMargin = 28.dp
-
-/** 同组内相邻块的间距 */
-private val BlockGap = 12.dp
-
-/** 提示与它所解释的输入框之间的间距，比块间距紧一点，视觉上才像一对 */
-private val HintGap = 8.dp
-
-/** 分组之间的间距，叠上 SmallTitle 自带的 8dp 上内边距后约 16dp */
-private val SectionGap = 8.dp
-
-/** 列表底部留白，避免最后一项贴着导航栏 */
-private val BottomSpace = 24.dp
-
-/** 主题模式只能在建 ThemeController 时给定，切换模式要重建控制器 */
 @Composable
-fun SettingsRoot(model: SettingsModel) {
-    val schemeMode = when (model.themeModeIndex) {
-        SettingsModel.THEME_LIGHT -> ColorSchemeMode.Light
-        SettingsModel.THEME_DARK -> ColorSchemeMode.Dark
-        else -> ColorSchemeMode.System
-    }
-    val controller = remember(schemeMode) { ThemeController(colorSchemeMode = schemeMode) }
-    MiuixTheme(controller = controller) {
-        SettingsScreen(model)
-    }
-}
-
-@Composable
-private fun SettingsScreen(model: SettingsModel) {
-    // 未连接时顶部横幅已经在说同一件事，副标题再重复一遍只是噪音
-    val statusText = if (model.frameworkName.isEmpty()) {
-        ""
-    } else {
-        stringResource(
-            R.string.framework_status_connected,
-            model.frameworkName,
-            model.frameworkVersion,
-            model.frameworkApi
-        )
-    }
-    val scrollBehavior = MiuixScrollBehavior()
-    Scaffold(
-        topBar = {
-            SmallTopAppBar(
-                title = stringResource(R.string.app_name),
-                subtitle = statusText,
-                scrollBehavior = scrollBehavior
-            )
+fun SettingsContent(
+    model: SettingsModel,
+    innerPadding: PaddingValues,
+    scrollBehavior: ScrollBehavior
+) {
+    // 横屏与挖屏下左右也要让开，否则卡片会压进系统栏
+    val direction = LocalLayoutDirection.current
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .overScrollVertical()
+            .nestedScroll(scrollBehavior.nestedScrollConnection),
+        contentPadding = PaddingValues(
+            start = innerPadding.calculateStartPadding(direction),
+            end = innerPadding.calculateEndPadding(direction),
+            top = innerPadding.calculateTopPadding(),
+            bottom = innerPadding.calculateBottomPadding() + BottomSpace
+        ),
+        verticalArrangement = Arrangement.spacedBy(SectionGap)
+    ) {
+        // 两条横幅是条件出现的，不给 key 的话它们消失时后面的项整体前移一格，
+        // 正在输入的框会把焦点让给别的框
+        if (!model.ready) {
+            item(key = "banner_service") {
+                StatusBanner(stringResource(R.string.msg_service_unavailable))
+            }
         }
-    ) { innerPadding ->
-        // 横屏与挖屏下左右也要让开，否则卡片会压进系统栏
-        val direction = LocalLayoutDirection.current
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .overScrollVertical()
-                .nestedScroll(scrollBehavior.nestedScrollConnection),
-            contentPadding = PaddingValues(
-                start = innerPadding.calculateStartPadding(direction),
-                end = innerPadding.calculateEndPadding(direction),
-                top = innerPadding.calculateTopPadding(),
-                bottom = innerPadding.calculateBottomPadding() + BottomSpace
-            ),
-            verticalArrangement = Arrangement.spacedBy(SectionGap)
-        ) {
-            // 两条横幅是条件出现的，不给 key 的话它们消失时后面的项整体前移一格，
-            // 正在输入的框会把焦点让给别的框
-            if (!model.ready) {
-                item(key = "banner_service") {
-                    StatusBanner(stringResource(R.string.msg_service_unavailable))
-                }
+        if (model.writeFailed) {
+            item(key = "banner_write") {
+                StatusBanner(stringResource(R.string.msg_write_failed))
             }
-            if (model.writeFailed) {
-                item(key = "banner_write") {
-                    StatusBanner(stringResource(R.string.msg_write_failed))
-                }
-            }
+        }
 
-            item(key = "section_webdav") {
-                SettingsSection(stringResource(R.string.section_webdav)) {
-                    WebDavSection(model)
-                }
+        item(key = "section_webdav") {
+            SettingsSection(stringResource(R.string.section_webdav)) {
+                WebDavSection(model)
             }
+        }
 
-            item(key = "section_behavior") {
-                SettingsSection(stringResource(R.string.section_behavior)) {
-                    BehaviorSection(model)
-                }
+        item(key = "section_behavior") {
+            SettingsSection(stringResource(R.string.section_behavior)) {
+                BehaviorSection(model)
             }
+        }
 
-            item(key = "section_appearance") {
-                SettingsSection(stringResource(R.string.section_appearance)) {
-                    AppearanceSection(model)
-                }
+        item(key = "section_appearance") {
+            SettingsSection(stringResource(R.string.section_appearance)) {
+                AppearanceSection(model)
             }
         }
     }

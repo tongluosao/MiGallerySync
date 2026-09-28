@@ -5,6 +5,16 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- 进度页显示正在上传照片的缩略图。Android 13 起媒体读取拆成图片/视频两项，
+         用户可能只给一半，所以两个都要声明；12 及以下退回 READ_EXTERNAL_STORAGE，
+         用 maxSdkVersion 限定，免得在 13+ 上还去要一个已经被忽略的权限。
+         注意这份清单是模块 App 的，不会被读进相册进程 —— 上传本身不需要任何权限 -->
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
     <!-- 不声明 usesCleartextTraffic：http 目标走 WebDavClient 的原生 socket 出口，
          不碰平台 HTTP 栈，也就绕开了 targetSdk 28+ 的明文拦截。
          平台栈只用于 https，那条本来就不需要明文权限 -->

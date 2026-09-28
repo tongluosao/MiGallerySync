@@ -55,4 +55,6 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.miuix.ui)
     implementation(libs.miuix.preference)
+    // 底栏图标（设置/进度）。不加也能编译，只是 MiuixIcons.Settings 这类扩展属性不存在
+    implementation(libs.miuix.icons)
 }

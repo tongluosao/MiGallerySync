@@ -9,6 +9,9 @@
     <string name="section_behavior">同步</string>
     <string name="section_appearance">界面</string>
 
+    <string name="tab_settings">设置</string>
+    <string name="tab_progress">进度</string>
+
     <string name="hint_base_url">服务器地址</string>
     <string name="hint_username">用户名</string>
     <string name="hint_password">密码或应用专用口令</string>
@@ -54,4 +57,17 @@
     <string name="msg_test_auth">认证失败：用户名或密码不对</string>
     <string name="msg_test_not_writable">服务器可达，但这个目录收不了文件：%1$s</string>
     <string name="msg_fill_url">请先填写服务器地址</string>
+
+    <string name="progress_total">上传总进度</string>
+    <string name="progress_items">%1$d / %2$d 项</string>
+    <string name="progress_bytes">%1$s / %2$s · 队列剩余 %3$d 项</string>
+    <string name="progress_item_detail">%1$d%% · %2$s / %3$s</string>
+    <string name="progress_queued">排队中 %1$d 项</string>
+    <string name="progress_queued_more">还有 %1$d 项未列出</string>
+    <string name="progress_idle">当前没有正在上传的照片</string>
+    <string name="progress_no_data">相册未在备份，或模块未启用</string>
+    <string name="progress_stale">进度数据已过期，连接可能已断开</string>
+    <string name="progress_unhealthy">WebDAV 暂不可用，这一轮已交回小米云</string>
+    <string name="progress_permission_denied">未授予相册读取权限，缩略图不可用（进度仍会更新）</string>
+    <string name="action_grant_permission">授予权限</string>
 </resources>
