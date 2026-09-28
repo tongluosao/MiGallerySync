@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 与 Miuix 的默认 surface 对齐：窗口底色先于 Compose 出现，不一致就会闪一下 -->
+    <color name="miuix_surface_light">#FFF7F7F7</color>
+    <color name="miuix_surface_dark">#FF000000</color>
+</resources>

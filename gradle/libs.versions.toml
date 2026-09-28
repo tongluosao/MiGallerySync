@@ -1,0 +1,29 @@
+[versions]
+agp = "9.1.1"
+# Miuix 0.9.4 由 Kotlin 2.4.20 编译，类元数据要求编译器不低于 2.4.x；
+# AGP 9.1.1 的内置 Kotlin 是 2.2.10，读不了，因此关闭内置支持并显式锁版本。
+kotlin = "2.4.20"
+coreKtx = "1.19.0"
+junit = "4.13.2"
+junitVersion = "1.3.0"
+espressoCore = "3.7.0"
+libxposed = "102.0.0"
+miuix = "0.9.4"
+activityCompose = "1.13.0"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.espresso", name = "espresso-core", version.ref = "espressoCore" }
+libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposed" }
+libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "libxposed" }
+# Miuix 的 Android 目标产物，纯 Android 模块直接可用，不需要整套 KMP 工程
+miuix-ui = { group = "top.yukonga.miuix.kmp", name = "miuix-ui-android", version.ref = "miuix" }
+miuix-preference = { group = "top.yukonga.miuix.kmp", name = "miuix-preference-android", version.ref = "miuix" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

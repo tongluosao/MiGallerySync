@@ -1,0 +1,6 @@
+<resources>
+    <!-- 界面全部由 Compose 自绘，系统主题只负责去掉 ActionBar 与窗口底色 -->
+    <style name="Theme.Gallerysync" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/miuix_surface_light</item>
+    </style>
+</resources>

@@ -1,0 +1,7 @@
+<resources>
+    <!-- 深色下窗口底色同步压暗，避免冷启动时白闪 -->
+    <style name="Theme.Gallerysync" parent="android:Theme.Material.NoActionBar">
+        <!-- 默认窗口底色是 #303030，Miuix 深色 surface 是纯黑，不压到底会在首帧闪一下灰 -->
+        <item name="android:windowBackground">@color/miuix_surface_dark</item>
+    </style>
+</resources>

@@ -1,0 +1,66 @@
+<resources>
+    <string name="app_name">MiGallerySync</string>
+    <string name="app_description">把小米相册的云备份目标替换为自建 WebDAV 服务器</string>
+
+    <string name="framework_status_unknown">未连接：请在 LSPosed 中启用本模块</string>
+    <string name="framework_status_connected">%1$s %2$s（API %3$d）</string>
+
+    <string name="section_webdav">WebDAV</string>
+    <string name="section_behavior">同步</string>
+    <string name="section_appearance">界面</string>
+    <string name="section_module">模块</string>
+
+    <string name="hint_base_url">服务器地址</string>
+    <string name="hint_username">用户名</string>
+    <string name="hint_password">密码或应用专用口令</string>
+    <string name="hint_remote_root">远端根目录</string>
+    <string name="hint_max_items_per_sync">单次入队上限</string>
+
+    <string name="summary_base_url">例如 https://dav.example.com/backup</string>
+    <string name="summary_remote_root">这个目录下的结构由「远端目录结构」决定</string>
+    <string name="summary_max_items_per_sync">一轮最多入队多少张，最小 1，默认 1000。调大能让全量首备更快喂满队列</string>
+    <string name="summary_password">明文存于 LSPosed 数据库，建议用应用专用口令</string>
+    <string name="warn_replace_mode">替换后相册的云端查看与释放空间会失效</string>
+
+    <string name="label_replace_mode">备份模式</string>
+    <string name="mode_replace">替换：只传 WebDAV</string>
+    <string name="mode_mirror">双写：同时传小米云</string>
+    <string name="mode_off">关闭：不介入</string>
+
+    <string name="label_wifi_only">仅在 Wi-Fi 下上传</string>
+    <string name="summary_wifi_only">移动网络不上传</string>
+    <string name="label_ui_mask">伪装备份服务商入口</string>
+    <string name="summary_ui_mask">相册设置页显示入口，点击打开本页</string>
+    <string name="label_remote_layout">远端目录结构</string>
+    <string name="layout_album">按相册：DCIM/Camera/照片.jpg</string>
+    <string name="layout_date">按时间：2026/09/照片.jpg</string>
+    <string name="layout_flat">全平铺：照片.jpg</string>
+
+    <string name="summary_theme_mode">只影响本页配色</string>
+
+    <string name="label_theme_mode">主题模式</string>
+    <string name="theme_mode_system">跟随系统</string>
+    <string name="theme_mode_light">浅色</string>
+    <string name="theme_mode_dark">深色</string>
+
+    <string name="action_test">测试连接</string>
+    <string name="action_hot_reload">热重载</string>
+    <string name="action_show">显示</string>
+    <string name="action_hide">隐藏</string>
+
+    <string name="msg_service_unavailable">框架未连接，修改不会保存</string>
+    <string name="msg_write_failed">写入失败，请重试</string>
+    <string name="msg_testing">测试中…</string>
+    <string name="msg_test_ok">连接成功，目标目录可写入</string>
+    <string name="msg_test_failed">连接失败：%1$s</string>
+    <string name="msg_test_auth">认证失败：用户名或密码不对</string>
+    <string name="msg_test_not_writable">服务器可达，但这个目录收不了文件：%1$s</string>
+    <string name="msg_fill_url">请先填写服务器地址</string>
+
+    <string name="summary_module">更新本模块后，让正在运行的相册直接加载新代码，不必强停相册</string>
+    <string name="msg_reloading">热重载中…</string>
+    <string name="msg_reload_no_service">框架未连接，无法热重载</string>
+    <string name="msg_reload_no_target">相册没在运行，下次启动就是新代码</string>
+    <string name="msg_reload_ok">相册进程 %1$d 已加载新代码</string>
+    <string name="msg_reload_failed">热重载失败：%1$s</string>
+</resources>
