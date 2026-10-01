@@ -70,7 +70,7 @@
     <string name="progress_idle">当前没有正在上传的照片</string>
     <string name="progress_no_data">相册未在备份，或模块未启用</string>
     <string name="progress_stale">进度数据已过期，连接可能已断开</string>
-    <string name="progress_unhealthy">WebDAV 暂不可用，这一轮已交回小米云</string>
+    <string name="progress_unhealthy">WebDAV 暂不可用，正在退避重试；这些照片不会上传到小米云</string>
     <string name="progress_permission_denied">未授予相册读取权限，缩略图不可用（进度仍会更新）</string>
     <string name="action_grant_permission">授予权限</string>
 </resources>

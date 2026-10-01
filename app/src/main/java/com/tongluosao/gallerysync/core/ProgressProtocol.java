@@ -38,7 +38,7 @@ public final class ProgressProtocol {
     /** {@code state} 的三个取值 */
     public static final String STATE_UPLOADING = "uploading";
     public static final String STATE_IDLE = "idle";
-    /** 熔断中：队列已放行原链路，这一轮的照片走小米云，WebDAV 侧不再接新活 */
+    /** WebDAV 不可用（连续失败到阈值）：队列仍在退避重试，界面要说明这批不会去小米云 */
     public static final String STATE_UNHEALTHY = "unhealthy";
 
     /** 上传方向。下载还没做，但字段先留着，将来加下载不用改通道 */

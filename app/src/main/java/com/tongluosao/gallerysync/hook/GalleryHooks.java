@@ -88,7 +88,12 @@ public final class GalleryHooks {
                         try {
                             blocked = handleInvokeList(chain.getArg(0));
                         } catch (Throwable t) {
-                            Logger.e("event=invoke_list_hook_failed", t);
+                            // 替换模式下这里也要拦住。放行 chain.proceed() 就是把这批照片送给小米云 ——
+                            // 用户明确要求"只传 WebDAV，不回退"，那宁可这一批这轮不动
+                            // （localFlag 没被改，下一轮枚举还会交回来），也不能偷偷传上去
+                            Config config = mConfig;
+                            blocked = config != null && config.isReplace();
+                            Logger.e("event=invoke_list_hook_failed blocked=" + blocked, t);
                         }
                         // 接管时不再入队到相册自己的执行器，返回值在调用点被忽略，返回 0 是安全的
                         if (blocked) {
@@ -127,11 +132,11 @@ public final class GalleryHooks {
                             String path = (String) filePath.get(desc);
                             long size = fileSize.getLong(desc);
                             Config config = mConfig;
-                            boolean shouldBeBlocked = config != null && config.isReplace() && config.isReady();
+                            boolean shouldBeBlocked = config != null && config.isReplace();
                             if (shouldBeBlocked) {
                                 Logger.w("event=upload_outlet_unexpected file=" + path
                                         + " size=" + size
-                                        + " reason=replace_mode_should_block_before_enqueue");
+                                        + " reason=replace_mode_must_not_reach_xiaomi_cloud");
                             } else {
                                 Logger.d("event=upload_outlet file=" + path + " size=" + size);
                             }
@@ -235,16 +240,17 @@ public final class GalleryHooks {
     /**
      * 该报给相册的"还剩多少要传"，不该接管时返回 null 表示沿用宿主自己的数字。
      *
-     * <p>三条不接管的理由：非替换模式（原链路照常在跑，宿主的账是对的）、队列还没建、
-     * 队列不健康（已经放行原链路，这时候宿主的口径才是真的）。
+     * <p>替换模式下**一律**用队列口径，哪怕队列不健康：既然不再放行原链路，宿主那套
+     * "localFlag IN (7,8)" 的数字就永远是它自己那 3 项的账，越大越离谱。
+     * 非替换模式（原链路照常在跑）与队列还没建时仍返回 null。
      */
     private int[] overrideDirtyCount() {
         Config config = mConfig;
-        if (config == null || !config.isReplace() || !config.isReady()) {
+        if (config == null || !config.isReplace()) {
             return null;
         }
         UploadQueue queue = mQueue;
-        if (queue == null || !queue.isHealthy()) {
+        if (queue == null) {
             return null;
         }
         return queue.queuedCounts();
@@ -266,8 +272,17 @@ public final class GalleryHooks {
             Logger.d("event=invoke_list skipped=" + raw.size() + " reason=module_off");
             return false;
         }
+        // 替换模式的语义是"只传 WebDAV，不碰小米云"。所以这里的判据是**模式**，不是
+        // "WebDAV 现在能不能用"：地址没填、服务器挂了、队列健康度掉到阈值 —— 这些都不该
+        // 让照片改道小米云。拦下来最多是晚一点传（相册的 localFlag 没被改成 0，下一轮枚举
+        // 还会把它们交回来），放行则是真的把数据传去了用户不想要的地方。
+        boolean replaceMode = config.isReplace();
         if (mReader == null) {
-            // 读不到同步项时绝不能拦截，否则会出现相册不上传、模块也拿不到文件的空窗
+            if (replaceMode) {
+                Logger.w("event=invoke_list blocked_no_upload reason=reader_unavailable");
+                return true;
+            }
+            // 非替换模式下读不到同步项时不能拦截，否则会出现相册不上传、模块也拿不到文件的空窗
             Logger.w("event=invoke_list not_blocked reason=reader_unavailable");
             return false;
         }
@@ -278,8 +293,11 @@ public final class GalleryHooks {
         int unreadable = 0;
         int limit = config.getMaxItemsPerSync();
         if (limit <= 0) {
-            // 上限为 0 时一个都入不了队，此时若还拦截就是"相册不传、模块也没传"，
-            // 直接违反最高优先级约束。配置被外部改坏时（RemotePreferences 可手改）也要靠这条兜住
+            if (replaceMode) {
+                Logger.w("event=invoke_list blocked_no_upload reason=limit_invalid limit=" + limit);
+                return true;
+            }
+            // 上限为 0 时一个都入不了队，此时若还拦截就是"相册不传、模块也没传"
             Logger.w("event=invoke_list not_blocked reason=limit_invalid limit=" + limit);
             return false;
         }
@@ -317,35 +335,27 @@ public final class GalleryHooks {
             Logger.d("event=invoke_list_sample " + sample);
         }
 
-        boolean replace = config.isReplace() && config.isReady();
-        if (!replace && !config.isReady()) {
-            // 未配置 WebDAV 时绝不拦截，避免"相册不上传、模块也没传"
-            Logger.d("event=invoke_list not_blocked reason=webdav_not_configured");
-            return false;
-        }
-        if (replace) {
-            // WebDAV 连续失败到阈值时临时放行原链路：继续拦就是"相册不传、模块也传不上去"，
-            // 宁可退回小米云也不能丢备份。队列还没建起来时没有失败记录，视为健康。
-            UploadQueue existing = mQueue;
-            if (existing != null && !existing.isHealthy()) {
-                Logger.w("event=invoke_list not_blocked reason=queue_unhealthy failures="
-                        + existing.consecutiveFailures());
-                return false;
-            }
-        }
+        boolean replace = config.isReplace();
 
         if (backup.isEmpty()) {
+            if (replace) {
+                // 替换模式下没有可入队的备份项也要拦住：放行就等于让这批去小米云。
+                // 而它们没被记账（localFlag 没被改成 0），下一轮枚举还会再交回来
+                Logger.w("event=invoke_list blocked_no_upload reason="
+                        + (unreadable > 0 ? "items_unreadable" : "batch_unknown")
+                        + " others=" + others + " thumb=" + thumbnails
+                        + " unreadable=" + unreadable);
+                return true;
+            }
             if (unreadable > 0) {
-                // 本批次有项读不出来，放行原链路比两边都不传安全
+                // 非替换模式：本批次有项读不出来，放行原链路比两边都不传安全
                 Logger.w("event=invoke_list not_blocked reason=items_unreadable count=" + unreadable);
                 return false;
             }
             if (thumbnails > 0 && others == 0) {
-                // 纯缩略图批次：派生数据，替换模式下同样不需要上行小米云
-                return replace;
+                // 纯缩略图批次：派生数据，不上行任何云
+                return false;
             }
-            // others 含 priority 0（编辑/删除/恢复）与相册将来新增的未知优先级：
-            // 前者拦下来会让操作到不了云端，后者更是"两边都没传"，一律保守放行
             Logger.w("event=invoke_list not_blocked reason=batch_unknown others=" + others
                     + " thumb=" + thumbnails);
             return false;
@@ -353,6 +363,12 @@ public final class GalleryHooks {
 
         UploadQueue queue = ensureQueue();
         if (queue == null) {
+            if (replace) {
+                // 队列都建不起来（拿不到宿主 Context）也不能改道小米云：整批留在相册那边，
+                // 下一轮枚举再试。宁可一直不动，也不能传到用户不想要的云上
+                Logger.w("event=invoke_list blocked_no_upload reason=queue_unavailable");
+                return true;
+            }
             Logger.w("event=invoke_list not_blocked reason=queue_unavailable");
             return false;
         }
@@ -360,7 +376,8 @@ public final class GalleryHooks {
             queue.enqueue(backup);
         } catch (Throwable t) {
             Logger.e("event=enqueue_failed", t);
-            return false;
+            // 入队炸了同样别改道：这批留在相册侧，下轮再来
+            return replace;
         }
         return replace;
     }
@@ -407,7 +424,7 @@ public final class GalleryHooks {
         MarkSynced target = new MarkSynced(context);
         return rowId -> {
             Config config = mConfig;
-            if (config != null && config.isReplace() && config.isReady()) {
+            if (config != null && config.isReplace()) {
                 target.markSynced(rowId);
             }
         };

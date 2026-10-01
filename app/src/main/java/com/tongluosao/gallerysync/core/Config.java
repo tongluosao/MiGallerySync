@@ -171,7 +171,13 @@ public final class Config {
         return MODE_REPLACE.equals(replaceMode);
     }
 
-    /** WebDAV 未配置时任何模式都不应拦截原链路，避免"什么都没备份" */
+    /**
+     * WebDAV 的地址填了没有。
+     *
+     * <p>注意它**不再**决定"要不要拦原链路"：替换模式下一律拦住，地址空着也是拦住
+     * （用户明确要求不可用时也不回退小米云，见 {@code GalleryHooks.handleInvokeList}）。
+     * 这里的判据只用来决定队列的 worker 要不要开工。
+     */
     public boolean isReady() {
         return !isOff() && baseUrl != null && !baseUrl.trim().isEmpty();
     }

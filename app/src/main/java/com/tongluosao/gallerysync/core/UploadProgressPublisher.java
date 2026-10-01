@@ -72,17 +72,18 @@ public final class UploadProgressPublisher {
         long pendingBytes();
 
         /**
-         * 还没轮到的项，按队列顺序最多 [limit] 个。
+         * 整个队列按插入序的前 [limit] 项，**含正在传的几项**。
          *
-         * <p>进度页要把"还在排队的还有哪些"也显示出来，不然只能看到正在传的 3 张，
-         * 完全看不出后面还积压了多少。
+         * <p>进度页是一个和队列同序的方格列表：在传的格子应该在它原来的位置上长出水面，
+         * 而不是被拎到最前面 —— 后者在补位动画下会是一段横跨整个网格的长滑动。
+         * 所以这里不跳过在传项，让客户端拿这一份列表当唯一的有序依据。
          */
         List<PendingItem> pendingItems(int limit);
 
         /** {@link #pendingItems} 的结构版本；变了才需要重传整张列表 */
         int pendingVersion();
 
-        /** WebDAV 是否可用；false 时进度页要说明"这一轮已交回小米云" */
+        /** WebDAV 是否可用；false 时进度页要说明"正在退避重试、不会去小米云" */
         boolean healthy();
     }
 
@@ -349,7 +350,7 @@ public final class UploadProgressPublisher {
         root.put("pending", pendingCount);
         // 排队列表：只在队列增删过、或隔几秒兜一次底的时候才重新序列化。整张列表十几 KB，
         // 2Hz 地发等于把 Binder 当水管用；平时这一项就省掉了，客户端沿用上一份
-        JSONArray pendingArray = pendingArrayFor(view, pendingCount);
+        JSONArray pendingArray = pendingArrayFor(view);
         if (pendingArray != null) {
             root.put("pl", pendingArray);
         }
@@ -367,7 +368,7 @@ public final class UploadProgressPublisher {
      *
      * @return 需要重传时返回新的数组，否则返回 null 表示"沿用上一份"
      */
-    private JSONArray pendingArrayFor(QueueView view, int pendingCount) {
+    private JSONArray pendingArrayFor(QueueView view) {
         if (view == null) {
             return null;
         }
@@ -379,12 +380,11 @@ public final class UploadProgressPublisher {
         }
         mLastPendingVersion = version;
         mLastPendingAt = now;
-        // 队列空了就明确发一个空数组：客户端要靠它把列表清掉，不能只靠"这一帧没带 pl"
-        if (pendingCount <= 0) {
-            return new JSONArray();
-        }
         JSONArray array = new JSONArray();
         try {
+            // 这里**不能**用 pendingCount（"还没轮到的项数"）判空：队列只剩 3 项且全在传时
+            // 它等于 0，会把列表发成空数组，客户端的方格直接清空、水格全没。
+            // 列表是否为空只由 pendingItems 的实际返回值决定
             for (PendingItem item : view.pendingItems(MAX_PENDING_ITEMS)) {
                 JSONObject obj = new JSONObject();
                 obj.put("k", item.key);
