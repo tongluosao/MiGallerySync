@@ -215,10 +215,7 @@ public final class WebDavClient {
     /** 上传文件；父目录不存在时补建目录并重试一次 */
     public boolean put(String remotePath, File localFile) throws IOException {
         putSend(remotePath, localFile);
-        if (!storedAs(remotePath, localFile.length())) {
-            throw new IOException("PUT returned 2xx but the server has no such file"
-                    + " path=" + remotePath);
-        }
+        requireStoredAs(remotePath, localFile.length());
         return true;
     }
 
@@ -230,12 +227,30 @@ public final class WebDavClient {
      * 是在等挂载型存储落盘，跟"这张照片传完了没有"无关，却一直占着上传通道。
      * 拆出来之后复核可以挪到别处做，通道立刻空出来去传下一项。
      *
-     * <p><b>调用方必须自己复核</b>（调 {@link #storedAs}），否则"回了 2xx 却没落盘"的服务器
-     * 会被当成上传成功 —— 相册那边一记账就再也不会重传，那是本模块最不能出现的结果。
+     * <p><b>调用方必须自己复核</b>（调 {@link #storedAs} 或 {@link #requireStoredAs}），
+     * 否则"回了 2xx 却没落盘"的服务器会被当成上传成功 —— 相册那边一记账就再也不会重传，
+     * 那是本模块最不能出现的结果。
+     *
+     * <p>同样重要的是：**发送与复核的先后顺序不能颠倒**。只做复核不做发送时，
+     * 复核问到的"这个路径存在"可能来自上一轮传进去的旧文件、或别的客户端写进去的同名文件，
+     * 于是"这次没传"被记成"传成功了"。所以这一条只负责发，判落盘一律交给下面那个方法。
      */
     public void putSend(String remotePath, File localFile) throws IOException {
         Res res = putWithDirFallback(remotePath, localFile, null);
         requireSuccess(res, "PUT", remotePath);
+    }
+
+    /**
+     * 复核落盘，不通过就抛"回了 2xx 却没有这个文件"。
+     *
+     * <p>与 {@link #put} 里那条判据共用同一个消息模板：调用方捕获到的 reason 必须一致，
+     * 否则日志里同一个故障会有两种写法，排查时分不清是发送失败还是复核失败。
+     */
+    public void requireStoredAs(String remotePath, long expectedSize) throws IOException {
+        if (!storedAs(remotePath, expectedSize)) {
+            throw new IOException("PUT returned 2xx but the server has no such file"
+                    + " path=" + remotePath);
+        }
     }
 
     /** 写入一小段内容；失败、以及"回了 2xx 却没落盘"都抛异常。界面用它做真实可写探测 */

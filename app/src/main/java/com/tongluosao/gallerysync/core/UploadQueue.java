@@ -773,13 +773,21 @@ public final class UploadQueue {
                 // 真目录被同名文件一挡，后续文件 PUT 就随机 405/423 —— 探测反而制造了故障。
                 // 能自动补父目录的服务器（alist / OpenList / CloudDrive2）本来就不需要这一步；
                 // 不需要的由 put() 在 404/409 时补建一次。
+                //
+                // **顺序不能颠倒：先把字节发出去，再谈复核。** 复核（HEAD/PROPFIND）问的是
+                // "这个路径在不在"，它对"是我刚传上去的"还是"上一轮就躺在那儿的"一无所知。
+                // 一旦只复核不发送，远端早就有的同名文件就会被判成"这次传成功了"，
+                // 接着 markSynced 把相册那行记成已上传 —— 相册显示已传、WebDAV 里却没有，
+                // 两边数量再也对不上。所以 putSend 必须在 enqueueVerify 之前，
+                // 且 putSend 抛异常时这一项绝不会进入复核队列。
+                client.putSend(remotePath, file);
                 if (config.isVerifyAsync()
                         && enqueueVerify(taskKey, task, config, remotePath, file.length())) {
                     handedOff = true;
                 } else {
-                    // 同步路径：发 + 复核一气呵成。复核没过会抛 IOException，
-                    // 与"服务器直接回错误码"走同一套重试逻辑
-                    client.put(remotePath, file);
+                    // 同步路径：复核没过会抛 IOException（与"服务器直接回错误码"同一句话），
+                    // 于是走同一套重试逻辑
+                    client.requireStoredAs(remotePath, file.length());
                     ok = true;
                     finalizeOk(task, config, remotePath, String.valueOf(index));
                 }
@@ -877,18 +885,14 @@ public final class UploadQueue {
             boolean ok = false;
             try {
                 WebDavClient client = verifyClientFor(job.config, index);
-                if (client.storedAs(job.remotePath, job.size)) {
-                    ok = true;
-                    Logger.i("event=verify_async_done ok=true path=" + job.task.path
-                            + " remote=" + job.remotePath);
-                    finalizeOk(job.task, job.config, job.remotePath, "verify-" + index);
-                } else {
-                    // 与 put() 里那条同一句话：发完了但服务器上确实没有。
-                    // 绝不能记成功 —— 一记账这项就再也不会重传了
-                    finalizeFail(job.task, job.config, new IOException(
-                            "PUT returned 2xx but the server has no such file"
-                                    + " path=" + job.remotePath));
-                }
+                // 复核是**唯一**的成功判据，同步路径与这里共用 WebDavClient.requireStoredAs：
+                // 那句话只有一处定义，日志里同一个故障不会出现两种写法。
+                // 复核不过绝不能记成功 —— 一记账这项就再也不会重传了
+                client.requireStoredAs(job.remotePath, job.size);
+                ok = true;
+                Logger.i("event=verify_async_done ok=true path=" + job.task.path
+                        + " remote=" + job.remotePath);
+                finalizeOk(job.task, job.config, job.remotePath, "verify-" + index);
             } catch (WebDavClient.TransportFailure e) {
                 finalizeFail(job.task, job.config, e);
             } catch (IOException e) {
