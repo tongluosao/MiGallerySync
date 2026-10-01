@@ -22,11 +22,7 @@ data class ActiveUpload(
     val size: Long,
     val sent: Long,
     val video: Boolean
-) {
-    /** 水面高度用。size 为 0 时按 0 处理，别除出 NaN */
-    val fraction: Float =
-        if (size <= 0L) 0f else (sent.toDouble() / size).coerceIn(0.0, 1.0).toFloat()
-}
+)
 
 /** 队列里一张还没轮到的照片 */
 data class QueuedUpload(
@@ -38,6 +34,29 @@ data class QueuedUpload(
 )
 
 /**
+ * 方格列表里的一格。
+ *
+ * [sent] 非空表示"这一格正在传" —— 它同时决定要不要画水、以及照片沉多深。
+ * 队列顺序由发送端给（`pl` 是整个队列按插入序的前几十项，含在传项），所以某一格开始
+ * 上传时它只是**原地**长出水面，不会从排队位置跳到最前面。
+ */
+data class UploadTile(
+    val key: String,
+    val name: String,
+    val path: String,
+    val size: Long,
+    val video: Boolean,
+    val sent: Long?
+) {
+    val uploading: Boolean get() = sent != null
+
+    /** 下沉深度用。size 为 0 时按 0 处理，别除出 NaN */
+    val fraction: Float =
+        if (sent == null || size <= 0L) 0f
+        else (sent.toDouble() / size).coerceIn(0.0, 1.0).toFloat()
+}
+
+/**
  * 一帧进度。
  *
  * 默认值是"从未收到过"，用 [timestamp] 是否为 0 区分 —— 队列真的空着时也会收到帧
@@ -47,6 +66,7 @@ data class ProgressUiState(
     val state: String = ProgressProtocol.STATE_IDLE,
     val active: List<ActiveUpload> = emptyList(),
     val queued: List<QueuedUpload> = emptyList(),
+    val tiles: List<UploadTile> = emptyList(),
     val pending: Int = 0,
     val doneItems: Int = 0,
     val totalItems: Int = 0,
@@ -63,8 +83,12 @@ data class ProgressUiState(
         if (totalBytes <= 0L) 0f
         else (doneBytes.toDouble() / totalBytes).coerceIn(0.0, 1.0).toFloat()
 
-    /** 排队里没被列出来的还有多少（一帧只带前几十条，剩下的靠这个数字交代） */
-    val queuedHidden: Int get() = (pending - queued.size).coerceAtLeast(0)
+    /**
+     * 队列里没被列出来的还有多少（一帧只带前几十项，剩下的靠这个数字交代）。
+     *
+     * `pending` 是"还没轮到的项数"（不含在传），所以要加上在传的几项才是队列总量。
+     */
+    val queuedHidden: Int get() = (pending + active.size - tiles.size).coerceAtLeast(0)
 }
 
 /**
@@ -226,22 +250,12 @@ class ProgressModel {
             } else {
                 ui.queued
             }
-            // 列表是隔几秒才重传的，这期间某几项可能已经开始传了：那张照片会同时出现在
-            // 大卡片和排队列表里，两者用同一个 key，LazyColumn 会直接抛"key 重复"崩掉。
-            // 在客户端剔一遍最省事，也顺手避免同一张照片显示两遍
-            val activeKeys = HashSet<String>(active.size * 2)
-            for (upload in active) {
-                activeKeys.add(upload.key)
-            }
-            val queuedDeduped = if (queued.isEmpty() || activeKeys.isEmpty()) {
-                queued
-            } else {
-                queued.filter { it.key !in activeKeys }
-            }
+            val tiles = buildTiles(queued, active)
             ProgressUiState(
                 state = root.optString("state", ProgressProtocol.STATE_IDLE),
                 active = active,
-                queued = queuedDeduped,
+                queued = queued,
+                tiles = tiles,
                 pending = root.optInt("pending", 0),
                 doneItems = root.optInt("sDoneItems", 0),
                 totalItems = root.optInt("sTotalItems", 0),
@@ -252,6 +266,41 @@ class ProgressModel {
         } catch (t: Throwable) {
             Logger.w("event=progress_parse_failed detail=$t")
             null
+        }
+    }
+
+    /**
+     * 把"队列顺序"与"谁在传"合成方格列表。
+     *
+     * `pl` 是整个队列按插入序的前几十项（含在传项），所以它就是唯一的有序依据：
+     * 某一格开始上传时只是原地多了一个 `sent`，不会换位置。
+     */
+    private fun buildTiles(queued: List<QueuedUpload>, active: List<ActiveUpload>): List<UploadTile> {
+        if (queued.isEmpty()) {
+            // 列表还没到（界面刚开、或这一帧恰好没带）：用在传项兜底，
+            // 至少能看到正在传的那几格，而不是一片空白
+            return active.map {
+                UploadTile(it.key, it.name, it.path, it.size, it.video, it.sent)
+            }
+        }
+        val activeByKey = HashMap<String, ActiveUpload>(active.size * 2)
+        for (upload in active) {
+            activeByKey[upload.key] = upload
+        }
+        // 查到就说明这一格在传。**不**把"不在列表里的在传项"前插进来：上传成功时队列侧
+        // 先移除该项、再通知进度线程，中间夹着落盘与跨进程落册调用，心跳若落在这个窗口
+        // 就会看到"active 有它、列表没有它"。前插会让这一格跳到第 0 位再消失；
+        // 忽略它的代价只是提前一帧消失，而此时它早已沉到看不见
+        return queued.map { item ->
+            val uploading = activeByKey[item.key]
+            UploadTile(
+                key = item.key,
+                name = item.name,
+                path = item.path,
+                size = item.size,
+                video = item.video,
+                sent = uploading?.sent
+            )
         }
     }
 }

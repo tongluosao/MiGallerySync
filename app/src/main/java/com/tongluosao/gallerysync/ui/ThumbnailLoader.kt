@@ -21,7 +21,7 @@ import java.util.concurrent.Executors
 /**
  * 进度页的缩略图加载。
  *
- * <p>不引第三方图片库（Glide / Coil）：进度页最多同时显示 3 张、每张只要 512px，
+ * <p>不引第三方图片库（Glide / Coil）：进度页最多几十个方格、每格只要 320px，
  * 一个内存 LRU 加一次采样解码就够了，为此多背一个库不值得。
  *
  * <p>按**绝对路径**直接解码，不走 MediaStore：上传队列里拿到的就是 DBImage 给的绝对路径，
@@ -31,18 +31,13 @@ import java.util.concurrent.Executors
 internal object ThumbnailLoader {
 
     /**
-     * 卡片（正在传的那几张）的目标边长。卡片在手机上约 336×210dp，512px 已经足够锐利；
-     * 再大只是白占内存 —— 这个缓存是按字节数算的，一张 512² 的 RGB_565 就是 512KB。
-     */
-    const val CARD_PX = 512
-
-    /**
-     * 排队列表里小缩略图的目标边长。
+     * 方格的目标边长。
      *
-     * <p>排队能有几十条，都按 512 解码的话光是它们就能把缓存撑爆，而且解码开销也白费
-     * —— 行高只有 40dp 出头，160px 已经够清楚。
+     * <p>进度页是 3 列贴屏幕边，411dp 屏每格约 135dp；420dpi 下约 355px。
+     * 取 320 而不是 355：`inSampleSize` 只按 2 的幂降采样，取 320 与 360 实际解出的尺寸
+     * 完全一样（一张 4000×3000 都解到 500×375），所以取小的那个不损失清晰度。
      */
-    const val ROW_PX = 160
+    const val TILE_PX = 320
 
     /** 解码失败的路径上限。同一张照片在一轮备份里会反复出现在帧里，失败一次就别再试 */
     private const val MAX_FAILED = 256
@@ -58,24 +53,22 @@ internal object ThumbnailLoader {
     /**
      * 解码线程池。
      *
-     * <p>不用 {@code Dispatchers.IO}：它的默认并发是 64，排队列表一滚下去可能同时抛出几十个
+     * <p>不用 {@code Dispatchers.IO}：它的默认并发是 64，方格列表一滚下去可能同时抛出几十个
      * 解码请求，一次解码就是几百 KB 的位图，并发太高只会把堆打爆、把滚动拖卡。
-     * 两路就够 —— 行是懒加载的，真正同时在解的就那么几张。
+     * 三路够用 —— 方格是懒加载的，真正同时在解的就那么几张。
      */
     private val dispatcher: CoroutineDispatcher =
-        Executors.newFixedThreadPool(2) { runnable ->
+        Executors.newFixedThreadPool(3) { runnable ->
             Thread(runnable, "gallerysync-thumb").apply { isDaemon = true }
         }.asCoroutineDispatcher()
 
     /**
      * 取一张缩略图；失败或没有权限时返回 null，调用方退回占位底。
      *
-     * <p>缓存键带上目标尺寸：同一张照片在卡片上是 512、在排队行里是 160，两者不能互相顶掉。
-     *
      * <p>没有在途去重：同一帧里不会有重复路径（去重键就含路径），而不同帧之间同一个路径
      * 第二次来的时候缓存已经填好了。
      */
-    suspend fun load(path: String, video: Boolean, targetPx: Int = CARD_PX): ImageBitmap? {
+    suspend fun load(path: String, video: Boolean, targetPx: Int = TILE_PX): ImageBitmap? {
         if (path.isEmpty()) {
             return null
         }

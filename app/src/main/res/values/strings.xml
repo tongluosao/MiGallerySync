@@ -66,8 +66,6 @@
     <string name="progress_total">上传总进度</string>
     <string name="progress_items">%1$d / %2$d 项</string>
     <string name="progress_bytes">%1$s / %2$s · 队列剩余 %3$d 项</string>
-    <string name="progress_item_detail">%1$d%% · %2$s / %3$s</string>
-    <string name="progress_queued">排队中 %1$d 项</string>
     <string name="progress_queued_more">还有 %1$d 项未列出</string>
     <string name="progress_idle">当前没有正在上传的照片</string>
     <string name="progress_no_data">相册未在备份，或模块未启用</string>
