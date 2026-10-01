@@ -38,6 +38,11 @@
     <string name="layout_date">按时间：2026/09/照片.jpg</string>
     <string name="layout_flat">全平铺：照片.jpg</string>
 
+    <string name="label_verify_async">100% 后不等复核</string>
+    <string name="summary_verify_async">发完立刻让出上传通道去传下一项，落盘复核在后台做。服务器假写仍会被发现并重传</string>
+    <string name="label_upload_concurrency">并行上传路数</string>
+    <string name="summary_upload_concurrency">同时上传几张，1-8，默认 3。调大能加速，太多会压满服务器</string>
+
     <string name="summary_theme_mode">只影响本页配色</string>
 
     <string name="label_theme_mode">主题模式</string>

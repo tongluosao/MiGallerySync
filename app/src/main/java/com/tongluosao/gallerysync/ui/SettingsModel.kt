@@ -56,6 +56,12 @@ class SettingsModel : CoroutineScope {
     /** 远端目录分法，取值下标对应 [LAYOUT_VALUES] */
     var layoutIndex by mutableStateOf(0)
         private set
+    /** 打开后 100% 即让出上传通道，落盘复核挪到后台线程 */
+    var verifyAsync by mutableStateOf(Config.DEFAULT_VERIFY_ASYNC)
+        private set
+    /** 并行路数，取值下标 = 路数 - 1，对应 [CONCURRENCY_ITEMS] */
+    var concurrencyIndex by mutableStateOf(Config.DEFAULT_UPLOAD_CONCURRENCY - 1)
+        private set
     var themeModeIndex by mutableStateOf(THEME_SYSTEM)
         private set
 
@@ -137,6 +143,17 @@ class SettingsModel : CoroutineScope {
     fun onLayoutChange(index: Int) {
         layoutIndex = index.coerceIn(0, LAYOUT_VALUES.lastIndex)
         writeNow(Config.KEY_REMOTE_LAYOUT, LAYOUT_VALUES[layoutIndex])
+    }
+
+    fun onVerifyAsyncChange(checked: Boolean) {
+        verifyAsync = checked
+        writeNow(Config.KEY_VERIFY_ASYNC, checked)
+    }
+
+    /** 下拉给的是下标，落盘的是真实的并行路数（1..MAX），落盘值与界面顺序必须一致 */
+    fun onConcurrencyChange(index: Int) {
+        concurrencyIndex = index.coerceIn(0, CONCURRENCY_ITEMS.lastIndex)
+        writeNow(Config.KEY_UPLOAD_CONCURRENCY, concurrencyIndex + 1)
     }
 
     fun onThemeModeChange(index: Int) {
@@ -279,6 +296,10 @@ class SettingsModel : CoroutineScope {
         wifiOnly = source.getBoolean(Config.KEY_WIFI_ONLY, true)
         uiMask = source.getBoolean(Config.KEY_UI_MASK, false)
         layoutIndex = layoutIndexOf(readLayout(source))
+        verifyAsync = source.getBoolean(Config.KEY_VERIFY_ASYNC, Config.DEFAULT_VERIFY_ASYNC)
+        concurrencyIndex = concurrencyIndexOf(
+            source.getInt(Config.KEY_UPLOAD_CONCURRENCY, Config.DEFAULT_UPLOAD_CONCURRENCY)
+        )
         maxItemsText = source.getInt(Config.KEY_MAX_ITEMS_PER_SYNC, Config.DEFAULT_MAX_ITEMS_PER_SYNC).toString()
         replaceModeIndex = modeIndexOf(source.getString(Config.KEY_REPLACE_MODE, Config.DEFAULT_REPLACE_MODE))
         themeModeIndex = source.getInt(KEY_THEME_MODE, THEME_SYSTEM).coerceIn(0, 2)
@@ -301,6 +322,12 @@ class SettingsModel : CoroutineScope {
             Config.KEY_WIFI_ONLY -> wifiOnly = source.getBoolean(key, true)
             Config.KEY_UI_MASK -> uiMask = source.getBoolean(key, false)
             Config.KEY_REMOTE_LAYOUT -> layoutIndex = layoutIndexOf(readLayout(source))
+            Config.KEY_VERIFY_ASYNC -> verifyAsync =
+                source.getBoolean(key, Config.DEFAULT_VERIFY_ASYNC)
+
+            Config.KEY_UPLOAD_CONCURRENCY -> concurrencyIndex = concurrencyIndexOf(
+                source.getInt(key, Config.DEFAULT_UPLOAD_CONCURRENCY)
+            )
             Config.KEY_MAX_ITEMS_PER_SYNC -> maxItemsText =
                 source.getInt(key, Config.DEFAULT_MAX_ITEMS_PER_SYNC).toString()
 
@@ -363,6 +390,9 @@ class SettingsModel : CoroutineScope {
         /** 远端目录分法的落盘值，顺序必须与界面选项一致 */
         val LAYOUT_VALUES = listOf(Config.LAYOUT_ALBUM, Config.LAYOUT_DATE, Config.LAYOUT_FLAT)
 
+        /** 并行路数的选项文案，下标 = 路数 - 1 */
+        val CONCURRENCY_ITEMS = (1..Config.MAX_UPLOAD_CONCURRENCY).map { it.toString() }
+
         const val THEME_SYSTEM = 0
         const val THEME_LIGHT = 1
         const val THEME_DARK = 2
@@ -380,6 +410,16 @@ class SettingsModel : CoroutineScope {
         private fun layoutIndexOf(value: String?): Int {
             val index = LAYOUT_VALUES.indexOf(value)
             return if (index >= 0) index else 0
+        }
+
+        /**
+         * 路数换算成下标，读进来时同样夹一次。
+         *
+         * <p>与 [Config.clampConcurrency] 同源：老版本或手改的 XML 里可能是 0 或 99，
+         * 界面必须显示成真正会生效的那个值，不能让用户以为自己设的是 99。
+         */
+        private fun concurrencyIndexOf(value: Int): Int {
+            return Config.clampConcurrency(value) - 1
         }
 
         /**

@@ -214,13 +214,28 @@ public final class WebDavClient {
 
     /** 上传文件；父目录不存在时补建目录并重试一次 */
     public boolean put(String remotePath, File localFile) throws IOException {
-        Res res = putWithDirFallback(remotePath, localFile, null);
-        requireSuccess(res, "PUT", remotePath);
+        putSend(remotePath, localFile);
         if (!storedAs(remotePath, localFile.length())) {
             throw new IOException("PUT returned 2xx but the server has no such file"
                     + " path=" + remotePath);
         }
         return true;
+    }
+
+    /**
+     * 只把请求体发出去，**不复核**。
+     *
+     * <p>给"发完就走"的上传队列用：PUT 的字节写进 socket 之后，界面上就已经是 100% 了，
+     * 后面那几轮 HEAD/PROPFIND（最多 {@link #VERIFY_ATTEMPTS} 轮 × {@link #VERIFY_RETRY_DELAY}）
+     * 是在等挂载型存储落盘，跟"这张照片传完了没有"无关，却一直占着上传通道。
+     * 拆出来之后复核可以挪到别处做，通道立刻空出来去传下一项。
+     *
+     * <p><b>调用方必须自己复核</b>（调 {@link #storedAs}），否则"回了 2xx 却没落盘"的服务器
+     * 会被当成上传成功 —— 相册那边一记账就再也不会重传，那是本模块最不能出现的结果。
+     */
+    public void putSend(String remotePath, File localFile) throws IOException {
+        Res res = putWithDirFallback(remotePath, localFile, null);
+        requireSuccess(res, "PUT", remotePath);
     }
 
     /** 写入一小段内容；失败、以及"回了 2xx 却没落盘"都抛异常。界面用它做真实可写探测 */

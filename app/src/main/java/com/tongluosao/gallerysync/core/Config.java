@@ -27,6 +27,21 @@ public final class Config {
     public static final String KEY_REMOTE_LAYOUT = "remote_layout";
     /** 旧键：只表示"扁平"。留着只为把老配置读出来，新写入一律走 remote_layout */
     public static final String KEY_FLAT_PATH = "flat_path";
+    /**
+     * 并行上传的路数，1..{@link #MAX_UPLOAD_CONCURRENCY}。
+     *
+     * <p>以前是写死的 3 路。每路各持一条 keep-alive 连接，能开多大取决于服务器：
+     * 直连自建 WebDAV 时多路明显更快，而 OpenList 挂网盘那一类并发再高收益递减，所以交给用户。
+     */
+    public static final String KEY_UPLOAD_CONCURRENCY = "upload_concurrency";
+    /**
+     * 100% 之后不等复核，立刻让出上传通道。
+     *
+     * <p>PUT 的请求体发完（界面走到 100%）之后还有 HEAD/PROPFIND 复核，那是为了识破
+     * "回 2xx 却没落盘"的假写存储。这段等待原本占着 worker 槽位，整条队列跟着一起等；
+     * 打开这个开关后复核挪到独立线程，槽位立刻空出来去传下一项。
+     */
+    public static final String KEY_VERIFY_ASYNC = "verify_async";
 
     /** 替换：拦截原链路，只上传 WebDAV */
     public static final String MODE_REPLACE = "replace";
@@ -59,6 +74,15 @@ public final class Config {
      */
     public static final int DEFAULT_MAX_ITEMS_PER_SYNC = 1000;
     public static final int DEFAULT_MAX_RETRY = 5;
+    /** 默认与老版本写死的路数一致：升级后行为不变，想要更快在设置页自己调 */
+    public static final int DEFAULT_UPLOAD_CONCURRENCY = 3;
+    /** 上限压住连接数：再高对自建服务器与网盘网关都是压测，收益已经很小 */
+    public static final int MAX_UPLOAD_CONCURRENCY = 8;
+    /**
+     * 默认开启。用户抱怨的就是"到 100% 还要等"，默认就该是修好的状态；
+     * 复核本身没有取消，只是挪到了后台，假写存储照样会被抓住并重传。
+     */
+    public static final boolean DEFAULT_VERIFY_ASYNC = true;
 
     private final String replaceMode;
     private final String baseUrl;
@@ -71,6 +95,8 @@ public final class Config {
     private final boolean uiMask;
     private final boolean verboseLog;
     private final String remoteLayout;
+    private final int uploadConcurrency;
+    private final boolean verifyAsync;
 
     private Config(SharedPreferences prefs) {
         if (prefs == null) {
@@ -85,6 +111,8 @@ public final class Config {
             uiMask = false;
             verboseLog = true;
             remoteLayout = DEFAULT_REMOTE_LAYOUT;
+            uploadConcurrency = DEFAULT_UPLOAD_CONCURRENCY;
+            verifyAsync = DEFAULT_VERIFY_ASYNC;
         } else {
             replaceMode = prefs.getString(KEY_REPLACE_MODE, DEFAULT_REPLACE_MODE);
             baseUrl = prefs.getString(KEY_BASE_URL, "");
@@ -97,7 +125,23 @@ public final class Config {
             uiMask = prefs.getBoolean(KEY_UI_MASK, false);
             verboseLog = prefs.getBoolean(KEY_VERBOSE_LOG, true);
             remoteLayout = readLayout(prefs);
+            uploadConcurrency = clampConcurrency(
+                    prefs.getInt(KEY_UPLOAD_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY));
+            verifyAsync = prefs.getBoolean(KEY_VERIFY_ASYNC, DEFAULT_VERIFY_ASYNC);
         }
+    }
+
+    /**
+     * 夹进 1..{@link #MAX_UPLOAD_CONCURRENCY}。
+     *
+     * <p>共享偏好是别的进程写进来的，值可能来自旧版本、手改的 XML 或写坏的配置；
+     * 0 会让上传一路都不启动（等于"备份停了"），过大则把服务器打满，两头都必须在读进来时兜住。
+     */
+    public static int clampConcurrency(int value) {
+        if (value < 1) {
+            return 1;
+        }
+        return Math.min(value, MAX_UPLOAD_CONCURRENCY);
     }
 
     /**
@@ -181,6 +225,16 @@ public final class Config {
         return LAYOUT_FLAT.equals(remoteLayout);
     }
 
+    /** 并行上传路数，已保证在 1..{@link #MAX_UPLOAD_CONCURRENCY} 内 */
+    public int getUploadConcurrency() {
+        return uploadConcurrency;
+    }
+
+    /** true 表示 PUT 发完就走，落盘复核交给后台线程 */
+    public boolean isVerifyAsync() {
+        return verifyAsync;
+    }
+
     @Override
     public String toString() {
         return "Config{mode=" + replaceMode
@@ -188,7 +242,9 @@ public final class Config {
                 + ", root=" + remoteRoot
                 + ", layout=" + remoteLayout
                 + ", wifiOnly=" + wifiOnly
-                + ", maxItems=" + maxItemsPerSync + "}";
+                + ", maxItems=" + maxItemsPerSync
+                + ", workers=" + uploadConcurrency
+                + ", verifyAsync=" + verifyAsync + "}";
     }
 
     /** 只保留 scheme + host + port，避免凭据与路径出现在日志里 */

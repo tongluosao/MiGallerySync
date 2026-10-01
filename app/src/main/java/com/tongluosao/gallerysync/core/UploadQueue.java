@@ -13,6 +13,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -23,14 +24,21 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * WebDAV 上传队列：去重、持久化、**并行上传（3 路）**、服务器级冷却退避。
+ * WebDAV 上传队列：去重、持久化、**并行上传（路数可调）**、服务器级冷却退避。
  *
  * <p>运行在相册进程，必须在后台线程完成全部 IO 与网络，绝不能阻塞相册的同步线程。
  * 去重键为 路径+大小+修改时间，已完成的记录会保留，避免相册因 localFlag 未清除而反复入队时重复上传。
  *
- * <p>为什么是 3 路而不是串行：单条连接上"发一个请求、等服务器收完再回响应"的往返占了
- * 每张照片的大头，串行时链路大部分时间在空等。3 路各持一条 keep-alive 连接，
- * 既能把等待叠起来，又不至于把自建服务器打满（真机上是 OpenList 挂网盘，并发再高收益递减）。
+ * <p>为什么并行而不是串行：单条连接上"发一个请求、等服务器收完再回响应"的往返占了
+ * 每张照片的大头，串行时链路大部分时间在空等。每路各持一条 keep-alive 连接，
+ * 既能把等待叠起来，又不至于把自建服务器打满。路数由 {@code upload_concurrency} 决定
+ * （1..8，默认 3）：真机上是 OpenList 挂网盘时并发再高收益递减，而直连自建 WebDAV
+ * 时多开几路明显更快，所以这个值交给用户。
+ *
+ * <p>"发完了还要等复核"曾经也占着这一路：PUT 的请求体写完之后，为了识破"回 2xx 却没落盘"的
+ * 假写存储，还要 HEAD/PROPFIND 复核好几轮（见 {@code WebDavClient.storedAs}），
+ * 那段时间界面停在 100% 而并行通道被白白占住。打开 {@code verify_async} 之后，
+ * 复核挪到 {@link #mVerifying} 对应的后台线程，通道立刻空出来去传下一项。
  *
  * <p>队列见底时会主动请相册再枚举一次（间隔逐次翻倍），因为相册自己只在小时级的排期上
  * 枚举脏项 —— 干等的话队列空着的时间远多于在传的时间。
@@ -56,20 +64,26 @@ public final class UploadQueue {
     private static final long WAIT_NO_TASK = 120_000L;
     private static final long WAIT_NO_NETWORK = 300_000L;
     /**
-     * 并发上传的路数，同时也就是进度页上"正在传"的照片数上限。
+     * 熔断要攒够几轮失败。
      *
-     * <p>每路各持一条 keep-alive 连接（见 {@link #clientFor}）。调大不是不能，但要连
-     * {@link #UNHEALTHY_FAILURES} 一起重估：那个阈值是按"并发下几轮才该熔断"定的。
-     */
-    private static final int UPLOAD_CONCURRENCY = 3;
-    /**
-     * 连续失败到这个次数就认为 WebDAV 侧不可用，Hook 侧会临时放行原链路。
-     *
-     * <p>3 并发下一次"整台服务器挂了"会在同一轮里凑出 3 次失败，所以阈值按轮数折算：
-     * 9 次 ≈ 原来的 5 次串行（约 3 轮）。定得太低会在服务器偶发抖动时误熔断，
+     * <p>一次"整台服务器挂了"会在同一轮里让**每一路**都失败一次，所以阈值必须按轮数折算，
+     * 不能按次数写死：3 路时 3 轮 = 9 次，与改造前写死的 9 次一致；8 路时是 24 次，
+     * 语义始终是"每路都试了约 3 轮"。定得太低会在服务器偶发抖动时误熔断，
      * 定得太高则真挂时迟迟不让位原链路 —— 后者是本模块最不能出现的结果，所以宁可偏保守。
      */
-    private static final int UNHEALTHY_FAILURES = 9;
+    private static final int BREAKER_ROUNDS = 3;
+    /**
+     * 落盘复核的后台线程数。
+     *
+     * <p>复核就是"发个 HEAD 等服务器回"，纯等待，不需要跟上传一样多：两路足够把复核的等待
+     * 叠起来，又不至于为几张照片再开一堆连接。
+     */
+    private static final int VERIFY_THREADS = 2;
+    /**
+     * 待复核项的积压上限。满了就退回同步复核（发完自己等），宁可这一项慢一点，
+     * 也不能让待复核项无上限地堆在内存里。
+     */
+    private static final int MAX_VERIFY_BACKLOG = 64;
     /** 只有不超过这个体积的项失败才算"整台服务器不行"；更大的项失败只算它自己传不动 */
     private static final long BREAKER_PROBE_MAX = 16L * 1024 * 1024;
     /**
@@ -97,18 +111,50 @@ public final class UploadQueue {
     /**
      * 正在被某个 worker 传的项（键同 {@link Task#key()}），受 {@link #mLock} 保护。
      *
-     * <p>它**只是内存态**，用来让 3 个 worker 互斥领取任务。在传的项不会被移出
-     * {@link #mPending}，所以 state.json 的结构与语义完全不变：进程被杀时这 3 项还在
+     * <p>它**只是内存态**，用来让多个 worker 互斥领取任务。在传的项不会被移出
+     * {@link #mPending}，所以 state.json 的结构与语义完全不变：进程被杀时这几项还在
      * pending 里，下次启动被重新领取并覆盖写（PUT 幂等），不会丢任务。
      */
     private final Set<String> mInflight = new HashSet<>();
+    /**
+     * 字节已经发完、正在等落盘复核的项，受 {@link #mLock} 保护。
+     *
+     * <p>它跟 {@link #mInflight} 是**两个阶段**，分开记正是这次改动的要害：
+     * 从 worker 的角度这些项已经结束（上传通道要立刻去传下一项），但从队列的角度它们还没传完
+     * （复核失败仍要重试）。所以它们照旧留在 {@link #mPending} 里、不进 {@link #mDone}，
+     * 只是不再被新的 worker 领走，也不再计入"我这一路手上还有活"。
+     *
+     * <p>进程被杀时这里的东西直接丢掉：state.json 里这些项还是 pending，下次启动重新 PUT
+     * 一遍（覆盖写，幂等），代价只是再传一次，不是丢数据。
+     */
+    private final Set<String> mVerifying = new HashSet<>();
+    /**
+     * 交接给复核线程的队列，受 {@link #mLock} 保护。
+     *
+     * <p>有界（{@link #MAX_VERIFY_BACKLOG}）：复核比上传快得多，正常不会积压；
+     * 真积压了就退回同步复核，绝不让它无限涨。
+     */
+    private final ArrayDeque<Verify> mVerifyQueue = new ArrayDeque<>();
+    /**
+     * 当前并行上传路数，取自 {@code upload_concurrency}（1..{@link Config#MAX_UPLOAD_CONCURRENCY}）。
+     *
+     * <p>可调：用户在设置页改完是跨进程写共享偏好 → 相册进程收到 {@code config_changed} →
+     * {@link #setConfig} 在这里生效。调小时越界的那几路会在**传完手上这一项之后**退出，
+     * 不会把正在传的请求砍掉。
+     */
+    private volatile int mConcurrency = Config.DEFAULT_UPLOAD_CONCURRENCY;
 
     private volatile Config mConfig;
     private volatile SyncMarker mMarker;
     private volatile HostSyncState mProgress;
     /** 多个 worker 会同时自增，Hook 线程还会跨线程读，必须原子 */
     private final AtomicInteger mConsecutiveFailures = new AtomicInteger();
-    private final Thread[] mWorkers = new Thread[UPLOAD_CONCURRENCY];
+    /**
+     * 上传线程数组。**按上限开满**，实际启用几路由 {@link #mConcurrency} 决定：
+     * 调大时现开新线程（worker 只在启动时创建，中途不能凭空多出来），
+     * 调小时多出来的那几路自己退出循环。
+     */
+    private final Thread[] mWorkers = new Thread[Config.MAX_UPLOAD_CONCURRENCY];
     /** worker 循环在锁外读它，必须 volatile；热重载时由 shutdown() 置假 */
     private volatile boolean mRunning = true;
 
@@ -116,8 +162,17 @@ public final class UploadQueue {
      * 复用的 WebDAV 客户端：连接 keep-alive 的载体，目标变了才换。**每路一个** ——
      * 一条连接上同时发两个请求会串包，而且并行等待正是提速的来源。
      */
-    private final WebDavClient[] mClients = new WebDavClient[UPLOAD_CONCURRENCY];
-    private final String[] mClientTargets = new String[UPLOAD_CONCURRENCY];
+    private final WebDavClient[] mClients = new WebDavClient[Config.MAX_UPLOAD_CONCURRENCY];
+    private final String[] mClientTargets = new String[Config.MAX_UPLOAD_CONCURRENCY];
+    /**
+     * 复核线程自己的连接，**必须与上传的 {@link #mClients} 分开**。
+     *
+     * <p>复核时对应的 worker 已经去传下一项了，两条线程会同时用同一个客户端：
+     * 一条连接上并行两个请求会串包，互相把对方的响应读走。
+     */
+    private final WebDavClient[] mVerifyClients = new WebDavClient[VERIFY_THREADS];
+    private final String[] mVerifyTargets = new String[VERIFY_THREADS];
+    private final Thread[] mVerifiers = new Thread[VERIFY_THREADS];
     private long mLastSave;
     private boolean mSavePending;
     /** 本轮空转之前传上去了几项。3 个 worker 都会加，只有空闲时那个读 */
@@ -166,24 +221,30 @@ public final class UploadQueue {
             @Override
             public int pendingCount() {
                 synchronized (mLock) {
-                    // mPending 里含着正在传的那几项（它们刻意不移出，见 mInflight 的注释），
-                    // 对客户端来说"还没轮到"要把它们减掉，否则总项数会多算 3
-                    return Math.max(mPending.size() - mInflight.size(), 0);
+                    // mPending 里含着正在传的、以及正在后台复核的那几项（都刻意不移出，
+                    // 见 mInflight / mVerifying 的注释），对客户端来说"还没轮到"要把它们减掉
+                    return Math.max(mPending.size() - mInflight.size() - mVerifying.size(), 0);
                 }
             }
 
             @Override
             public long pendingBytes() {
                 synchronized (mLock) {
-                    // 先全量求和再减掉在传的那几个，而不是逐项 contains 判断：
+                    // 先全量求和再减掉在传/复核的那几个，而不是逐项 contains 判断：
                     // 后者要为每个 pending 项拼一次去重键字符串（路径+大小+时间），
                     // 全量首备时 pending 上万个，心跳每 500ms 一次就是每秒上万次分配。
-                    // 在传最多 3 个，反查的代价可以忽略
+                    // 在传与复核合起来最多十几项，反查的代价可以忽略
                     long total = 0;
                     for (Task task : mPending.values()) {
                         total += task.size;
                     }
                     for (String key : mInflight) {
+                        Task task = mPending.get(key);
+                        if (task != null) {
+                            total -= task.size;
+                        }
+                    }
+                    for (String key : mVerifying) {
                         Task task = mPending.get(key);
                         if (task != null) {
                             total -= task.size;
@@ -198,13 +259,12 @@ public final class UploadQueue {
                 synchronized (mLock) {
                     List<UploadProgressPublisher.PendingItem> out =
                             new ArrayList<>(Math.min(limit, mPending.size()));
+                    // 含正在传的那几项，不跳过：进度页要的是一个和队列同序的方格列表，
+                    // 在传的格子应该在**它原来的位置**上长出水面，而不是被拎到最前面。
+                    // worker 从队首领取，所以这 3 项本来就排在最前，顺序天然是对的。
                     for (Task task : mPending.values()) {
                         if (out.size() >= limit) {
                             break;
-                        }
-                        if (mInflight.contains(task.key())) {
-                            // 正在传的那几个在进度页上是单独的大卡片，这里不再列一遍
-                            continue;
                         }
                         out.add(new UploadProgressPublisher.PendingItem(
                                 task.key(), baseName(task.path), task.path, task.size, task.video));
@@ -224,6 +284,7 @@ public final class UploadQueue {
             }
         });
         startWorkers();
+        startVerifiers();
     }
 
     public static UploadQueue get(Context context, Config config) {
@@ -243,29 +304,51 @@ public final class UploadQueue {
      */
     public void shutdown() {
         int pending;
+        List<Verify> cancelled;
         synchronized (mLock) {
             // 先把最后一次进度落盘再停：mRunning 置假后 saveLocked 会直接跳过
             flushLocked();
             mRunning = false;
             pending = mPending.size();
             mInflight.clear();
+            // 还没轮到复核的项直接作废。它们仍在 mPending 里（没移出、没记 done），
+            // 下次启动会被重新 PUT 一遍（覆盖写、幂等），代价只是再传一次，不是丢数据
+            cancelled = new ArrayList<>(mVerifyQueue);
+            mVerifyQueue.clear();
+            mVerifying.clear();
             mLock.notifyAll();
         }
-        // 别让相册的界面一直挂在"正在上传"上。用 endAll 而不是 endUpload：3 路并发下
+        // 这些项已经 taskStart 过、也 beginUpload 过，得自己把账还回去
+        for (Verify job : cancelled) {
+            mPublisher.taskEnd(job.key, false);
+        }
+        if (!cancelled.isEmpty()) {
+            Logger.i("event=queue_shutdown_verify_dropped count=" + cancelled.size());
+        }
+        // 别让相册的界面一直挂在"正在上传"上。用 endAll 而不是 endUpload：多路并发下
         // "谁最后结束"不确定，endUpload 只是减引用，收不了尾
         HostSyncState progress = mProgress;
         if (progress != null) {
+            for (Verify ignored : cancelled) {
+                progress.endUpload();
+            }
             progress.endAll();
         }
         releaseClient();
+        releaseVerifyClients();
         // 心跳线程也得停：它是 daemon 不会拖住进程退出，但留着的话热重载后新旧两条
         // 心跳会一起发帧，客户端收到的进度会在两套数据之间跳
         mPublisher.stop();
         Logger.i("event=queue_shutdown pending=" + pending
-                + " workers=" + UPLOAD_CONCURRENCY);
+                + " workers=" + mConcurrency);
         for (Thread worker : mWorkers) {
             if (worker != null) {
                 worker.interrupt();
+            }
+        }
+        for (Thread verifier : mVerifiers) {
+            if (verifier != null) {
+                verifier.interrupt();
             }
         }
         // 单例也得清掉：worker 已经停了，留着它的话下一次 get() 会拿到一个永远不会动的队列
@@ -287,20 +370,46 @@ public final class UploadQueue {
     }
 
     private void releaseClient() {
-        for (int i = 0; i < UPLOAD_CONCURRENCY; i++) {
+        for (int i = 0; i < Config.MAX_UPLOAD_CONCURRENCY; i++) {
             releaseClientAt(i);
         }
     }
 
+    /** 关掉第 index 个复核线程自己的连接 */
+    private void releaseVerifyClientAt(int index) {
+        WebDavClient client = mVerifyClients[index];
+        mVerifyClients[index] = null;
+        mVerifyTargets[index] = null;
+        if (client != null) {
+            client.close();
+        }
+    }
+
+    private void releaseVerifyClients() {
+        for (int i = 0; i < VERIFY_THREADS; i++) {
+            releaseVerifyClientAt(i);
+        }
+    }
+
     /**
-     * WebDAV 侧是否可用。
+     * WebDAV 侧是否可用。**这只是给界面看的观测信号，不再决定放不放行原链路。**
      *
-     * <p>连续失败达到阈值就返回 false。Hook 侧据此在替换模式下临时放行原链路：
-     * 队列一直失败（密码错、服务器挂）时若还继续拦截，相册这边被挡、WebDAV 那边传不上去，
-     * 就成了"两边都没传"，那是本模块最不能出现的结果。宁可退回小米云，也不能丢备份。
+     * <p>早先连续失败到阈值时 Hook 会退回小米云"保底"。现在替换模式的语义是"只传 WebDAV，
+     * 一张都不去小米云"：不可用就继续拦着、继续退避重试，队列和相册的 localFlag 都原样保留，
+     * 下一轮枚举还会把它们交回来 —— 晚传不等于丢失，传到不想要的云上才是真的错。
      */
     public boolean isHealthy() {
-        return mConsecutiveFailures.get() < UNHEALTHY_FAILURES;
+        return mConsecutiveFailures.get() < unhealthyFailures();
+    }
+
+    /**
+     * 熔断阈值：每路都要试够 {@link #BREAKER_ROUNDS} 轮。
+     *
+     * <p>路数可调之后阈值不能再写死：8 路时一次"整台服务器挂了"会一轮凑出 8 次失败，
+     * 写死 9 就变成"一轮半就熔断"，服务器只是抖动也可能被误判。
+     */
+    private int unhealthyFailures() {
+        return BREAKER_ROUNDS * Math.max(mConcurrency, 1);
     }
 
     /** 当前连续失败次数，仅用于日志 */
@@ -362,10 +471,37 @@ public final class UploadQueue {
             }
             // 旧连接是对着旧目标建的，keep-alive 留着只会连错地方
             releaseClient();
+            releaseVerifyClients();
             synchronized (mLock) {
                 targetChangedLocked();
             }
         }
+        applyConcurrency(config.getUploadConcurrency());
+    }
+
+    /**
+     * 应用并行路数。
+     *
+     * <p>调大：立刻补开线程（它们会自己去抢任务）。调小：只更新计数，越界那几路会在
+     * 传完手上**这一项之后**自然退出循环 —— 不能在传输中途把请求砍了，那样这一项既没传完、
+     * 也没进重试队列，只能等下一轮枚举才回来。
+     *
+     * <p>不需要 notifyAll：调大是"多了几路来抢"，队列里若真有活，新线程一进去就能看到；
+     * 若都在退避，它们的 wait 到期时间本来就是按最早那个 nextAttemptAt 算的，喊醒也没用。
+     */
+    private void applyConcurrency(int wanted) {
+        int clamped = Config.clampConcurrency(wanted);
+        int old = mConcurrency;
+        if (clamped == old) {
+            return;
+        }
+        mConcurrency = clamped;
+        if (clamped > old) {
+            for (int i = old; i < clamped; i++) {
+                startWorker(i);
+            }
+        }
+        Logger.i("event=queue_concurrency changed=" + old + " to=" + clamped);
     }
 
     /**
@@ -455,13 +591,31 @@ public final class UploadQueue {
     }
 
     private void startWorkers() {
-        for (int i = 0; i < UPLOAD_CONCURRENCY; i++) {
+        for (int i = 0; i < mConcurrency; i++) {
+            startWorker(i);
+        }
+    }
+
+    /**
+     * 开第 index 路上传线程。线程对象只建一次 —— 重复调用只会把同一路开两遍，
+     * 所以 {@link #applyConcurrency} 只在**调大**时补开，调小时靠旧线程自己退出。
+     */
+    private void startWorker(int index) {
+        Thread worker = new Thread(() -> drain(index), "MiGallerySync-upload-" + index);
+        // daemon：上传线程绝不能拖住相册进程不让它退出
+        worker.setDaemon(true);
+        mWorkers[index] = worker;
+        worker.start();
+    }
+
+    /** 开复核线程。数量固定（{@link #VERIFY_THREADS}），不随上传路数变 */
+    private void startVerifiers() {
+        for (int i = 0; i < VERIFY_THREADS; i++) {
             final int index = i;
-            Thread worker = new Thread(() -> drain(index), "MiGallerySync-upload-" + i);
-            // daemon：上传线程绝不能拖住相册进程不让它退出
-            worker.setDaemon(true);
-            mWorkers[i] = worker;
-            worker.start();
+            Thread verifier = new Thread(() -> verifyLoop(index), "MiGallerySync-verify-" + index);
+            verifier.setDaemon(true);
+            mVerifiers[index] = verifier;
+            verifier.start();
         }
     }
 
@@ -476,7 +630,7 @@ public final class UploadQueue {
      * 不需要先领再放（那样一旦网络长时间不通，被领走的那几项会一直挂在 in-flight 里）。
      */
     private void drain(int index) {
-        while (mRunning) {
+        while (mRunning && index < mConcurrency) {
             Config config = mConfig;
             if (config == null || !config.isReady()) {
                 sleepQuietly(WAIT_NO_TASK);
@@ -495,9 +649,9 @@ public final class UploadQueue {
                 long now = System.currentTimeMillis();
                 for (Task candidate : mPending.values()) {
                     String candidateKey = candidate.key();
-                    if (mInflight.contains(candidateKey)) {
-                        // 同伴正在传它：跳过。它的 nextAttemptAt 也不该算进"我还要等多久"，
-                        // 它已经在被处理了，不是在排队
+                    if (mInflight.contains(candidateKey) || mVerifying.contains(candidateKey)) {
+                        // 同伴正在传它（或在后台复核它）：跳过。它的 nextAttemptAt 也不该算进
+                        // "我还要等多久"，它已经在被处理了，不是在排队
                         continue;
                     }
                     if (candidate.nextAttemptAt <= now) {
@@ -509,9 +663,11 @@ public final class UploadQueue {
                     waitMillis = Math.min(waitMillis, candidate.nextAttemptAt - now);
                 }
                 if (task == null) {
-                    // 只有"一项都没人在传"才算真的空闲。否则这一路会替正在传的同伴去收尾
-                    // （endAll + 催同步），把宿主的"正在上传"提前关掉
-                    if (mInflight.isEmpty() && !mIdleNotified) {
+                    // 只有"一项都没人在传、也没有还没定论的复核"才算真的空闲。
+                    // 否则这一路会替正在传的同伴去收尾（endAll + 催同步），
+                    // 把宿主的"正在上传"提前关掉 —— 复核失败的那一项马上又要重传，
+                    // 界面就会在"传完了"和"正在上传"之间来回跳
+                    if (mInflight.isEmpty() && mVerifying.isEmpty() && !mIdleNotified) {
                         mIdleNotified = true;
                         idle = true;
                     }
@@ -519,7 +675,7 @@ public final class UploadQueue {
                         mLock.wait(Math.max(1000L, waitMillis));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
-                        return;
+                        break;
                     }
                 }
             }
@@ -534,6 +690,9 @@ public final class UploadQueue {
 
             upload(task, config, index);
         }
+        // 路数被调小、或队列整体停机时走到这里。这一路的连接要还回去，
+        // 否则它会一直对着目标挂着，直到队列销毁
+        releaseClientAt(index);
     }
 
     /**
@@ -555,7 +714,7 @@ public final class UploadQueue {
         // 收尾必须在锁内做并复查一次，否则会出现"同伴已经 beginUpload，我们却告诉宿主传完了"——
         // 那之后整批传输期间宿主界面都会停在"未在上传"
         synchronized (mLock) {
-            if (!mInflight.isEmpty()) {
+            if (!mInflight.isEmpty() || !mVerifying.isEmpty()) {
                 return;
             }
             progress.endAll();
@@ -598,6 +757,9 @@ public final class UploadQueue {
             boolean ok = false;
             // 提到 try 外面：finally 里要用它清掉进度回调
             WebDavClient client = null;
+            // 交出去之后 worker 这边就不能再碰 endUpload/taskEnd —— 那两条账由复核线程在
+            // 真正知道结果之后记（见 verifyLoop），否则会出现"还没确认就告诉宿主传完了"
+            boolean handedOff = false;
             try {
                 client = clientFor(config, index);
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
@@ -611,70 +773,203 @@ public final class UploadQueue {
                 // 真目录被同名文件一挡，后续文件 PUT 就随机 405/423 —— 探测反而制造了故障。
                 // 能自动补父目录的服务器（alist / OpenList / CloudDrive2）本来就不需要这一步；
                 // 不需要的由 put() 在 404/409 时补建一次。
-                client.put(remotePath, file);
-                ok = true;
-                synchronized (mLock) {
-                    mPending.remove(taskKey);
-                    mPendingVersion++;
-                    mDone.put(taskKey, System.currentTimeMillis());
-                    trimDoneLocked();
-                    saveThrottledLocked();
-                }
-                int failures = mConsecutiveFailures.getAndSet(0);
-                if (failures != 0) {
-                    Logger.i("event=queue_recovered failures_reset=" + failures);
-                }
-                // 传通一次就说明服务器是活的：冷却清零、催相册的间隔也拉回最短，
-                // 不然一次抖动会把后面几十项的间隔一直撑在最大值上
-                mCooldownFailures.set(0);
-                mIdleSyncDelay = IDLE_SYNC_BASE;
-                mUploadedSinceIdle.incrementAndGet();
-                Logger.i("event=upload_ok worker=" + index + " path=" + task.path
-                        + " remote=" + remotePath
-                        + " size=" + file.length() + " pending=" + mPending.size());
-                // put() 里已经用 HEAD/PROPFIND 复核过确实落盘，才配得上这条记账；
-                // 放在锁外做，宿主 provider 的耗时不该把队列锁住
-                SyncMarker marker = mMarker;
-                if (marker != null) {
-                    marker.markSynced(task.rowId);
-                }
-                if (progress != null) {
-                    // 记账写下去之后界面上的"待备份 N"才会减一，所以刷新放在记账之后
-                    progress.refresh();
+                if (config.isVerifyAsync()
+                        && enqueueVerify(taskKey, task, config, remotePath, file.length())) {
+                    handedOff = true;
+                } else {
+                    // 同步路径：发 + 复核一气呵成。复核没过会抛 IOException，
+                    // 与"服务器直接回错误码"走同一套重试逻辑
+                    client.put(remotePath, file);
+                    ok = true;
+                    finalizeOk(task, config, remotePath, String.valueOf(index));
                 }
             } catch (WebDavClient.TransportFailure e) {
-                // 连接层失败：只算这一项的账，不喂熔断（见 WebDavClient.send 的注释）
-                scheduleRetry(task, config, e.getMessage(), false);
+                finalizeFail(task, config, e);
             } catch (IOException e) {
-                // 服务器自己回的错误码（401/403/5xx/假写）。大文件在这些码上更容易被边缘节点
-                // 单独掐掉（实测 3MB 回 554 而小文件全过），所以只有"小体积的项也失败"才说明
-                // 是整台服务器不可用，够格喂熔断
-                scheduleRetry(task, config, e.getMessage(), task.size <= BREAKER_PROBE_MAX);
+                finalizeFail(task, config, e);
             } catch (Throwable t) {
-                mConsecutiveFailures.incrementAndGet();
-                Logger.e("event=upload_error path=" + task.path, t);
-                synchronized (mLock) {
-                    task.nextAttemptAt = System.currentTimeMillis() + RETRY_GIVE_UP;
-                    saveThrottledLocked();
-                }
+                finalizeUnexpected(task, t);
             } finally {
-                // 与上面的 beginUpload 严格配对（内部是引用计数，只有归零才告诉宿主"传完了"）
-                if (progress != null) {
-                    progress.endUpload();
-                }
-                // 迟到的字节回调由 publisher 自己按 key 丢掉，这里清掉只是不留悬空引用
+                // 迟到的字节回调由 publisher 自己按 key 丢掉，这里清掉只是不留悬空引用。
+                // 交出去的情况也要清：这一路的连接马上要给下一项用
                 if (client != null) {
                     client.setProgressListener(null);
                 }
-                mPublisher.taskEnd(taskKey, ok);
+                if (!handedOff) {
+                    // 与上面的 beginUpload 严格配对（内部是引用计数，只有归零才告诉宿主"传完了"）
+                    if (progress != null) {
+                        progress.endUpload();
+                    }
+                    mPublisher.taskEnd(taskKey, ok);
+                }
             }
         } finally {
             // 任何返回路径都必须把这一项从"在传"里摘掉：漏了的话它既不会被重试也不会被跳过，
-            // 永远占着位置 —— 3 路里少一路就是永久少三分之一的吞吐
+            // 永远占着位置 —— 少一路就是永久少一部分吞吐。
+            // 交出去的项此时已经在 mVerifying 里（enqueueVerify 在锁内登记的），
+            // 所以这里只管 mInflight：对 worker 来说这一项结束了，通道要立刻去传下一项，
+            // 对新 worker 来说它还没完（mVerifying 挡着，不能重复领取）——
+            // 这就是"复核不占上传通道"的实质
             synchronized (mLock) {
                 mInflight.remove(taskKey);
                 mLock.notifyAll();
             }
+        }
+    }
+
+    /**
+     * 把"字节已经发完、只剩复核"的项交给复核线程。
+     *
+     * @return false 表示没交出去（队列在停、或复核积压到上限），调用方必须自己同步复核
+     */
+    private boolean enqueueVerify(String key, Task task, Config config, String remotePath, long size) {
+        synchronized (mLock) {
+            if (!mRunning) {
+                return false;
+            }
+            if (mVerifyQueue.size() >= MAX_VERIFY_BACKLOG) {
+                // 积压兜底：宁可这一项慢一点，也不能让待复核项无上限地堆在内存里
+                Logger.w("event=verify_async_fallback reason=backlog path=" + task.path);
+                return false;
+            }
+            mVerifyQueue.addLast(new Verify(key, task, config, remotePath, size));
+            // 就在这把锁内登记 mVerifying：等到 worker 的 finally 才登记的话，
+            // 复核线程可能已经抢先做完并把 mVerifying 里的它删掉（删了个不存在的），
+            // 随后 worker 再加回来 —— 这一项就永远卡在 mVerifying 里没人碰了。
+            // 这里跟 mInflight 短暂共存无所谓：两处都只是"别领它"的意思
+            mVerifying.add(key);
+            Logger.d("event=verify_async_handoff path=" + task.path);
+            mLock.notifyAll();
+            return true;
+        }
+    }
+
+    /**
+     * 复核线程的主循环：取出一项"字节已发完"的任务，确认它真的落盘了。
+     *
+     * <p>这是"到底传成功没有"的唯一结论所在：成功才补记账（标记已同步、清熔断），
+     * 失败照常重试。也正因为结论在这里，{@code endUpload()} 与 {@code taskEnd()} 也在这里补
+     * —— worker 交出去的时候并没有替这一项告诉宿主"传完了"。
+     *
+     * <p>复核用自己那一条连接（{@link #verifyClientFor}）：对应的 worker 早就在传下一项了，
+     * 跟它共用一条连接会互相把对方的响应读走。
+     */
+    private void verifyLoop(int index) {
+        while (mRunning) {
+            Verify job;
+            synchronized (mLock) {
+                while (mRunning && mVerifyQueue.isEmpty()) {
+                    try {
+                        mLock.wait(WAIT_NO_TASK);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                if (!mRunning) {
+                    break;
+                }
+                job = mVerifyQueue.pollFirst();
+                if (job == null) {
+                    continue;
+                }
+            }
+            boolean ok = false;
+            try {
+                WebDavClient client = verifyClientFor(job.config, index);
+                if (client.storedAs(job.remotePath, job.size)) {
+                    ok = true;
+                    Logger.i("event=verify_async_done ok=true path=" + job.task.path
+                            + " remote=" + job.remotePath);
+                    finalizeOk(job.task, job.config, job.remotePath, "verify-" + index);
+                } else {
+                    // 与 put() 里那条同一句话：发完了但服务器上确实没有。
+                    // 绝不能记成功 —— 一记账这项就再也不会重传了
+                    finalizeFail(job.task, job.config, new IOException(
+                            "PUT returned 2xx but the server has no such file"
+                                    + " path=" + job.remotePath));
+                }
+            } catch (WebDavClient.TransportFailure e) {
+                finalizeFail(job.task, job.config, e);
+            } catch (IOException e) {
+                finalizeFail(job.task, job.config, e);
+            } catch (Throwable t) {
+                finalizeUnexpected(job.task, t);
+            } finally {
+                HostSyncState progress = mProgress;
+                if (progress != null) {
+                    progress.endUpload();
+                }
+                mPublisher.taskEnd(job.key, ok);
+                synchronized (mLock) {
+                    mVerifying.remove(job.key);
+                    mLock.notifyAll();
+                }
+            }
+        }
+        // 停机（或线程被中断）时这一条连接要还回去
+        releaseVerifyClientAt(index);
+    }
+
+    /**
+     * 复核成功之后的收尾：移出待传、记已完成、清熔断、写相册落册标记。
+     *
+     * <p>上传线程与复核线程都走这里，保证"什么才算真的传成功"只有一处定义。
+     */
+    private void finalizeOk(Task task, Config config, String remotePath, String worker) {
+        final String taskKey = task.key();
+        synchronized (mLock) {
+            mPending.remove(taskKey);
+            mPendingVersion++;
+            mDone.put(taskKey, System.currentTimeMillis());
+            trimDoneLocked();
+            saveThrottledLocked();
+        }
+        int failures = mConsecutiveFailures.getAndSet(0);
+        if (failures != 0) {
+            Logger.i("event=queue_recovered failures_reset=" + failures);
+        }
+        // 传通一次就说明服务器是活的：冷却清零、催相册的间隔也拉回最短，
+        // 不然一次抖动会把后面几十项的间隔一直撑在最大值上
+        mCooldownFailures.set(0);
+        mIdleSyncDelay = IDLE_SYNC_BASE;
+        mUploadedSinceIdle.incrementAndGet();
+        Logger.i("event=upload_ok worker=" + worker + " path=" + task.path
+                + " remote=" + remotePath
+                + " size=" + task.size + " pending=" + mPending.size());
+        // 复核确实落盘之后才配得上这条记账；放在锁外做，宿主 provider 的耗时不该把队列锁住
+        SyncMarker marker = mMarker;
+        if (marker != null) {
+            marker.markSynced(task.rowId);
+        }
+        HostSyncState progress = mProgress;
+        if (progress != null) {
+            // 记账写下去之后界面上的"待备份 N"才会减一，所以刷新放在记账之后
+            progress.refresh();
+        }
+    }
+
+    /**
+     * 传失败之后的收尾：安排重试，并按失败类型决定要不要喂熔断。
+     *
+     * <p>连接层失败（{@link WebDavClient.TransportFailure}）只算这一项的账，永不喂熔断：
+     * 那是链路抖动，不是"服务器不行"。而服务器自己回的错误码里，只有**小体积的项也失败**
+     * 才说明是整台服务器不可用 —— 大文件更容易被边缘节点单独掐掉（实测 3MB 回 554
+     * 而小文件全过），把它们算进去会让熔断被单个大文件误触发。
+     */
+    private void finalizeFail(Task task, Config config, IOException error) {
+        boolean counts = !(error instanceof WebDavClient.TransportFailure)
+                && task.size <= BREAKER_PROBE_MAX;
+        scheduleRetry(task, config, error.getMessage(), counts);
+    }
+
+    /** 意料之外的异常：不猜它是不是链路问题，只把这一项放远点，别拖累整队 */
+    private void finalizeUnexpected(Task task, Throwable error) {
+        mConsecutiveFailures.incrementAndGet();
+        Logger.e("event=upload_error path=" + task.path, error);
+        synchronized (mLock) {
+            task.nextAttemptAt = System.currentTimeMillis() + RETRY_GIVE_UP;
+            saveThrottledLocked();
         }
     }
 
@@ -703,6 +998,24 @@ public final class UploadQueue {
     }
 
     /**
+     * 取第 index 个复核线程可复用的客户端。规则同 {@link #clientFor}，只是数组分开：
+     * 复核跟上传会同时用连接，共用一条会互相读到对方的响应。
+     */
+    private WebDavClient verifyClientFor(Config config, int index) {
+        String signature = Config.safeHost(config.getBaseUrl()) + "|" + config.getUsername();
+        WebDavClient existing = mVerifyClients[index];
+        if (existing != null && signature.equals(mVerifyTargets[index])) {
+            return existing;
+        }
+        releaseVerifyClientAt(index);
+        WebDavClient client =
+                new WebDavClient(config.getBaseUrl(), config.getUsername(), config.getPassword());
+        mVerifyClients[index] = client;
+        mVerifyTargets[index] = signature;
+        return client;
+    }
+
+    /**
      * 安排下一次重试。
      *
      * @param counts 是否计入"目标不可用"的熔断计数。退避本身按项计数，
@@ -712,9 +1025,9 @@ public final class UploadQueue {
         task.attempts++;
         if (counts) {
             int failures = mConsecutiveFailures.incrementAndGet();
-            if (failures == UNHEALTHY_FAILURES) {
+            if (failures == unhealthyFailures()) {
                 Logger.w("event=queue_unhealthy failures=" + failures
-                        + " action=hook_will_yield_to_original");
+                        + " action=keep_blocking_and_retry");
             }
         }
         long delay;
@@ -971,6 +1284,26 @@ public final class UploadQueue {
             Logger.i("event=state_loaded pending=" + mPending.size() + " done=" + mDone.size());
         } catch (Throwable t) {
             Logger.w("event=state_load_failed", t);
+        }
+    }
+
+    /**
+     * 一项"字节已发完、只剩复核"的工作。worker 把 {@link Task} 与算好的远端路径一起交过来，
+     * 复核线程照着再做一次 HEAD/PROPFIND 就能定结论，不必重算目录。
+     */
+    private static final class Verify {
+        final String key;
+        final Task task;
+        final Config config;
+        final String remotePath;
+        final long size;
+
+        Verify(String key, Task task, Config config, String remotePath, long size) {
+            this.key = key;
+            this.task = task;
+            this.config = config;
+            this.remotePath = remotePath;
+            this.size = size;
         }
     }
 

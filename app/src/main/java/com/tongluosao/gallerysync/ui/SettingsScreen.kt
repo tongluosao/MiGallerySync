@@ -254,6 +254,19 @@ private fun BehaviorSection(model: SettingsModel) {
                 title = stringResource(R.string.label_remote_layout),
                 onSelectedIndexChange = model::onLayoutChange
             )
+            SwitchPreference(
+                checked = model.verifyAsync,
+                onCheckedChange = model::onVerifyAsyncChange,
+                title = stringResource(R.string.label_verify_async),
+                summary = stringResource(R.string.summary_verify_async)
+            )
+            OverlayDropdownPreference(
+                items = SettingsModel.CONCURRENCY_ITEMS,
+                selectedIndex = model.concurrencyIndex,
+                title = stringResource(R.string.label_upload_concurrency),
+                summary = stringResource(R.string.summary_upload_concurrency),
+                onSelectedIndexChange = model::onConcurrencyChange
+            )
         }
         if (model.isReplaceMode) {
             HintLine(stringResource(R.string.warn_replace_mode), error = true)
