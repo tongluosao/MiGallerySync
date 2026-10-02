@@ -21,7 +21,7 @@ import java.util.concurrent.Executors
 /**
  * 进度页的缩略图加载。
  *
- * <p>不引第三方图片库（Glide / Coil）：进度页最多几十个方格、每格只要 320px，
+ * <p>不引第三方图片库（Glide / Coil）：进度页最多几十行，每行只要 96px，
  * 一个内存 LRU 加一次采样解码就够了，为此多背一个库不值得。
  *
  * <p>按**绝对路径**直接解码，不走 MediaStore：上传队列里拿到的就是 DBImage 给的绝对路径，
@@ -31,13 +31,12 @@ import java.util.concurrent.Executors
 internal object ThumbnailLoader {
 
     /**
-     * 方格的目标边长。
+     * 列表行里缩略图的目标边长。
      *
-     * <p>进度页是 3 列贴屏幕边，411dp 屏每格约 135dp；420dpi 下约 355px。
-     * 取 320 而不是 355：`inSampleSize` 只按 2 的幂降采样，取 320 与 360 实际解出的尺寸
-     * 完全一样（一张 4000×3000 都解到 500×375），所以取小的那个不损失清晰度。
+     * <p>行内缩略图是 40dp（420dpi 下约 105px），取 96 就够；`inSampleSize` 只按 2 的幂
+     * 降采样，取 96 与 128 实际解出的尺寸一样，所以取小的那个不损失清晰度、还更省内存。
      */
-    const val TILE_PX = 320
+    const val ROW_PX = 96
 
     /** 解码失败的路径上限。同一张照片在一轮备份里会反复出现在帧里，失败一次就别再试 */
     private const val MAX_FAILED = 256
@@ -53,9 +52,9 @@ internal object ThumbnailLoader {
     /**
      * 解码线程池。
      *
-     * <p>不用 {@code Dispatchers.IO}：它的默认并发是 64，方格列表一滚下去可能同时抛出几十个
+     * <p>不用 {@code Dispatchers.IO}：它的默认并发是 64，列表一滚下去可能同时抛出几十个
      * 解码请求，一次解码就是几百 KB 的位图，并发太高只会把堆打爆、把滚动拖卡。
-     * 三路够用 —— 方格是懒加载的，真正同时在解的就那么几张。
+     * 三路够用 —— 行是懒加载的，真正同时在解的就那么几张。
      */
     private val dispatcher: CoroutineDispatcher =
         Executors.newFixedThreadPool(3) { runnable ->
@@ -68,7 +67,7 @@ internal object ThumbnailLoader {
      * <p>没有在途去重：同一帧里不会有重复路径（去重键就含路径），而不同帧之间同一个路径
      * 第二次来的时候缓存已经填好了。
      */
-    suspend fun load(path: String, video: Boolean, targetPx: Int = TILE_PX): ImageBitmap? {
+    suspend fun load(path: String, video: Boolean, targetPx: Int = ROW_PX): ImageBitmap? {
         if (path.isEmpty()) {
             return null
         }

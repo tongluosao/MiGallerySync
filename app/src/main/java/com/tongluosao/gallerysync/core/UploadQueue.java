@@ -259,8 +259,8 @@ public final class UploadQueue {
                 synchronized (mLock) {
                     List<UploadProgressPublisher.PendingItem> out =
                             new ArrayList<>(Math.min(limit, mPending.size()));
-                    // 含正在传的那几项，不跳过：进度页要的是一个和队列同序的方格列表，
-                    // 在传的格子应该在**它原来的位置**上长出水面，而不是被拎到最前面。
+                    // 含正在传的那几项，不跳过：客户端要在传项排在列表最前面，而它需要
+                    // 队列序才知道排队部分怎么排；两边共用一个 key，去重由客户端做。
                     // worker 从队首领取，所以这 3 项本来就排在最前，顺序天然是对的。
                     for (Task task : mPending.values()) {
                         if (out.size() >= limit) {

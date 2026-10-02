@@ -41,7 +41,12 @@ public final class ProgressProtocol {
     /** WebDAV 不可用（连续失败到阈值）：队列仍在退避重试，界面要说明这批不会去小米云 */
     public static final String STATE_UNHEALTHY = "unhealthy";
 
-    /** 上传方向。下载还没做，但字段先留着，将来加下载不用改通道 */
+    /**
+     * 任务方向。
+     *
+     * <p>上传项是该字段缺省时的取值（老版本相册进程发来的帧没有它，客户端按上传处理）；
+     * 下载项显式带 {@link #DIR_DOWN}，进度页据此把文案从"上传"改成"下载"。
+     */
     public static final String DIR_UP = "up";
     public static final String DIR_DOWN = "down";
 

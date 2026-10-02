@@ -74,9 +74,9 @@ public final class UploadProgressPublisher {
         /**
          * 整个队列按插入序的前 [limit] 项，**含正在传的几项**。
          *
-         * <p>进度页是一个和队列同序的方格列表：在传的格子应该在它原来的位置上长出水面，
-         * 而不是被拎到最前面 —— 后者在补位动画下会是一段横跨整个网格的长滑动。
-         * 所以这里不跳过在传项，让客户端拿这一份列表当唯一的有序依据。
+         * <p>进度页排队部分的顺序直接取这一份，所以这里不跳过在传项：客户端拿到列表后
+         * 把在传项拎到最前面显示，两边是同一个键，重复的那几项必须由客户端按 key 去掉
+         * （{@code ProgressModel.buildTasks}），否则列表会 key 重复。
          */
         List<PendingItem> pendingItems(int limit);
 
@@ -383,7 +383,7 @@ public final class UploadProgressPublisher {
         JSONArray array = new JSONArray();
         try {
             // 这里**不能**用 pendingCount（"还没轮到的项数"）判空：队列只剩 3 项且全在传时
-            // 它等于 0，会把列表发成空数组，客户端的方格直接清空、水格全没。
+            // 它等于 0，会把列表发成空数组，客户端的排队部分直接清空、在传项也没了。
             // 列表是否为空只由 pendingItems 的实际返回值决定
             for (PendingItem item : view.pendingItems(MAX_PENDING_ITEMS)) {
                 JSONObject obj = new JSONObject();
