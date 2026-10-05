@@ -114,10 +114,10 @@ public final class UploadQueue {
     /** 名单缓存最多留几个目录：按时间分目录时一个月能跨几十个，不给上限就是慢慢涨 */
     private static final int MAX_CACHED_DIRS = 64;
     /**
-     * "按目标分账"模式下最多同时留几本账（见 {@link #mLedgers}）。
+     * "按目标分开记录"模式下最多同时留几条记录（见 {@link #mLedgers}）。
      *
-     * <p>四本够"家里 NAS / 单位服务器 / 旧账号 / 新账号"这种用法来回切；
-     * 每本最多 {@link #MAX_DONE_RECORDS} 条，落盘时会一起写进 state.json，所以不能留太多 ——
+     * <p>四条够"家里 NAS / 单位服务器 / 旧账号 / 新账号"这种用法来回切；
+     * 每条最多 {@link #MAX_DONE_RECORDS} 项，落盘时会一起写进 state.json，所以不能留太多 ——
      * 那是每次落盘都要序列化的体积。
      */
     private static final int MAX_LEDGERS = 4;
@@ -129,26 +129,26 @@ public final class UploadQueue {
     private final LinkedHashMap<String, Task> mPending = new LinkedHashMap<>();
     private final LinkedHashMap<String, Long> mDone = new LinkedHashMap<>();
     /**
-     * "按目标分账"模式下的**其他目标**各自的已完成记录：目标签名 → 那一本账。
+     * "按目标分开记录"模式下的**其他目标**各自的已完成记录：目标签名 → 那一条记录。
      *
-     * <p>{@link #mDone} 永远装着"当前这个目标"的账；换目标时把当前这本存进这里、
-     * 再把新目标那本（如果有）取出来装回 {@code mDone}。这样"传完一项"这条热路径
-     * 一行都不用改，分账只发生在换目标那一瞬间。
+     * <p>{@link #mDone} 永远装着"当前这个目标"的；换目标时把当前这条存进这里、
+     * 再把新目标那条（如果有）取出来装回 {@code mDone}。这样"传完一项"这条热路径
+     * 一行都不用改，分开记录只发生在换目标那一瞬间。
      *
      * <p>为什么要有它：{@link #mDone} 是按本地文件（路径+大小+mtime）记的，只说明
      * "这一份传到过某个远端"。用户换回旧账号时期望"不用重传"，换成新账号时期望"确实传一遍" ——
-     * 只有把账按目标分开存才能同时满足。留 {@link #MAX_LEDGERS} 本（LRU）：
-     * 用户反复来回切账号时最近那几本还在，更早的丢掉换一轮重传，不是丢数据。
+     * 只有把记录按目标分开存才能同时满足。留 {@link #MAX_LEDGERS} 条（LRU）：
+     * 用户反复来回切账号时最近那几条还在，更早的丢掉换一轮重传，不是丢数据。
      *
      * <p>受 {@link #mLock} 保护。
      */
     private final LinkedHashMap<String, LinkedHashMap<String, Long>> mLedgers = new LinkedHashMap<>();
     /**
-     * {@link #mDone} 这本账是对着哪个目标攒的。
+     * {@link #mDone} 这条记录是对着哪个目标攒的。
      *
-     * <p>它是"这本账属于谁"的运行时真相，不能现算：{@code mConfig} 在 {@link #setConfig}
-     * 里总是已经换成新目标了，那时再拿它算签名，得到的是新目标的签名 —— 旧账就会被
-     * 记到新目标名下（换账号后一本账都不重传）。
+     * <p>它是"这条记录属于谁"的运行时真相，不能现算：{@code mConfig} 在 {@link #setConfig}
+     * 里总是已经换成新目标了，那时再拿它算签名，得到的是新目标的签名 —— 旧记录就会被
+     * 记到新目标名下（换账号后一条记录都不用重传）。
      */
     private String mDoneSignature = "";
     /**
@@ -577,6 +577,43 @@ public final class UploadQueue {
     }
 
     /**
+     * 清掉"已完成"这条记录，让相册重新交下来的项真的重传一遍。用户点"重置备份状态"时调用。
+     *
+     * <p>为什么非清不可：done 记录是按"本地文件（路径+大小+mtime）已经传到当前位置了"记的。
+     * 重置了相册的 {@code localFlag} 之后，相册会把同一批项重新交下来 —— 但这些项在 done 表里
+     * 都有记录，队列会按 key 命中直接判成"传过了"跳过，**一个字节都不发**，
+     * 重置就成了"相册显示重新开始备份、远端却还是什么都没多"。
+     *
+     * <p>与 {@link #targetChangedLocked} 的区别：那个是处理"换目标"（分开记录模式下还要换记录），
+     * 这里没有目标变化，就是**同一条记录清空**。分开记录模式下也照清 —— 用户点这个按钮的意图
+     * 就是"远端缺东西，重传一遍"，留着那条记录等于点了个寂寞。
+     *
+     * <p>清完**立刻落盘**：进程在下次正常落盘之前被杀（一键清理、崩溃）的话，
+     * 旧 done 表会从 state.json 原样读回来，这次重置就白做了。
+     */
+    public void resetLedger() {
+        int done;
+        synchronized (mLock) {
+            done = mDone.size();
+            mDone.clear();
+            mLedgers.clear();
+            // 退避与失败计数也是对着"上次那批传不动"攒的，一并归零
+            mConsecutiveFailures.set(0);
+            for (Task task : mPending.values()) {
+                task.attempts = 0;
+                task.nextAttemptAt = 0L;
+            }
+            writeStateLocked();
+            mLock.notifyAll();
+        }
+        // 远端名单缓存留着无妨（它是一分钟内有效的目录快照，与"传没传过"无关），
+        // 但重置意味着远端确实缺文件，重新列一次更保险
+        releaseClient();
+        releaseVerifyClients();
+        Logger.i("event=ledger_reset done=" + done + " pending=" + mPending.size());
+    }
+
+    /**
      * 应用并行路数。
      *
      * <p>调大：立刻补开线程（它们会自己去抢任务）。调小：只更新计数，越界那几路会在
@@ -605,14 +642,14 @@ public final class UploadQueue {
      * 目标变了：处理"已完成"与退避。
      *
      * <p>已完成记录是按"这个位置上已经有了"记的，换服务器/换账号/换远端目录之后它对新位置
-     * 完全无效 —— 留在当前这本账里就是"队列一片绿、新目标上一个文件都没有"。
+     * 完全无效 —— 留在当前这条记录里就是"队列一片绿、新目标上一个文件都没有"。
      * 退避同理，它是旧目标攒出来的，一律清零。
      *
-     * <p>分账模式（{@link Config#isLocalFlagPerTarget()}）下不是清掉而是**换账**：
+     * <p>分开记录模式（{@link Config#isLocalFlagPerTarget()}）下不是清掉而是**换记录**：
      * 把当前这本按旧签名存进 {@link #mLedgers}，再把新签名那本（以前存过的）取出来当当前账。
-     * 于是"换回旧账号"时那本账里记过的项直接命中，一个字节都不重发；"换成新账号"时
+     * 于是"换回旧账号"时那条记录里记过的项直接命中，一个字节都不重发；"换成新账号"时
      * 新签名没有账，就是全空 —— 正是用户要的两种行为。共用模式（默认）下照旧清空：
-     * 那本账是相册的 `localFlag` 的镜像，相册那边没有"按目标分账"这回事，分账反而会让
+     * 那条记录是相册的 `localFlag` 的镜像，相册那边没有"按目标分开记录"这回事，分开记录反而会让
      * 相册显示已上传、而模块认为该传 —— 两边说法不一致。
      *
      * <p>调用方必须持有 mLock（里面要 notifyAll 唤醒等退避的 worker）。
@@ -1017,7 +1054,7 @@ public final class UploadQueue {
     /**
      * 复核线程的主循环：取出一项"字节已发完"的任务，确认它真的落盘了。
      *
-     * <p>这是"到底传成功没有"的唯一结论所在：成功才补记账（标记已同步、清熔断），
+     * <p>这是"到底传成功没有"的唯一结论所在：成功才补写标记（标记已同步、清熔断），
      * 失败照常重试。也正因为结论在这里，{@code endUpload()} 与 {@code taskEnd()} 也在这里补
      * —— worker 交出去的时候并没有替这一项告诉宿主"传完了"。
      *
@@ -1049,7 +1086,7 @@ public final class UploadQueue {
                 WebDavClient client = verifyClientFor(job.config, index);
                 // 复核是**唯一**的成功判据，同步路径与这里共用 WebDavClient.requireStoredAs：
                 // 那句话只有一处定义，日志里同一个故障不会出现两种写法。
-                // 复核不过绝不能记成功 —— 一记账这项就再也不会重传了
+                // 复核不过绝不能记成功 —— 一写标记这项就再也不会重传了
                 client.requireStoredAs(job.remotePath, job.size);
                 ok = true;
                 Logger.i("event=verify_async_done ok=true path=" + job.task.path
@@ -1103,14 +1140,14 @@ public final class UploadQueue {
         Logger.i("event=upload_ok worker=" + worker + " path=" + task.path
                 + " remote=" + remotePath
                 + " size=" + task.size + " pending=" + mPending.size());
-        // 复核确实落盘之后才配得上这条记账；放在锁外做，宿主 provider 的耗时不该把队列锁住
+        // 复核确实落盘之后才配得上这条标记；放在锁外做，宿主 provider 的耗时不该把队列锁住
         SyncMarker marker = mMarker;
         if (marker != null) {
             marker.markSynced(task.rowId);
         }
         HostSyncState progress = mProgress;
         if (progress != null) {
-            // 记账写下去之后界面上的"待备份 N"才会减一，所以刷新放在记账之后
+            // 标记写下去之后界面上的"待备份 N"才会减一，所以刷新放在标记之后
             progress.refresh();
         }
     }
@@ -1379,7 +1416,7 @@ public final class UploadQueue {
      *
      * <p>远端根目录与分目录方式也要算进来：done 记录的意思是"这一份已经传到当前这个位置了"，
      * 用户把目录换掉、或把分目录方式从按时间改成按相册之后，同一个文件该待的位置就变了，
-     * 旧账对新位置完全无效。这两项都不是凭据，落盘没有风险。
+     * 旧记录对新位置完全无效。这两项都不是凭据，落盘没有风险。
      * 密码仍然不落盘，所以这里只取 safeHost 与用户名（运行时那次比对由 {@link #sameTarget} 负责，
      * 它拿得到密码，能额外发现改密码）。
      */
@@ -1388,7 +1425,7 @@ public final class UploadQueue {
     }
 
     /**
-     * 目标签名，同时也是"分账模式下的账本键"。
+     * 目标签名，同时也是"分开记录模式下的记录键"。
      *
      * <p>落盘时要算的是**当前这份配置**的签名（不能用一个可能已经过期的实例字段），
      * 而换目标时要算的是**新配置**的签名（那时 {@link #mDone} 里还是旧目标的账）——
@@ -1466,7 +1503,7 @@ public final class UploadQueue {
             root.put("target", targetSignature());
             root.put("pending", pending);
             root.put("done", done);
-            // 分账模式下把其他目标那几本一起带上：不带的话"换回旧账号不用重传"就只在本进程
+            // 分开记录模式下把其他目标那几条记录一起带上：不带的话"换回旧账号不用重传"就只在本进程
             // 活着的时候成立，重启一次账就没了（用户看到的还是"又传了一遍"）
             Config config = mConfig;
             if (config != null && config.isLocalFlagPerTarget() && !mLedgers.isEmpty()) {
@@ -1523,7 +1560,7 @@ public final class UploadQueue {
             if (done != null) {
                 readLedger(done, mDone);
             }
-            // 分账模式下"其他目标"的账本。老版本没有这个键，读不到就是空的，行为不变
+            // 分开记录模式下"其他目标"的记录。老版本没有这个键，读不到就是空的，行为不变
             JSONObject ledgers = root.optJSONObject("ledgers");
             if (ledgers != null) {
                 Iterator<String> signatures = ledgers.keys();
@@ -1549,8 +1586,8 @@ public final class UploadQueue {
                 Config config = mConfig;
                 if (!savedTarget.isEmpty() && !savedTarget.equals(targetSignature())) {
                     // 落盘时的目标与现在这份配置不是同一个。两种模式都在这里处理：
-                    // 共用账本直接清掉（旧账对新目标无效）；分账模式换成新目标那本
-                    // （刚读进来的那本账的签名是 savedTarget，会被存回 mLedgers）。
+                    // 共用记录直接清掉（旧记录对新目标无效）；分开记录模式换成新目标那本
+                    // （刚读进来的那条记录的签名是 savedTarget，会被存回 mLedgers）。
                     targetChangedLocked(config);
                     // 立刻落盘：否则每开一次进程就重来一次，把"已完成"反复清空、文件反复重传
                     writeStateLocked();
@@ -1563,7 +1600,7 @@ public final class UploadQueue {
         }
     }
 
-    /** 把一段 JSON 对象读成账本（键都是"路径|大小|mtime"） */
+    /** 把一段 JSON 对象读成记录（键都是"路径|大小|mtime"） */
     private static void readLedger(JSONObject source, LinkedHashMap<String, Long> into) {
         Iterator<String> keys = source.keys();
         List<String> list = new ArrayList<>();
@@ -1601,7 +1638,7 @@ public final class UploadQueue {
         final long mtime;
         final boolean video;
         final long date;
-        /** cloud 表行号，跨进程重启也要留着：上传成功的记账靠它 */
+        /** cloud 表行号，跨进程重启也要留着：上传成功的标记靠它 */
         final String rowId;
         int attempts;
         long nextAttemptAt;

@@ -131,7 +131,7 @@ public final class CloudItemReader {
         public final boolean video;
         public final long date;
         public final String sha1;
-        /** cloud 表行号，上传成功后按它写回 localFlag；读不到时为 null，只影响记账不影响上传 */
+        /** cloud 表行号，上传成功后按它写回 localFlag；读不到时为 null，只影响标记不影响上传 */
         public final String rowId;
 
         Item(String path, long size, int priority, boolean video, long date, String sha1,

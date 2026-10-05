@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -42,12 +44,15 @@ import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.ScrollBehavior
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TextFieldDefaults
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
+import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
+import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 设置页的滚动区。主题控制器、顶栏与底栏都由 [MainScreen] 持有，
@@ -96,6 +101,12 @@ fun SettingsContent(
         item(key = "section_behavior") {
             SettingsSection(stringResource(R.string.section_behavior)) {
                 BehaviorSection(model)
+            }
+        }
+
+        item(key = "section_maintenance") {
+            SettingsSection(stringResource(R.string.section_maintenance)) {
+                MaintenanceSection(model)
             }
         }
 
@@ -307,9 +318,99 @@ private fun BehaviorSection(model: SettingsModel) {
     }
 }
 
+/**
+ * 维护区：只放"会真的动相册数据"的动作。
+ *
+ * <p>单独一个分区而不是塞进"同步"里，是因为这一项与其它配置项性质不同 ——
+ * 其余项改了只是换个行为，这一项点下去是**不可逆的重传**，要给用户一个明显的边界。
+ */
 @Composable
-private fun AppearanceSection(model: SettingsModel) {
-    Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
+private fun MaintenanceSection(model: SettingsModel) {
+    var confirming by remember { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
+        Row(
+            modifier = Modifier.padding(horizontal = ScreenMargin),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(BlockGap)
+        ) {
+            Button(
+                onClick = { confirming = true },
+                enabled = model.ready && model.resetState !is SettingsModel.ResetState.Running,
+                minWidth = 96.dp,
+                colors = ButtonDefaults.buttonColorsPrimary(
+                    disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
+                )
+            ) {
+                Text(text = stringResource(R.string.action_reset_uploaded))
+            }
+            ResetResultText(model.resetState, onDismiss = model::dismissResetResult)
+        }
+        HintLine(stringResource(R.string.summary_reset_uploaded))
+        // 替换模式下相册的"已上传"标记归模块管，重置才有意义；别的模式下相册自己
+        // 还在跟小米云打交道，替它重置等于打乱它自己的账
+        if (!model.isReplaceMode) {
+            HintLine(stringResource(R.string.warn_reset_needs_replace), error = true)
+        }
+    }
+
+    WindowDialog(
+        show = confirming,
+        title = stringResource(R.string.dialog_reset_title),
+        summary = stringResource(R.string.dialog_reset_summary),
+        onDismissRequest = { confirming = false },
+        content = {
+            val dismissState = LocalDismissState.current
+            Row(horizontalArrangement = Arrangement.SpaceBetween) {
+                TextButton(
+                    text = stringResource(R.string.action_cancel),
+                    onClick = { dismissState?.invoke() },
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(20.dp))
+                TextButton(
+                    text = stringResource(R.string.action_reset_confirm),
+                    onClick = {
+                        model.resetUploaded()
+                        dismissState?.invoke()
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.textButtonColorsPrimary()
+                )
+            }
+        }
+    )
+}
+
+@Composable
+private fun RowScope.ResetResultText(
+    state: SettingsModel.ResetState,
+    onDismiss: () -> Unit
+) {
+    val text = when (state) {
+        SettingsModel.ResetState.Idle -> null
+        SettingsModel.ResetState.Running -> stringResource(R.string.msg_reset_running)
+        SettingsModel.ResetState.Sent -> stringResource(R.string.msg_reset_sent)
+        is SettingsModel.ResetState.Failed -> stringResource(R.string.msg_reset_failed, state.detail)
+    }
+    val color = when (state) {
+        SettingsModel.ResetState.Sent -> MiuixTheme.colorScheme.primary
+        SettingsModel.ResetState.Running -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        else -> MiuixTheme.colorScheme.error
+    }
+    if (text != null) {
+        Text(
+            text = text,
+            modifier = Modifier
+                .weight(1f)
+                .clickable { onDismiss() },
+            style = MiuixTheme.textStyles.body2,
+            color = color
+        )
+    }
+}
+
+@Composable
+private fun AppearanceSection(model: SettingsModel) {    Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
         OverlayDropdownPreference(
             items = listOf(
                 stringResource(R.string.theme_mode_system),

@@ -30,6 +30,34 @@ public final class ProgressProtocol {
     public static final String EXTRA_PAYLOAD = "payload";
 
     /**
+     * 反向命令广播的 action：模块 App → 相册进程。
+     *
+     * <p>方向与 {@link #ACTION} 相反。相册进程里那条指令（重置已上传标记）必须由**相册
+     * 自己**去写它的 provider —— 模块 App 没有那个 provider 的写权限，而相册进程里注入的
+     * 代码用的是相册的 UID，天然满足。
+     *
+     * <p>为什么不用 {@code XposedService}：它只有 {@code getRemotePreferences} 这一类
+     * "App 写、注入进程读"的接口，没有"让注入进程执行一个动作"的通道，所以只能再开一条广播。
+     *
+     * <p><b>定向的包名是相册、不是本模块</b>：接收器注册在**相册进程**里
+     * （{@code GalleryHooks.ensureCommandReceiver}），所以必须 {@code setPackage(相册包名)}。
+     * 写成 {@code setPackage(本模块)} 就只投给模块自己的进程 —— 那里根本没有注册这个
+     * action 的接收器，广播会被安静丢掉，表现成"点了按钮什么都没发生"。
+     *
+     * <p>相册没在跑时广播同样被丢弃，这是可接受的（那说明备份此刻也没在跑）。
+     */
+    public static final String ACTION_COMMAND = MODULE_PACKAGE + ".action.COMMAND";
+
+    /** 命令广播要投递到的进程：接收器注册在相册进程里，不是模块自己的进程 */
+    public static final String TARGET_PACKAGE = "com.miui.gallery";
+
+    /** 命令名：把当前账号的"已上传"标记全部重置回未上传 */
+    public static final String CMD_RESET_UPLOADED = "reset_uploaded";
+
+    /** 命令广播的唯一 extra：命令名 */
+    public static final String EXTRA_COMMAND = "command";
+
+    /**
      * 协议版本。客户端不认识的版本直接忽略整帧 —— 新旧两个版本同时在跑时，
      * 宁可让界面停在上一帧，也不要按错字段解析出一堆假数据。
      */

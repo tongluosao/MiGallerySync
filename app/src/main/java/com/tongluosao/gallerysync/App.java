@@ -20,7 +20,14 @@ import io.github.libxposed.service.XposedServiceHelper;
 public final class App extends Application implements XposedServiceHelper.OnServiceListener {
 
     private static volatile XposedService sService;
+    /** 进程内 Application 实例。广播必须从一个真实 Context 发出，界面侧拿不到别的 Context */
+    private static volatile App sInstance;
     private static final List<Consumer<XposedService>> sListeners = new CopyOnWriteArrayList<>();
+
+    /** 本进程的 Application；界面发命令广播时要用它当 Context（也用来读包名） */
+    public static App application() {
+        return sInstance;
+    }
 
     public static XposedService getService() {
         return sService;
@@ -46,6 +53,7 @@ public final class App extends Application implements XposedServiceHelper.OnServ
     @Override
     public void onCreate() {
         super.onCreate();
+        sInstance = this;
         Logger.attach(null);
         XposedServiceHelper.registerListener(this);
     }

@@ -260,7 +260,7 @@ public final class WebDavClient {
      * 拆出来之后复核可以挪到别处做，通道立刻空出来去传下一项。
      *
      * <p><b>调用方必须自己复核</b>（调 {@link #storedAs} 或 {@link #requireStoredAs}），
-     * 否则"回了 2xx 却没落盘"的服务器会被当成上传成功 —— 相册那边一记账就再也不会重传，
+     * 否则"回了 2xx 却没落盘"的服务器会被当成上传成功 —— 相册那边一写标记就再也不会重传，
      * 那是本模块最不能出现的结果。
      *
      * <p>同样重要的是：**发送与复核的先后顺序不能颠倒**。只做复核不做发送时，
@@ -363,7 +363,7 @@ public final class WebDavClient {
         // 一个 600MB 的视频在慢链路上几分钟是常态，用默认 30s 会把好好的下载掐断。
         socket.setSoTimeout(READ_TIMEOUT_MAX);
         OutputStream out = mOut;
-        out.write(requestHead("GET", host, port, target, null, null, 0L, -1));
+        out.write(requestHead("GET", host, port, target, null, null, 0L, -1, null, null));
         out.flush();
 
         Head head = readHead();
@@ -511,6 +511,40 @@ public final class WebDavClient {
         return isSuccess(res.code) || res.code == 404;
     }
 
+    /**
+     * 把远端对象搬到另一个路径（WebDAV {@code MOVE}）。回收站用它：本地删掉一张照片时，
+     * 远端那一份不是删掉而是搬到回收站目录，这样"远端不缺文件"这件事仍然成立，
+     * 下载补齐也就不会把它当成"本地缺、远端有"重新拉回来。
+     *
+     * <p>目标**必须**是完整路径，且本方法不替它建父目录 —— MOVE 的父目录不存在时
+     * 服务器回 409，调用方先 {@link #ensureCollection} 再调这里。
+     *
+     * <p>{@code Overwrite: F} 是刻意的：回收站里若已经有同名文件，**不覆盖**而是让服务器
+     * 回 412。回收站里的东西是用户删过的原始副本，同名多半意味着"同一个名字删过两次"，
+     * 覆盖等于悄悄丢掉一份。回 412 时调用方会带时间戳后缀再试一次。
+     *
+     * @return true 表示搬成功（2xx）；404（源本来就没有）也算成功 —— 目的已达成
+     */
+    public boolean move(String fromPath, String toPath) throws IOException {
+        String destination = mBaseUrl + encodePath(toPath);
+        Res res = send("MOVE", fromPath, null, null, false, -1, 0, destination, "F");
+        return isSuccess(res.code) || res.code == 404;
+    }
+
+    /**
+     * 远端对象在不在。与 {@link #storedAs} 的区别：只问"有没有这个东西"，不比对大小，
+     * 也不做多轮重试 —— 回收站判断用，不需要那么严。
+     */
+    public boolean exists(String remotePath) {
+        try {
+            Res head = send("HEAD", remotePath, null, null, false);
+            return isSuccess(head.code) || head.code == 301 || head.code == 302
+                    || head.code == 307 || head.code == 308;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     /** 目录在 / 不在 / 问不出来。第三态是必须的：不能把"问不出来"当成"没有" */
     private static final int COLL_EXISTS = 1;
     private static final int COLL_MISSING = 0;
@@ -615,8 +649,9 @@ public final class WebDavClient {
      */
     private Res propfind(String remotePath, int depth, int cap) {
         try {
-            return send("PROPFIND", remotePath, null,
-                    PROPFIND_BODY.getBytes(StandardCharsets.UTF_8), true, depth, cap);
+            return send("PROPFIND", remotePath,
+                    null, PROPFIND_BODY.getBytes(StandardCharsets.UTF_8), true, depth, cap,
+                    null, null);
         } catch (Throwable t) {
             // 服务器不支持 PROPFIND 时按"判不了"处理，不把它当成写失败
             Logger.d("event=propfind_failed reason=" + t.getMessage());
@@ -926,7 +961,7 @@ public final class WebDavClient {
     /** depth 仅对 PROPFIND 有意义：-1 表示不带该头 */
     private Res send(String method, String remotePath, File file, byte[] body,
             boolean readBody, int depth) throws IOException {
-        return send(method, remotePath, file, body, readBody, depth, 0);
+        return send(method, remotePath, file, body, readBody, depth, 0, null, null);
     }
 
     /**
@@ -934,7 +969,8 @@ public final class WebDavClient {
      *                列目录必须显式调大，否则 XML 会被截断
      */
     private Res send(String method, String remotePath, File file, byte[] body,
-            boolean readBody, int depth, int bodyCap) throws IOException {
+            boolean readBody, int depth, int bodyCap, String destination, String overwrite)
+            throws IOException {
         URL url = new URL(mBaseUrl + encodePath(remotePath));
         String host = url.getHost();
         int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
@@ -945,7 +981,8 @@ public final class WebDavClient {
         // 大文件还要再付一遍上传流量。
         boolean reused = mSocket != null;
         try {
-            return exchange(method, host, port, target, file, body, length, readBody, depth, bodyCap);
+            return exchange(method, host, port, target, file, body, length, readBody, depth,
+                    bodyCap, destination, overwrite);
         } catch (IOException e) {
             dropConnection();
             if (!reused) {
@@ -954,7 +991,8 @@ public final class WebDavClient {
             Logger.d("event=conn_reopen method=" + method + " reason=" + e.getMessage());
         }
         try {
-            return exchange(method, host, port, target, file, body, length, readBody, depth, bodyCap);
+            return exchange(method, host, port, target, file, body, length, readBody, depth,
+                    bodyCap, destination, overwrite);
         } catch (IOException e) {
             dropConnection();
             throw transportFailure(method, host, e);
@@ -994,13 +1032,15 @@ public final class WebDavClient {
     }
 
     private Res exchange(String method, String host, int port, String target,
-            File file, byte[] body, long length, boolean readBody, int depth, int bodyCap)
+            File file, byte[] body, long length, boolean readBody, int depth, int bodyCap,
+            String destination, String overwrite)
             throws IOException {
         Socket socket = connect(host, port);
         socket.setSoTimeout(readTimeoutFor(length));
         try {
             OutputStream out = mOut;
-            out.write(requestHead(method, host, port, target, file, body, length, depth));
+            out.write(requestHead(method, host, port, target, file, body, length, depth,
+                    destination, overwrite));
             writeBody(out, file, body, length);
             out.flush();
 
@@ -1181,7 +1221,8 @@ public final class WebDavClient {
     }
 
     private byte[] requestHead(String method, String host, int port, String target,
-            File file, byte[] body, long length, int depth) {
+            File file, byte[] body, long length, int depth, String destination,
+            String overwrite) {
         StringBuilder sb = new StringBuilder(256);
         sb.append(method).append(' ').append(target).append(" HTTP/1.1\r\n")
                 .append("Host: ").append(hostHeader(host, port)).append("\r\n")
@@ -1199,6 +1240,13 @@ public final class WebDavClient {
         } else if ("PUT".equals(method)) {
             sb.append("Content-Length: ").append(length).append("\r\n")
                     .append("Content-Type: ").append(contentType(file)).append("\r\n");
+        } else if ("MOVE".equals(method) || "COPY".equals(method)) {
+            // Destination 是**绝对 URL**（RFC 4918 要求），且其中的路径必须已百分号转义 ——
+            // 调用方传进来的就已经是转义好的完整 URL
+            sb.append("Destination: ").append(destination).append("\r\n");
+            if (overwrite != null) {
+                sb.append("Overwrite: ").append(overwrite).append("\r\n");
+            }
         }
         sb.append("\r\n");
         return sb.toString().getBytes(StandardCharsets.ISO_8859_1);

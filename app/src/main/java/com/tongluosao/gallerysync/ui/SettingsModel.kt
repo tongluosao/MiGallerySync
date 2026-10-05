@@ -1,5 +1,6 @@
 package com.tongluosao.gallerysync.ui
 
+import android.content.Intent
 import android.content.SharedPreferences
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -7,6 +8,7 @@ import androidx.compose.runtime.setValue
 import com.tongluosao.gallerysync.App
 import com.tongluosao.gallerysync.core.Config
 import com.tongluosao.gallerysync.core.Logger
+import com.tongluosao.gallerysync.core.ProgressProtocol
 import com.tongluosao.gallerysync.core.WebDavClient
 import io.github.libxposed.service.XposedService
 import kotlinx.coroutines.CoroutineScope
@@ -62,7 +64,7 @@ class SettingsModel : CoroutineScope {
     /** 上传前先看远端有没有同名文件，有就跳过（不比对内容） */
     var skipExistingRemote by mutableStateOf(Config.DEFAULT_SKIP_EXISTING_REMOTE)
         private set
-    /** 账本模式下标：0 = 与相册共用，1 = 按目标分账。对应 [FLAG_MODE_VALUES] */
+    /** 记录方式下标：0 = 与相册共用，1 = 按目标分开记录。对应 [FLAG_MODE_VALUES] */
     var localFlagModeIndex by mutableStateOf(0)
         private set
     /** 打开后把远端有、本地没有的文件下载回本地 */
@@ -83,6 +85,10 @@ class SettingsModel : CoroutineScope {
         get() = LAYOUT_VALUES[layoutIndex] == Config.LAYOUT_FLAT
 
     var testState by mutableStateOf<TestState>(TestState.Idle)
+        private set
+
+    /** "重置已上传标记"的进行状态；见 [resetUploaded] */
+    var resetState by mutableStateOf<ResetState>(ResetState.Idle)
         private set
 
     /** 写入失败（service 掉线或 binder 异常）时置真，下一次成功写入清零 */
@@ -184,6 +190,45 @@ class SettingsModel : CoroutineScope {
     fun onThemeModeChange(index: Int) {
         themeModeIndex = index.coerceIn(0, 2)
         writeNow(KEY_THEME_MODE, themeModeIndex)
+    }
+
+    /**
+     * 重置"已上传标记"并让这批照片重新完整上传一遍。
+     *
+     * <p>只在**相册进程**里能做：要改的是相册自己的 cloud 表（`localFlag`），
+     * 而模块 App 没有那个 provider 的写权限。所以这里发一条定向广播过去，
+     * 相册进程里的接收器（`GalleryHooks.installCommandReceiver`）用相册的 UID 执行。
+     *
+     * <p>相册没在跑时广播被静默丢弃 —— 界面据此提示"需要相册在运行"，
+     * 而不是假装成功（用户会以为传完了却什么都没有）。
+     */
+    fun resetUploaded() {
+        if (resetState is ResetState.Running) {
+            return
+        }
+        val app = App.application()
+        if (app == null) {
+            resetState = ResetState.Failed("应用未就绪")
+            return
+        }
+        resetState = ResetState.Running
+        val intent = Intent(ProgressProtocol.ACTION_COMMAND)
+            // 定向到**相册**而不是本模块：接收器注册在相册进程里，写成本模块就永远送不到
+            .setPackage(ProgressProtocol.TARGET_PACKAGE)
+            .putExtra(ProgressProtocol.EXTRA_COMMAND, ProgressProtocol.CMD_RESET_UPLOADED)
+        try {
+            app.sendBroadcast(intent)
+            // 广播是异步的，相册不在场时我们收不到任何回执（也不该把相册拉起来）。
+            // 所以只能给一个"已发出"的乐观结果，真正的行数由相册侧记进日志。
+            resetState = ResetState.Sent
+        } catch (t: Throwable) {
+            Logger.w("event=ui_reset_failed", t)
+            resetState = ResetState.Failed(t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    fun dismissResetResult() {
+        resetState = ResetState.Idle
     }
 
     // endregion
@@ -427,6 +472,21 @@ class SettingsModel : CoroutineScope {
         data class Failure(val detail: String) : TestState
     }
 
+    /**
+     * "重置已上传标记"的结果。
+     *
+     * <p>因为走的是一条单向广播，界面拿不到相册侧的返回值 —— 相册不在场时广播被静默丢弃，
+     * 而我们**刻意**不因此把相册拉起来（那会让模块 App 反过来主宰相册进程的生命周期）。
+     * 所以 [Sent] 的语义是"命令已发出"，不是"已完成"；真实改动行数记在相册侧日志里
+     * （`event=reset_uploaded rows=N`）。
+     */
+    sealed interface ResetState {
+        data object Idle : ResetState
+        data object Running : ResetState
+        data object Sent : ResetState
+        data class Failed(val detail: String) : ResetState
+    }
+
     companion object {
         /** 备份模式的落盘值，顺序必须与界面选项一致 */
         val MODE_VALUES = listOf(Config.MODE_REPLACE, Config.MODE_MIRROR, Config.MODE_OFF)
@@ -435,10 +495,10 @@ class SettingsModel : CoroutineScope {
         val LAYOUT_VALUES = listOf(Config.LAYOUT_ALBUM, Config.LAYOUT_DATE, Config.LAYOUT_FLAT)
 
         /**
-         * 账本模式的落盘值，顺序必须与界面选项一致。
+         * 记录方式的落盘值，顺序必须与界面选项一致。
          *
          * <p>与别的下拉框不同，这里落盘的不是下标而是字符串 —— 认不出来的值在
-         * [Config.readFlagMode] 里会退回默认（共用相册那本账），那是安全的一侧。
+         * [Config.readFlagMode] 里会退回默认（共用相册那条记录），那是安全的一侧。
          */
         val FLAG_MODE_VALUES = listOf(Config.FLAG_MODE_SHARED, Config.FLAG_MODE_PER_TARGET)
 

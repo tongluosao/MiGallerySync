@@ -46,4 +46,46 @@ public final class MarkSynced implements SyncMarker {
             Logger.w("event=mark_synced_failed row=" + rowId, t);
         }
     }
+
+    /**
+     * 把"已经标成上传完成"的行全部重置回"待上传"，让相册重新枚举、模块重新传一遍。
+     *
+     * <p><b>为什么需要它</b>："相册说传完了、远端却没有"这类坏账，任何代码改动都**看不见** ——
+     * 相册挑待上传项的谓词是 {@code localFlag != 0}（{@code CloudUtils.getSelectionOwnerNeedSync}），
+     * 这些行 {@code localFlag} 已经是 0，相册根本不会再把它们交给 {@code invokeList}，
+     * 模块也就永远没有机会发现远端缺文件并补传。唯一的修法就是把这些行退回"未上传"。
+     *
+     * <p>做法完全照抄宿主自己关闭云备份时那一套（{@code DeleteDataUtil.resetTableCloud}）：
+     * 同一组列、同一个目标值，只把范围收紧到"已经标成完成"的行上。
+     * 那些列正是相册用来认定"这份文件在云上"的全部依据 ——
+     * 它们的 {@code serverId} 指向的小米云对象本来就不存在（我们自己换掉了云），
+     * 留着只会让相册之后按它去查看/恢复云端对象而全部对不上号。
+     *
+     * <p><b>为什么范围是这两条</b>：
+     * <ul>
+     *   <li>{@code localFlag = 0}：就是"已完成"这个状态。置回 7（"自动创建，待上传"），
+     *       这是相册在 {@code SyncOwnerDataFromLocal.putToRequestCloudItemList} 里
+     *       明确会走上传分支的取值之一（4/7/8 才进上传列表）。</li>
+     *   <li>{@code serverId IS NOT NULL}：跟宿主那条谓词保持同一个前提。没有 serverId 的行
+     *       本来也没被相册算成"在云上"，动它们纯属多余。</li>
+     * </ul>
+     *
+     * <p>刻意**不动** {@code localFlag IN (2,15)} 的行：那是"已删除/编辑中"的在途状态，
+     * 替相册改它们会打乱它自己的删除同步。
+     *
+     * <p>不动 {@code localFile}：文件本身还在手机上，我们要的就是让相册重新上传它。
+     *
+     * @return 实际改动的行数；抛出异常时由调用方记日志
+     */
+    public int resetUploaded() {
+        ContentValues values = new ContentValues();
+        values.putNull("serverId");
+        values.putNull("serverTag");
+        values.putNull("serverStatus");
+        values.put("localFlag", 7);
+        int rows = mContext.getContentResolver().update(CLOUD_URI, values,
+                "localFlag = 0 AND serverId IS NOT NULL", null);
+        Logger.i("event=reset_uploaded rows=" + rows);
+        return rows;
+    }
 }

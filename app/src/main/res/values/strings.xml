@@ -7,6 +7,7 @@
 
     <string name="section_webdav">WebDAV</string>
     <string name="section_behavior">同步</string>
+    <string name="section_maintenance">维护</string>
     <string name="section_appearance">界面</string>
 
     <string name="tab_settings">设置</string>
@@ -45,12 +46,23 @@
 
     <string name="label_skip_existing_remote">远端有同名文件就跳过</string>
     <string name="summary_skip_existing_remote">上传前先看一眼远端有没有同名的，有就当已备份、不比对内容直接跳过。省流量但不会发现内容不同的旧文件</string>
-    <string name="label_local_flag_mode">已备份记账方式</string>
-    <string name="summary_local_flag_mode">与相册共用一本账最省事，但换账号/换目录后相册仍认为传过了；按目标分开记则各账号各记一份，换回来不用重传</string>
+    <string name="label_local_flag_mode">已上传标记记录方式</string>
+    <string name="summary_local_flag_mode">与相册共用一条记录最省事，但换账号/换目录后相册仍认为传过了；分开记则各账号各记一份，换回来不用重传</string>
     <string name="flag_mode_shared">与相册共用（改相册标记）</string>
     <string name="flag_mode_per_target">按目标分开记（不动相册标记）</string>
     <string name="label_download_enabled">从远端下载补齐</string>
-    <string name="summary_download_enabled">远端有、本地没有的文件下载到 DCIM/MiGallerySync 并加进相册。只补不删，本地已有的同名文件绝不覆盖</string>
+    <string name="summary_download_enabled">远端有、本地没有的文件下载到 DCIM/MiGallerySync 并加进相册。只补不删，本地已有的同名文件绝不覆盖；本地删掉的照片会被移到回收站，不会重新下回来</string>
+
+    <string name="action_reset_uploaded">重置已上传标记</string>
+    <string name="summary_reset_uploaded">把相册里标成"已上传"的照片全部退回未上传，让它们重新完整传一遍。用于远端文件缺失、相册却显示已传完的情况</string>
+    <string name="warn_reset_needs_replace">只在「替换：只传 WebDAV」模式下可用</string>
+    <string name="dialog_reset_title">重新完整上传一遍？</string>
+    <string name="dialog_reset_summary">相册里所有标成"已上传"的照片都会被退回未上传，然后重新上传一次。照片本身不会被删除或修改，但远端已有的同名文件会被覆盖写，过程可能要很久。此操作不可撤销。</string>
+    <string name="action_reset_confirm">开始重置</string>
+    <string name="action_cancel">取消</string>
+    <string name="msg_reset_running">正在重置…</string>
+    <string name="msg_reset_sent">已通知相册，请稍候查看进度页</string>
+    <string name="msg_reset_failed">重置失败：%1$s</string>
 
     <string name="summary_theme_mode">只影响本页配色</string>
 

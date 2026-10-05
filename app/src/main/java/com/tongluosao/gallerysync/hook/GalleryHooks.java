@@ -1,6 +1,10 @@
 package com.tongluosao.gallerysync.hook;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -10,7 +14,9 @@ import java.util.List;
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.DownloadQueue;
 import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.core.ProgressProtocol;
 import com.tongluosao.gallerysync.core.SyncMarker;
+import com.tongluosao.gallerysync.core.TrashQueue;
 import com.tongluosao.gallerysync.core.UploadQueue;
 
 import io.github.libxposed.api.XposedInterface;
@@ -48,9 +54,15 @@ public final class GalleryHooks {
     private volatile UploadQueue mQueue;
     /** 下载队列；第一次上传见底时才建（开关关着也建，方便用户随时打开） */
     private volatile DownloadQueue mDownload;
+    /** 回收站：删除 hook 往里排，"上传空转"时搬。与下载同一个节拍 */
+    private volatile TrashQueue mTrash;
+    /** 删除方向的 hook。它只需要一个 Context 与回收站队列，与上传队列无关 */
+    private volatile DeleteHook mDeleteHook;
     private volatile Config mConfig;
     /** 宿主 Application 是否已经 onCreate：配置与它谁先到都有可能，两边都要能补建队列 */
     private volatile boolean mAppStarted;
+    /** 模块 App 发来的命令广播的接收器；注册后要留着引用，注销时才找得到 */
+    private volatile BroadcastReceiver mCommandReceiver;
 
     private GalleryHooks(XposedInterface xposed, ClassLoader classLoader) {
         this.mXposed = xposed;
@@ -80,6 +92,15 @@ public final class GalleryHooks {
         DownloadQueue download = mDownload;
         if (download != null) {
             download.setConfig(config);
+        }
+        // 删除 hook 与回收站同理：一个可能还没装（拿不到 Context），一个可能还没建
+        DeleteHook deleteHook = mDeleteHook;
+        if (deleteHook != null) {
+            deleteHook.setConfig(config);
+        }
+        TrashQueue trash = mTrash;
+        if (trash != null) {
+            trash.setConfig(config);
         }
     }
 
@@ -187,6 +208,12 @@ public final class GalleryHooks {
                         try {
                             mAppStarted = true;
                             ensureQueue();
+                            // 命令接收器与删除 hook 都要宿主 Context，而 install() 那一刻
+                            // 启动还没走到这里（实测日志就是 command_receiver_unavailable
+                            // reason=no_host_context）。放在 super.onCreate() 之后补装，
+                            // 那时 GalleryApp.sGetAndroidContext() 一定可用
+                            ensureCommandReceiver();
+                            installDeleteHook();
                         } catch (Throwable t) {
                             // 建不起来只是"这一代没提前接上"，不能影响相册自己的启动
                             Logger.e("event=app_start_bootstrap_failed", t);
@@ -262,6 +289,55 @@ public final class GalleryHooks {
             return null;
         }
         return queue.queuedCounts();
+    }
+
+    /**
+     * 装删除 hook，并把回收站队列建起来。
+     *
+     * <p>与上传/下载队列一样要等宿主 Context：回收站要读 cloud 表、要落盘 state.json，
+     * 两件事都得有相册进程的 Context。所以这个钩子只负责"先把观察者挂上"，
+     * 队列本身在 {@link #ensureQueue} 里一起建（那里已经拿到了 Context）。
+     */
+    private void installDeleteHook() {
+        try {
+            if (mDeleteHook != null) {
+                return;
+            }
+            Context context = HostContext.get(mClassLoader);
+            if (context == null) {
+                // 与命令接收器同因：install() 那一刻启动还没走到 GalleryApp.onCreate。
+                // 启动钩子会再调一次，所以这里不当作错误
+                Logger.d("event=delete_hook_deferred reason=no_host_context");
+                return;
+            }
+            DeleteHook hook = new DeleteHook(mXposed, mClassLoader, context.getApplicationContext());
+            hook.setConfig(mConfig);
+            hook.install();
+            mDeleteHook = hook;
+        } catch (Throwable t) {
+            Logger.e("event=delete_hook_failed", t);
+        }
+    }
+
+    /** 调用方必须持有 mLock */
+    private void ensureTrashLocked() {
+        if (mTrash != null) {
+            return;
+        }
+        Config config = mConfig;
+        if (config == null) {
+            return;
+        }
+        Context context = HostContext.get(mClassLoader);
+        if (context == null) {
+            return;
+        }
+        mTrash = TrashQueue.get(context, config);
+        DeleteHook hook = mDeleteHook;
+        if (hook != null) {
+            hook.setTrash(mTrash);
+        }
+        Logger.i("event=trash_queue_ready");
     }
 
     /**
@@ -348,7 +424,7 @@ public final class GalleryHooks {
         if (backup.isEmpty()) {
             if (replace) {
                 // 替换模式下没有可入队的备份项也要拦住：放行就等于让这批去小米云。
-                // 而它们没被记账（localFlag 没被改成 0），下一轮枚举还会再交回来
+                // 而它们没被标记（localFlag 没被改成 0），下一轮枚举还会再交回来
                 Logger.w("event=invoke_list blocked_no_upload reason="
                         + (unreadable > 0 ? "items_unreadable" : "batch_unknown")
                         + " others=" + others + " thumb=" + thumbnails
@@ -415,13 +491,16 @@ public final class GalleryHooks {
                     mQueue = UploadQueue.get(context, mConfig);
                     mQueue.setMarker(markSynced(context));
                     mQueue.setProgress(HostSyncState.create(mClassLoader));
-                    // 下载队列与上传队列并列，共用同一个进度发布器（上传队列构造时就起了）
-                    mQueue.setIdleListener(this::ensureDownloadQueueAwake);
+                    // 下载队列与回收站都跟上传队列并列，共用同一个进度发布器
+                    //（上传队列构造时就起了），并由同一个 idle 回调驱动
+                    mQueue.setIdleListener(this::onUploadIdle);
                     Logger.i("event=queue_ready");
                 } else {
                     Logger.w("event=queue_unavailable reason=no_host_context");
                 }
             }
+            // 回收站要读 cloud 表、要落盘，与上传队列同一条件（拿到宿主 Context）
+            ensureTrashLocked();
             return mQueue;
         }
     }
@@ -457,11 +536,18 @@ public final class GalleryHooks {
         }
     }
 
-    /** 上传见底的回调：顺手保证下载队列已经建起来（首次唤醒时才建，省一点启动开销） */
-    private void ensureDownloadQueueAwake() {
+    /**
+     * 上传见底的回调：下载补齐与回收站都在这时候动手。
+     *
+     * <p>两件事共用同一个节拍是有意的 —— 它们都在"用户没在传照片"的时候才跑，
+     * 谁也不会跟上传抢带宽。下载队列与回收站都是首次唤醒时才建，省一点启动开销。
+     */
+    private void onUploadIdle() {
         DownloadQueue queue;
+        TrashQueue trash;
         synchronized (this) {
             queue = mDownload;
+            trash = mTrash;
         }
         if (queue == null) {
             ensureDownloadQueue();
@@ -472,16 +558,31 @@ public final class GalleryHooks {
         if (queue != null) {
             queue.onUploadIdle();
         }
+        if (trash == null) {
+            synchronized (this) {
+                ensureTrashLocked();
+                trash = mTrash;
+            }
+        }
+        if (trash != null) {
+            // 搬回收站不与下载抢线程：它整轮只有几个 MOVE，几十毫秒的事。
+            // 真放到独立线程反而多一处生命周期要管
+            try {
+                trash.drain();
+            } catch (Throwable t) {
+                Logger.w("event=trash_drain_failed detail=" + t);
+            }
+        }
     }
 
     /**
-     * 只有替换模式才需要替相册记账：镜像模式下原链路照常跑，宿主上传成功自己会写 localFlag=0。
+     * 只有替换模式才需要替相册标记：镜像模式下原链路照常跑，宿主上传成功自己会写 localFlag=0。
      * 模式可能被用户随时改，所以判据放在调用时而不是装配时。
      *
-     * <p>分账模式（{@code local_flag_mode=per_target}）下更是**一个字节都不写**：
-     * 那个开关的意思就是"别动相册那本账，模块自己按目标分账"。此时相册的 {@code localFlag}
+     * <p>分开记录模式（{@code local_flag_mode=per_target}）下更是**一个字节都不写**：
+     * 那个开关的意思就是"别动相册那条记录，模块自己按目标分开记录"。此时相册的 {@code localFlag}
      * 会一直停在 7/8，界面上"正在同步 N 个"由模块接管（数字来自队列，仍然是对的），
-     * 相册每轮枚举都会把同一批项重新交下来 —— 队列按 路径+大小+mtime 在当前目标那本账里
+     * 相册每轮枚举都会把同一批项重新交下来 —— 队列按 路径+大小+mtime 在当前目标那条记录里
      * 命中就直接跳过，不产生流量。代价是相册自己那份"脏项计数"永远归不了零，
      * 设置页的说明里写清楚了。
      */
@@ -501,21 +602,126 @@ public final class GalleryHooks {
         };
     }
 
+    /**
+     * 接收模块 App 发来的命令广播（见 {@link ProgressProtocol#ACTION_COMMAND}）。
+     *
+     * <p>目前只有一条命令：把当前账号的"已上传"标记全部重置回未上传。它必须在**相册进程**
+     * 里执行 —— 要写的是相册自己的 cloud provider，而注入进这个进程的代码用的是相册的 UID，
+     * 天然有写权限；模块 App 进程没有。
+     *
+     * <p>注册时用 {@code RECEIVER_EXPORTED}：发送方是另一个 App（模块 App）的 UID，
+     * 不导出的话一个字节也收不到。这不会扩大攻击面 —— action 是带包名的私有字符串，
+     * 而框架本身已经用 {@code setPackage} 把它定向到了模块 App。
+     */
+    private void ensureCommandReceiver() {
+        try {
+            if (mCommandReceiver != null) {
+                return;
+            }
+            Context context = HostContext.get(mClassLoader);
+            if (context == null) {
+                Logger.d("event=command_receiver_deferred reason=no_host_context");
+                return;
+            }
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context ctx, Intent intent) {
+                    try {
+                        handleCommand(intent.getStringExtra(ProgressProtocol.EXTRA_COMMAND));
+                    } catch (Throwable t) {
+                        // 广播接收器里漏出去的异常会打死宿主的接收线程
+                        Logger.e("event=command_failed", t);
+                    }
+                }
+            };
+            IntentFilter filter = new IntentFilter(ProgressProtocol.ACTION_COMMAND);
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter);
+            }
+            mCommandReceiver = receiver;
+            Logger.i("event=command_receiver_registered");
+        } catch (Throwable t) {
+            Logger.e("event=command_receiver_failed", t);
+        }
+    }
+
+    /** 执行一条来自模块 App 的命令。未知命令只留痕，不猜。 */
+    private void handleCommand(String command) {
+        if (command == null || command.isEmpty()) {
+            return;
+        }
+        Logger.i("event=command_received command=" + command);
+        if (ProgressProtocol.CMD_RESET_UPLOADED.equals(command)) {
+            resetUploaded();
+        }
+    }
+
+    /**
+     * 重置"已上传"标记并清掉模块自己的待传账，让这批照片重新走一遍完整备份。
+     *
+     * <p>两件事缺一不可：
+     * <ol>
+     *   <li>把相册的 {@code localFlag} 退回 7 —— 否则相册不会再把它们交给 {@code invokeList}
+     *       （它的枚举谓词是 {@code localFlag != 0}），模块根本看不见它们。</li>
+     *   <li>清掉模块的 done 记录 —— 否则相册交下来之后，队列按"路径+大小+mtime"命中旧记录，
+     *       直接判成"这一份传过了"跳过，一个字节都不发。这条正是 AGENTS.md 里
+     *       "换了目录之后备份就不动了"那个坑的同一个原因。</li>
+     * </ol>
+     */
+    private void resetUploaded() {
+        Context context = HostContext.get(mClassLoader);
+        if (context == null) {
+            Logger.w("event=reset_uploaded_failed reason=no_host_context");
+            return;
+        }
+        try {
+            int rows = new MarkSynced(context).resetUploaded();
+            // 清完模块的账要立刻落盘：进程在下次正常落盘前被杀的话，
+            // 旧 done 表会从 state.json 原样读回来，这次重置就白做了
+            UploadQueue queue = mQueue;
+            if (queue != null) {
+                queue.resetLedger();
+            }
+            Logger.i("event=reset_uploaded_done rows=" + rows);
+        } catch (Throwable t) {
+            Logger.e("event=reset_uploaded_failed", t);
+        }
+    }
+
     /** 热重载交接：停掉上传与下载线程，新 generation 会从 state.json 重建队列 */
     public void shutdown() {
         UploadQueue queue;
         DownloadQueue download;
+        TrashQueue trash;
+        BroadcastReceiver receiver;
         synchronized (this) {
             queue = mQueue;
             mQueue = null;
             download = mDownload;
             mDownload = null;
+            trash = mTrash;
+            mTrash = null;
+            receiver = mCommandReceiver;
+            mCommandReceiver = null;
+        }
+        if (receiver != null) {
+            try {
+                HostContext.get(mClassLoader).unregisterReceiver(receiver);
+            } catch (Throwable t) {
+                // 注销失败最多是旧 receiver 还挂着；它只会回一条幂等的重置命令
+                Logger.w("event=command_receiver_unregister_failed", t);
+            }
         }
         if (queue != null) {
             queue.shutdown();
         }
         if (download != null) {
             download.shutdown();
+        }
+        if (trash != null) {
+            trash.shutdown();
         }
     }
 }

@@ -55,7 +55,7 @@ public final class Config {
      */
     public static final String KEY_SKIP_EXISTING_REMOTE = "skip_existing_remote";
     /**
-     * 把"已备份"的记账从相册的 {@code localFlag} 挪到模块自己按目标分账的本子上。
+     * 把"已备份"的标记从相册的 {@code localFlag} 挪到模块自己按目标分开记录的本子上。
      *
      * <p>见 {@link #FLAG_MODE_PER_TARGET}。
      */
@@ -83,19 +83,19 @@ public final class Config {
     public static final String LAYOUT_FLAT = "flat";
 
     /**
-     * 默认：与相册共用一本账 —— 模块传成功后往 cloud 表写 {@code localFlag=0}。
+     * 默认：与相册共用一条记录 —— 模块传成功后往 cloud 表写 {@code localFlag=0}。
      *
-     * <p>好处是相册那句「正在同步 N 个」会真的归零，与用户看到的账一致。
-     * 坏处是这本账只认"这个文件传到过某个远端"，换账号/换根目录之后它照样说"传过了"。
+     * <p>好处是相册那句「正在同步 N 个」会真的归零，与用户看到的"已上传"一致。
+     * 坏处是这条记录只认"这个文件传到过某个远端"，换账号/换根目录之后它照样说"传过了"。
      */
     public static final String FLAG_MODE_SHARED = "shared";
     /**
-     * 按目标分账：不写相册的 {@code localFlag}，模块自己按"主机+账号+远端根目录+分目录方式"
-     * 各记一本"这些路径传完了"。
+     * 按目标分开记录：不写相册的 {@code localFlag}，模块自己按"主机+账号+远端根目录+分目录方式"
+     * 各记一条"这些路径传完了"。
      *
      * <p>用户要的就是这个：换回旧账号时不必重传，换成新账号时又确实会传一遍。
-     * 代价是相册那本账永远归不了零 —— {@code localFlag} 一直停在 7/8，相册每轮枚举都会把
-     * 同一批项重新交下来（模块按路径+大小+mtime 在本目标这本账里命中就直接跳过，不产生流量）。
+     * 代价是相册那条记录永远归不了零 —— {@code localFlag} 一直停在 7/8，相册每轮枚举都会把
+     * 同一批项重新交下来（模块按路径+大小+mtime 在本目标这条记录里命中就直接跳过，不产生流量）。
      * 相册界面上"正在同步 N 个"由模块接管（数字来自队列），所以显示仍然是对的。
      */
     public static final String FLAG_MODE_PER_TARGET = "per_target";
@@ -131,7 +131,7 @@ public final class Config {
      * 用户要的就是"省电省性能"，逐字节校验要完整下载一遍远端文件，那是流量意义上的灾难。
      */
     public static final boolean DEFAULT_SKIP_EXISTING_REMOTE = true;
-    /** 默认与相册共用一本账：升级后行为不变，不想让相册那本账被改的人自己去开分账 */
+    /** 默认与相册共用一条记录：升级后行为不变，不想让相册那条记录被改的人自己去开分开记录 */
     public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
     /** 默认关闭：反向数据流必须是用户显式要求才开，见 {@link #KEY_DOWNLOAD_ENABLED} */
     public static final boolean DEFAULT_DOWNLOAD_ENABLED = false;
@@ -195,8 +195,8 @@ public final class Config {
     }
 
     /**
-     * 读账本模式。认不出来的一律按默认（共用相册那本账）处理：
-     * 分账会停止改写相册的 {@code localFlag}，这是个有代价的开关，不该被一个错值悄悄打开。
+     * 读记录方式。认不出来的一律按默认（共用相册那条记录）处理：
+     * 分开记录会停止改写相册的 {@code localFlag}，这是个有代价的开关，不该被一个错值悄悄打开。
      */
     private static String readFlagMode(SharedPreferences prefs) {
         String mode = prefs.getString(KEY_LOCAL_FLAG_MODE, null);
@@ -321,7 +321,7 @@ public final class Config {
         return skipExistingRemote;
     }
 
-    /** true 表示不写相册的 localFlag，改用模块自己按目标分的账本 */
+    /** true 表示不写相册的 localFlag，改用模块自己按目标分开的记录 */
     public boolean isLocalFlagPerTarget() {
         return FLAG_MODE_PER_TARGET.equals(localFlagMode);
     }
