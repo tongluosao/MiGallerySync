@@ -59,6 +59,15 @@ class SettingsModel : CoroutineScope {
     /** 打开后 100% 即让出上传通道，落盘复核挪到后台线程 */
     var verifyAsync by mutableStateOf(Config.DEFAULT_VERIFY_ASYNC)
         private set
+    /** 上传前先看远端有没有同名文件，有就跳过（不比对内容） */
+    var skipExistingRemote by mutableStateOf(Config.DEFAULT_SKIP_EXISTING_REMOTE)
+        private set
+    /** 账本模式下标：0 = 与相册共用，1 = 按目标分账。对应 [FLAG_MODE_VALUES] */
+    var localFlagModeIndex by mutableStateOf(0)
+        private set
+    /** 打开后把远端有、本地没有的文件下载回本地 */
+    var downloadEnabled by mutableStateOf(Config.DEFAULT_DOWNLOAD_ENABLED)
+        private set
     /** 并行路数，取值下标 = 路数 - 1，对应 [CONCURRENCY_ITEMS] */
     var concurrencyIndex by mutableStateOf(Config.DEFAULT_UPLOAD_CONCURRENCY - 1)
         private set
@@ -148,6 +157,22 @@ class SettingsModel : CoroutineScope {
     fun onVerifyAsyncChange(checked: Boolean) {
         verifyAsync = checked
         writeNow(Config.KEY_VERIFY_ASYNC, checked)
+    }
+
+    fun onSkipExistingRemoteChange(checked: Boolean) {
+        skipExistingRemote = checked
+        writeNow(Config.KEY_SKIP_EXISTING_REMOTE, checked)
+    }
+
+    /** 落盘的是字符串（shared / per_target），不是下标 —— 详见 Config.KEY_LOCAL_FLAG_MODE */
+    fun onLocalFlagModeChange(index: Int) {
+        localFlagModeIndex = index.coerceIn(0, FLAG_MODE_VALUES.lastIndex)
+        writeNow(Config.KEY_LOCAL_FLAG_MODE, FLAG_MODE_VALUES[localFlagModeIndex])
+    }
+
+    fun onDownloadEnabledChange(checked: Boolean) {
+        downloadEnabled = checked
+        writeNow(Config.KEY_DOWNLOAD_ENABLED, checked)
     }
 
     /** 下拉给的是下标，落盘的是真实的并行路数（1..MAX），落盘值与界面顺序必须一致 */
@@ -297,6 +322,15 @@ class SettingsModel : CoroutineScope {
         uiMask = source.getBoolean(Config.KEY_UI_MASK, false)
         layoutIndex = layoutIndexOf(readLayout(source))
         verifyAsync = source.getBoolean(Config.KEY_VERIFY_ASYNC, Config.DEFAULT_VERIFY_ASYNC)
+        skipExistingRemote = source.getBoolean(
+            Config.KEY_SKIP_EXISTING_REMOTE, Config.DEFAULT_SKIP_EXISTING_REMOTE
+        )
+        localFlagModeIndex = flagModeIndexOf(
+            source.getString(Config.KEY_LOCAL_FLAG_MODE, Config.DEFAULT_LOCAL_FLAG_MODE)
+        )
+        downloadEnabled = source.getBoolean(
+            Config.KEY_DOWNLOAD_ENABLED, Config.DEFAULT_DOWNLOAD_ENABLED
+        )
         concurrencyIndex = concurrencyIndexOf(
             source.getInt(Config.KEY_UPLOAD_CONCURRENCY, Config.DEFAULT_UPLOAD_CONCURRENCY)
         )
@@ -324,6 +358,16 @@ class SettingsModel : CoroutineScope {
             Config.KEY_REMOTE_LAYOUT -> layoutIndex = layoutIndexOf(readLayout(source))
             Config.KEY_VERIFY_ASYNC -> verifyAsync =
                 source.getBoolean(key, Config.DEFAULT_VERIFY_ASYNC)
+
+            Config.KEY_SKIP_EXISTING_REMOTE -> skipExistingRemote =
+                source.getBoolean(key, Config.DEFAULT_SKIP_EXISTING_REMOTE)
+
+            Config.KEY_LOCAL_FLAG_MODE -> localFlagModeIndex = flagModeIndexOf(
+                source.getString(key, Config.DEFAULT_LOCAL_FLAG_MODE)
+            )
+
+            Config.KEY_DOWNLOAD_ENABLED -> downloadEnabled =
+                source.getBoolean(key, Config.DEFAULT_DOWNLOAD_ENABLED)
 
             Config.KEY_UPLOAD_CONCURRENCY -> concurrencyIndex = concurrencyIndexOf(
                 source.getInt(key, Config.DEFAULT_UPLOAD_CONCURRENCY)
@@ -390,6 +434,14 @@ class SettingsModel : CoroutineScope {
         /** 远端目录分法的落盘值，顺序必须与界面选项一致 */
         val LAYOUT_VALUES = listOf(Config.LAYOUT_ALBUM, Config.LAYOUT_DATE, Config.LAYOUT_FLAT)
 
+        /**
+         * 账本模式的落盘值，顺序必须与界面选项一致。
+         *
+         * <p>与别的下拉框不同，这里落盘的不是下标而是字符串 —— 认不出来的值在
+         * [Config.readFlagMode] 里会退回默认（共用相册那本账），那是安全的一侧。
+         */
+        val FLAG_MODE_VALUES = listOf(Config.FLAG_MODE_SHARED, Config.FLAG_MODE_PER_TARGET)
+
         /** 并行路数的选项文案，下标 = 路数 - 1 */
         val CONCURRENCY_ITEMS = (1..Config.MAX_UPLOAD_CONCURRENCY).map { it.toString() }
 
@@ -409,6 +461,11 @@ class SettingsModel : CoroutineScope {
 
         private fun layoutIndexOf(value: String?): Int {
             val index = LAYOUT_VALUES.indexOf(value)
+            return if (index >= 0) index else 0
+        }
+
+        private fun flagModeIndexOf(value: String?): Int {
+            val index = FLAG_MODE_VALUES.indexOf(value)
             return if (index >= 0) index else 0
         }
 

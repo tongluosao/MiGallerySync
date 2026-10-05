@@ -102,12 +102,55 @@ public final class UploadQueue {
     private static final long IDLE_SYNC_BASE = 60_000L;
     private static final long IDLE_SYNC_MAX = 60 * 60_000L;
 
+    /**
+     * "远端目录里有哪些名字"这份名单能信多久。
+     *
+     * <p>见 {@link #mRemoteNames}。取一分钟是因为相册一次交下来的项基本都在同一批里传完，
+     * 一分钟足够让同目录的几十项共用一次 PROPFIND；再长就会让"别人刚传上去的同名文件"
+     * 也被判成远端没有（代价只是多传一次覆盖写，无害），但会让"用户自己刚删掉远端文件"
+     * 这件事在整整一分钟里看不见（那才是真的少传一个文件）。
+     */
+    private static final long REMOTE_DIR_CACHE_MS = 60_000L;
+    /** 名单缓存最多留几个目录：按时间分目录时一个月能跨几十个，不给上限就是慢慢涨 */
+    private static final int MAX_CACHED_DIRS = 64;
+    /**
+     * "按目标分账"模式下最多同时留几本账（见 {@link #mLedgers}）。
+     *
+     * <p>四本够"家里 NAS / 单位服务器 / 旧账号 / 新账号"这种用法来回切；
+     * 每本最多 {@link #MAX_DONE_RECORDS} 条，落盘时会一起写进 state.json，所以不能留太多 ——
+     * 那是每次落盘都要序列化的体积。
+     */
+    private static final int MAX_LEDGERS = 4;
+
     private static volatile UploadQueue sInstance;
 
     private final Context mContext;
     private final Object mLock = new Object();
     private final LinkedHashMap<String, Task> mPending = new LinkedHashMap<>();
     private final LinkedHashMap<String, Long> mDone = new LinkedHashMap<>();
+    /**
+     * "按目标分账"模式下的**其他目标**各自的已完成记录：目标签名 → 那一本账。
+     *
+     * <p>{@link #mDone} 永远装着"当前这个目标"的账；换目标时把当前这本存进这里、
+     * 再把新目标那本（如果有）取出来装回 {@code mDone}。这样"传完一项"这条热路径
+     * 一行都不用改，分账只发生在换目标那一瞬间。
+     *
+     * <p>为什么要有它：{@link #mDone} 是按本地文件（路径+大小+mtime）记的，只说明
+     * "这一份传到过某个远端"。用户换回旧账号时期望"不用重传"，换成新账号时期望"确实传一遍" ——
+     * 只有把账按目标分开存才能同时满足。留 {@link #MAX_LEDGERS} 本（LRU）：
+     * 用户反复来回切账号时最近那几本还在，更早的丢掉换一轮重传，不是丢数据。
+     *
+     * <p>受 {@link #mLock} 保护。
+     */
+    private final LinkedHashMap<String, LinkedHashMap<String, Long>> mLedgers = new LinkedHashMap<>();
+    /**
+     * {@link #mDone} 这本账是对着哪个目标攒的。
+     *
+     * <p>它是"这本账属于谁"的运行时真相，不能现算：{@code mConfig} 在 {@link #setConfig}
+     * 里总是已经换成新目标了，那时再拿它算签名，得到的是新目标的签名 —— 旧账就会被
+     * 记到新目标名下（换账号后一本账都不重传）。
+     */
+    private String mDoneSignature = "";
     /**
      * 正在被某个 worker 传的项（键同 {@link Task#key()}），受 {@link #mLock} 保护。
      *
@@ -147,6 +190,8 @@ public final class UploadQueue {
     private volatile Config mConfig;
     private volatile SyncMarker mMarker;
     private volatile HostSyncState mProgress;
+    /** 上传见底时通知谁；见 {@link IdleListener} */
+    private volatile IdleListener mIdleListener;
     /** 多个 worker 会同时自增，Hook 线程还会跨线程读，必须原子 */
     private final AtomicInteger mConsecutiveFailures = new AtomicInteger();
     /**
@@ -203,6 +248,33 @@ public final class UploadQueue {
      * 平时的帧还是几百字节。
      */
     private volatile int mPendingVersion;
+
+    /**
+     * 远端目录内容的短期缓存：目录 → 该目录下的直接子项名字集合。
+     *
+     * <p>上传前那一次"远端有没有同名文件"的判断很便宜，但**每个文件一次** PROPFIND 也不便宜：
+     * 一天几千项、每项一次往返，还要在手机上不停地解密连接。按目录缓存之后，
+     * 同一批（相册一次交下来的一项一条相册目录，通常几十项同目录）只要列一次。
+     *
+     * <p>生命周期是 {@link #REMOTE_DIR_CACHE_MS}：缓存太久就会拿一份旧名单去判"远端没有"，
+     * 而那期间别的客户端可能已经传上去了（那时多传一次覆盖写，无害）；缓存太短又等于没缓存。
+     * 一分钟足够覆盖"同一批连着传完"这个场景。条目数也有上限，防的是用户把
+     * {@code remote_layout} 设成按时间分、一个月跨几十个目录时把内存撑起来。
+     *
+     * <p>只受 {@link #mLock} 保护（多个 worker 并发读）。
+     */
+    private final LinkedHashMap<String, RemoteNames> mRemoteNames = new LinkedHashMap<>();
+
+    /** {@link #mRemoteNames} 里的一条：名字集合 + 取回来的时刻 */
+    private static final class RemoteNames {
+        final Set<String> names;
+        final long at;
+
+        RemoteNames(Set<String> names, long at) {
+            this.names = names;
+            this.at = at;
+        }
+    }
 
     /**
      * 把在传状态发给模块 App 的进度页。
@@ -454,6 +526,28 @@ public final class UploadQueue {
         mMarker = marker;
     }
 
+    /**
+     * 上传队列见底的通知。
+     *
+     * <p>给下载队列用：上传在动 = 用户正在用这个 App，那时补下载最不容易打扰；
+     * 上传长时间不动就说明没人盯着，下载自己按翻倍后的间隔慢慢来。
+     */
+    public interface IdleListener {
+        void onIdle();
+    }
+
+    public void setIdleListener(IdleListener listener) {
+        mIdleListener = listener;
+    }
+
+    /**
+     * 进度发布器。下载队列要与上传共用同一个：进度页只有一张，两个队列各挂一个
+     * {@link UploadProgressPublisher.QueueView}，计数与列表由发布器合起来。
+     */
+    public UploadProgressPublisher publisher() {
+        return mPublisher;
+    }
+
     /** 驱动相册原生进度界面的桥；为 null 时界面不显示进度，上传照常 */
     public void setProgress(HostSyncState progress) {
         mProgress = progress;
@@ -473,7 +567,9 @@ public final class UploadQueue {
             releaseClient();
             releaseVerifyClients();
             synchronized (mLock) {
-                targetChangedLocked();
+                targetChangedLocked(config);
+                // 缓存里的远端名单也是对旧目标列的，换目标的这一刻一律作废
+                mRemoteNames.clear();
             }
         }
         applyConcurrency(config.getUploadConcurrency());
@@ -505,26 +601,67 @@ public final class UploadQueue {
     }
 
     /**
-     * 目标变了就把"已完成"与退避一起清掉。
-     * 已完成记录是按"这个位置上已经有了"记的，换服务器/换账号/换远端目录之后它对新位置
-     * 完全无效 —— 留着就是"队列一片绿、新目标上一个文件都没有"。退避同理，它是旧目标攒出来的。
-     * 调用方必须持有 mLock（里面要 notifyAll 唤醒等退避的 worker）。
+     * 目标变了：处理"已完成"与退避。
+     *
+     * <p>已完成记录是按"这个位置上已经有了"记的，换服务器/换账号/换远端目录之后它对新位置
+     * 完全无效 —— 留在当前这本账里就是"队列一片绿、新目标上一个文件都没有"。
+     * 退避同理，它是旧目标攒出来的，一律清零。
+     *
+     * <p>分账模式（{@link Config#isLocalFlagPerTarget()}）下不是清掉而是**换账**：
+     * 把当前这本按旧签名存进 {@link #mLedgers}，再把新签名那本（以前存过的）取出来当当前账。
+     * 于是"换回旧账号"时那本账里记过的项直接命中，一个字节都不重发；"换成新账号"时
+     * 新签名没有账，就是全空 —— 正是用户要的两种行为。共用模式（默认）下照旧清空：
+     * 那本账是相册的 `localFlag` 的镜像，相册那边没有"按目标分账"这回事，分账反而会让
+     * 相册显示已上传、而模块认为该传 —— 两边说法不一致。
+     *
+     * <p>调用方必须持有 mLock（里面要 notifyAll 唤醒等退避的 worker）。
      */
-    private void targetChangedLocked() {
+    private void targetChangedLocked(Config config) {
         int pending = mPending.size();
         int done = mDone.size();
+        String nextSignature = targetSignature(config);
+        boolean perTarget = config != null && config.isLocalFlagPerTarget();
+        if (perTarget && !mDone.isEmpty() && !mDoneSignature.isEmpty()
+                && !mDoneSignature.equals(nextSignature)) {
+            // 存的是副本：mDone 下面就要被清空/复用，直接放引用会被后续改动带走
+            mLedgers.put(mDoneSignature, new LinkedHashMap<>(mDone));
+            trimLedgersLocked();
+            Logger.i("event=ledger_stashed signature=" + mDoneSignature + " records=" + done);
+        }
         mDone.clear();
+        if (perTarget) {
+            LinkedHashMap<String, Long> stored = mLedgers.remove(nextSignature);
+            if (stored != null && !stored.isEmpty()) {
+                mDone.putAll(stored);
+                Logger.i("event=ledger_restored signature=" + nextSignature
+                        + " records=" + mDone.size());
+            }
+        }
+        mDoneSignature = nextSignature;
         for (Task task : mPending.values()) {
             task.attempts = 0;
             task.nextAttemptAt = 0L;
         }
         if (done > 0 || pending > 0) {
-            Logger.i("event=queue_target_reset done=" + done + " pending=" + pending);
+            Logger.i("event=queue_target_reset done=" + done + " pending=" + pending
+                    + " per_target=" + perTarget);
         }
         // 立刻落盘：不写的话，进程在下次正常落盘之前被杀（一键清理、崩溃），
         // 旧 done 表会从 state.json 里原样读回来，"换了目录"这件事就白做了
         writeStateLocked();
         mLock.notifyAll();
+    }
+
+    /** 最多留 {@link #MAX_LEDGERS} 本账，超了就丢最早存进来的那本（下次换回去重传一轮） */
+    private void trimLedgersLocked() {
+        if (mLedgers.size() <= MAX_LEDGERS) {
+            return;
+        }
+        Iterator<String> it = mLedgers.keySet().iterator();
+        while (it.hasNext() && mLedgers.size() > MAX_LEDGERS) {
+            it.next();
+            it.remove();
+        }
     }
 
     /**
@@ -1156,7 +1293,17 @@ public final class UploadQueue {
      * 它拿得到密码，能额外发现改密码）。
      */
     private String targetSignature() {
-        Config config = mConfig;
+        return targetSignature(mConfig);
+    }
+
+    /**
+     * 目标签名，同时也是"分账模式下的账本键"。
+     *
+     * <p>落盘时要算的是**当前这份配置**的签名（不能用一个可能已经过期的实例字段），
+     * 而换目标时要算的是**新配置**的签名（那时 {@link #mDone} 里还是旧目标的账）——
+     * 所以做成静态形态，两个调用点各传各的。
+     */
+    private static String targetSignature(Config config) {
         if (config == null) {
             return "";
         }
@@ -1228,6 +1375,20 @@ public final class UploadQueue {
             root.put("target", targetSignature());
             root.put("pending", pending);
             root.put("done", done);
+            // 分账模式下把其他目标那几本一起带上：不带的话"换回旧账号不用重传"就只在本进程
+            // 活着的时候成立，重启一次账就没了（用户看到的还是"又传了一遍"）
+            Config config = mConfig;
+            if (config != null && config.isLocalFlagPerTarget() && !mLedgers.isEmpty()) {
+                JSONObject ledgers = new JSONObject();
+                for (Map.Entry<String, LinkedHashMap<String, Long>> ledger : mLedgers.entrySet()) {
+                    JSONObject one = new JSONObject();
+                    for (Map.Entry<String, Long> entry : ledger.getValue().entrySet()) {
+                        one.put(entry.getKey(), entry.getValue());
+                    }
+                    ledgers.put(ledger.getKey(), one);
+                }
+                root.put("ledgers", ledgers);
+            }
             try (FileOutputStream out = new FileOutputStream(tmp)) {
                 out.write(root.toString().getBytes(StandardCharsets.UTF_8));
             }
@@ -1269,25 +1430,57 @@ public final class UploadQueue {
             }
             JSONObject done = root.optJSONObject("done");
             if (done != null) {
-                Iterator<String> keys = done.keys();
-                List<String> list = new ArrayList<>();
-                while (keys.hasNext()) {
-                    list.add(keys.next());
-                }
-                for (String key : list) {
-                    mDone.put(key, done.optLong(key, 0L));
-                }
+                readLedger(done, mDone);
             }
+            // 分账模式下"其他目标"的账本。老版本没有这个键，读不到就是空的，行为不变
+            JSONObject ledgers = root.optJSONObject("ledgers");
+            if (ledgers != null) {
+                Iterator<String> signatures = ledgers.keys();
+                List<String> sigList = new ArrayList<>();
+                while (signatures.hasNext()) {
+                    sigList.add(signatures.next());
+                }
+                for (String signature : sigList) {
+                    JSONObject one = ledgers.optJSONObject(signature);
+                    if (one == null) {
+                        continue;
+                    }
+                    LinkedHashMap<String, Long> ledger = new LinkedHashMap<>();
+                    readLedger(one, ledger);
+                    if (!ledger.isEmpty()) {
+                        mLedgers.put(signature, ledger);
+                    }
+                }
+                trimLedgersLocked();
+            }
+            mDoneSignature = savedTarget;
             synchronized (mLock) {
+                Config config = mConfig;
                 if (!savedTarget.isEmpty() && !savedTarget.equals(targetSignature())) {
-                    targetChangedLocked();
+                    // 落盘时的目标与现在这份配置不是同一个。两种模式都在这里处理：
+                    // 共用账本直接清掉（旧账对新目标无效）；分账模式换成新目标那本
+                    // （刚读进来的那本账的签名是 savedTarget，会被存回 mLedgers）。
+                    targetChangedLocked(config);
                     // 立刻落盘：否则每开一次进程就重来一次，把"已完成"反复清空、文件反复重传
                     writeStateLocked();
                 }
             }
-            Logger.i("event=state_loaded pending=" + mPending.size() + " done=" + mDone.size());
+            Logger.i("event=state_loaded pending=" + mPending.size() + " done=" + mDone.size()
+                    + " ledgers=" + mLedgers.size());
         } catch (Throwable t) {
             Logger.w("event=state_load_failed", t);
+        }
+    }
+
+    /** 把一段 JSON 对象读成账本（键都是"路径|大小|mtime"） */
+    private static void readLedger(JSONObject source, LinkedHashMap<String, Long> into) {
+        Iterator<String> keys = source.keys();
+        List<String> list = new ArrayList<>();
+        while (keys.hasNext()) {
+            list.add(keys.next());
+        }
+        for (String key : list) {
+            into.put(key, source.optLong(key, 0L));
         }
     }
 

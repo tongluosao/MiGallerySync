@@ -43,6 +43,15 @@
     <string name="label_upload_concurrency">并行上传路数</string>
     <string name="summary_upload_concurrency">同时上传几张，1-8，默认 3。调大能加速，太多会压满服务器</string>
 
+    <string name="label_skip_existing_remote">远端有同名文件就跳过</string>
+    <string name="summary_skip_existing_remote">上传前先看一眼远端有没有同名的，有就当已备份、不比对内容直接跳过。省流量但不会发现内容不同的旧文件</string>
+    <string name="label_local_flag_mode">已备份记账方式</string>
+    <string name="summary_local_flag_mode">与相册共用一本账最省事，但换账号/换目录后相册仍认为传过了；按目标分开记则各账号各记一份，换回来不用重传</string>
+    <string name="flag_mode_shared">与相册共用（改相册标记）</string>
+    <string name="flag_mode_per_target">按目标分开记（不动相册标记）</string>
+    <string name="label_download_enabled">从远端下载补齐</string>
+    <string name="summary_download_enabled">远端有、本地没有的文件下载到 DCIM/MiGallerySync 并加进相册。只补不删，本地已有的同名文件绝不覆盖</string>
+
     <string name="summary_theme_mode">只影响本页配色</string>
 
     <string name="label_theme_mode">主题模式</string>

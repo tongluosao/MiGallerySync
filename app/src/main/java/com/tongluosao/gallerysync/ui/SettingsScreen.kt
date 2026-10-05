@@ -260,6 +260,28 @@ private fun BehaviorSection(model: SettingsModel) {
                 title = stringResource(R.string.label_verify_async),
                 summary = stringResource(R.string.summary_verify_async)
             )
+            SwitchPreference(
+                checked = model.skipExistingRemote,
+                onCheckedChange = model::onSkipExistingRemoteChange,
+                title = stringResource(R.string.label_skip_existing_remote),
+                summary = stringResource(R.string.summary_skip_existing_remote)
+            )
+            OverlayDropdownPreference(
+                items = listOf(
+                    stringResource(R.string.flag_mode_shared),
+                    stringResource(R.string.flag_mode_per_target)
+                ),
+                selectedIndex = model.localFlagModeIndex,
+                title = stringResource(R.string.label_local_flag_mode),
+                summary = stringResource(R.string.summary_local_flag_mode),
+                onSelectedIndexChange = model::onLocalFlagModeChange
+            )
+            SwitchPreference(
+                checked = model.downloadEnabled,
+                onCheckedChange = model::onDownloadEnabledChange,
+                title = stringResource(R.string.label_download_enabled),
+                summary = stringResource(R.string.summary_download_enabled)
+            )
             OverlayDropdownPreference(
                 items = SettingsModel.CONCURRENCY_ITEMS,
                 selectedIndex = model.concurrencyIndex,

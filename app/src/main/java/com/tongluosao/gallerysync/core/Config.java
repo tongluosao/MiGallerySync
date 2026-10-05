@@ -42,6 +42,31 @@ public final class Config {
      * 打开这个开关后复核挪到独立线程，槽位立刻空出来去传下一项。
      */
     public static final String KEY_VERIFY_ASYNC = "verify_async";
+    /**
+     * 上传前先看远端有没有同名文件，有就当作"这一份已经备份过了"，跳过上传。
+     *
+     * <p>相册那边每轮同步会把同一批脏项反复交下来，模块虽然有自己的 done 表去重，但那份表
+     * 是按"本地文件"记的，换账号、换根目录、清数据都会失效；只要失效过一轮，几千张照片
+     * 就要按字节重发一遍。远端同名的判定不需要流量（一次 PROPFIND 换回整个目录的名字），
+     * 所以默认打开：真正的"重传一遍"应该由用户显式清远端或换目录来触发。
+     *
+     * <p>代价要说清楚：**不比对内容**。远端那个同名文件是上一次自己传的、还是别人放的同名
+     * 文件，模块分不出来，都按"已完成"处理。想要严格一致就把它关掉。
+     */
+    public static final String KEY_SKIP_EXISTING_REMOTE = "skip_existing_remote";
+    /**
+     * 把"已备份"的记账从相册的 {@code localFlag} 挪到模块自己按目标分账的本子上。
+     *
+     * <p>见 {@link #FLAG_MODE_PER_TARGET}。
+     */
+    public static final String KEY_LOCAL_FLAG_MODE = "local_flag_mode";
+    /**
+     * 把远端有、本地没有的文件下载回本地。
+     *
+     * <p>默认关闭：它是反向的数据流（远端 → 手机），一旦远端被谁塞了东西，
+     * 打开它就等于让那些文件自动落到相册里。想要"双向同步"的用户自己开。
+     */
+    public static final String KEY_DOWNLOAD_ENABLED = "download_enabled";
 
     /** 替换：拦截原链路，只上传 WebDAV */
     public static final String MODE_REPLACE = "replace";
@@ -56,6 +81,24 @@ public final class Config {
     public static final String LAYOUT_DATE = "date";
     /** 全平铺：<root>/<文件名>，供建不出子目录的服务器使用 */
     public static final String LAYOUT_FLAT = "flat";
+
+    /**
+     * 默认：与相册共用一本账 —— 模块传成功后往 cloud 表写 {@code localFlag=0}。
+     *
+     * <p>好处是相册那句「正在同步 N 个」会真的归零，与用户看到的账一致。
+     * 坏处是这本账只认"这个文件传到过某个远端"，换账号/换根目录之后它照样说"传过了"。
+     */
+    public static final String FLAG_MODE_SHARED = "shared";
+    /**
+     * 按目标分账：不写相册的 {@code localFlag}，模块自己按"主机+账号+远端根目录+分目录方式"
+     * 各记一本"这些路径传完了"。
+     *
+     * <p>用户要的就是这个：换回旧账号时不必重传，换成新账号时又确实会传一遍。
+     * 代价是相册那本账永远归不了零 —— {@code localFlag} 一直停在 7/8，相册每轮枚举都会把
+     * 同一批项重新交下来（模块按路径+大小+mtime 在本目标这本账里命中就直接跳过，不产生流量）。
+     * 相册界面上"正在同步 N 个"由模块接管（数字来自队列），所以显示仍然是对的。
+     */
+    public static final String FLAG_MODE_PER_TARGET = "per_target";
 
     public static final String DEFAULT_REPLACE_MODE = MODE_REPLACE;
     public static final String DEFAULT_REMOTE_ROOT = "MiGallerySync";
@@ -83,6 +126,15 @@ public final class Config {
      * 复核本身没有取消，只是挪到了后台，假写存储照样会被抓住并重传。
      */
     public static final boolean DEFAULT_VERIFY_ASYNC = true;
+    /**
+     * 默认开启：见 {@link #KEY_SKIP_EXISTING_REMOTE}。名字对得上就当备份过了，不校验内容 ——
+     * 用户要的就是"省电省性能"，逐字节校验要完整下载一遍远端文件，那是流量意义上的灾难。
+     */
+    public static final boolean DEFAULT_SKIP_EXISTING_REMOTE = true;
+    /** 默认与相册共用一本账：升级后行为不变，不想让相册那本账被改的人自己去开分账 */
+    public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
+    /** 默认关闭：反向数据流必须是用户显式要求才开，见 {@link #KEY_DOWNLOAD_ENABLED} */
+    public static final boolean DEFAULT_DOWNLOAD_ENABLED = false;
 
     private final String replaceMode;
     private final String baseUrl;
@@ -97,6 +149,9 @@ public final class Config {
     private final String remoteLayout;
     private final int uploadConcurrency;
     private final boolean verifyAsync;
+    private final boolean skipExistingRemote;
+    private final String localFlagMode;
+    private final boolean downloadEnabled;
 
     private Config(SharedPreferences prefs) {
         if (prefs == null) {
@@ -113,6 +168,9 @@ public final class Config {
             remoteLayout = DEFAULT_REMOTE_LAYOUT;
             uploadConcurrency = DEFAULT_UPLOAD_CONCURRENCY;
             verifyAsync = DEFAULT_VERIFY_ASYNC;
+            skipExistingRemote = DEFAULT_SKIP_EXISTING_REMOTE;
+            localFlagMode = DEFAULT_LOCAL_FLAG_MODE;
+            downloadEnabled = DEFAULT_DOWNLOAD_ENABLED;
         } else {
             replaceMode = prefs.getString(KEY_REPLACE_MODE, DEFAULT_REPLACE_MODE);
             baseUrl = prefs.getString(KEY_BASE_URL, "");
@@ -128,7 +186,24 @@ public final class Config {
             uploadConcurrency = clampConcurrency(
                     prefs.getInt(KEY_UPLOAD_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY));
             verifyAsync = prefs.getBoolean(KEY_VERIFY_ASYNC, DEFAULT_VERIFY_ASYNC);
+            skipExistingRemote = prefs.getBoolean(
+                    KEY_SKIP_EXISTING_REMOTE, DEFAULT_SKIP_EXISTING_REMOTE);
+            localFlagMode = readFlagMode(prefs);
+            downloadEnabled = prefs.getBoolean(
+                    KEY_DOWNLOAD_ENABLED, DEFAULT_DOWNLOAD_ENABLED);
         }
+    }
+
+    /**
+     * 读账本模式。认不出来的一律按默认（共用相册那本账）处理：
+     * 分账会停止改写相册的 {@code localFlag}，这是个有代价的开关，不该被一个错值悄悄打开。
+     */
+    private static String readFlagMode(SharedPreferences prefs) {
+        String mode = prefs.getString(KEY_LOCAL_FLAG_MODE, null);
+        if (FLAG_MODE_PER_TARGET.equals(mode)) {
+            return FLAG_MODE_PER_TARGET;
+        }
+        return DEFAULT_LOCAL_FLAG_MODE;
     }
 
     /**
@@ -241,6 +316,25 @@ public final class Config {
         return verifyAsync;
     }
 
+    /** true 表示上传前先列一次远端目录，名字对上就跳过（不比对内容） */
+    public boolean isSkipExistingRemote() {
+        return skipExistingRemote;
+    }
+
+    /** true 表示不写相册的 localFlag，改用模块自己按目标分的账本 */
+    public boolean isLocalFlagPerTarget() {
+        return FLAG_MODE_PER_TARGET.equals(localFlagMode);
+    }
+
+    public String getLocalFlagMode() {
+        return localFlagMode;
+    }
+
+    /** true 表示要把远端有、本地没有的文件下载回本地 */
+    public boolean isDownloadEnabled() {
+        return downloadEnabled;
+    }
+
     @Override
     public String toString() {
         return "Config{mode=" + replaceMode
@@ -250,7 +344,10 @@ public final class Config {
                 + ", wifiOnly=" + wifiOnly
                 + ", maxItems=" + maxItemsPerSync
                 + ", workers=" + uploadConcurrency
-                + ", verifyAsync=" + verifyAsync + "}";
+                + ", verifyAsync=" + verifyAsync
+                + ", skipRemote=" + skipExistingRemote
+                + ", flagMode=" + localFlagMode
+                + ", download=" + downloadEnabled + "}";
     }
 
     /** 只保留 scheme + host + port，避免凭据与路径出现在日志里 */

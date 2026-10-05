@@ -419,18 +419,30 @@ public final class GalleryHooks {
     /**
      * 只有替换模式才需要替相册记账：镜像模式下原链路照常跑，宿主上传成功自己会写 localFlag=0。
      * 模式可能被用户随时改，所以判据放在调用时而不是装配时。
+     *
+     * <p>分账模式（{@code local_flag_mode=per_target}）下更是**一个字节都不写**：
+     * 那个开关的意思就是"别动相册那本账，模块自己按目标分账"。此时相册的 {@code localFlag}
+     * 会一直停在 7/8，界面上"正在同步 N 个"由模块接管（数字来自队列，仍然是对的），
+     * 相册每轮枚举都会把同一批项重新交下来 —— 队列按 路径+大小+mtime 在当前目标那本账里
+     * 命中就直接跳过，不产生流量。代价是相册自己那份"脏项计数"永远归不了零，
+     * 设置页的说明里写清楚了。
      */
     private SyncMarker markSynced(Context context) {
         MarkSynced target = new MarkSynced(context);
         return rowId -> {
             Config config = mConfig;
-            if (config != null && config.isReplace()) {
-                target.markSynced(rowId);
+            if (config == null || !config.isReplace()) {
+                return;
             }
+            if (config.isLocalFlagPerTarget()) {
+                // 只在 verbose 下输出：每传成功一项都会走这里，默认级别刷屏
+                Logger.d("event=mark_synced_skipped reason=per_target row=" + rowId);
+                return;
+            }
+            target.markSynced(rowId);
         };
     }
 
-    /** 热重载交接：停掉上传线程，新 generation 会从 state.json 重建队列 */
     public void shutdown() {
         UploadQueue queue;
         synchronized (this) {
