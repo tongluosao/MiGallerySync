@@ -302,10 +302,60 @@ public final class WebDavClient {
         return isSuccess(res.code) || res.code == 404;
     }
 
+    /** 目录在 / 不在 / 问不出来。第三态是必须的：不能把"问不出来"当成"没有" */
+    private static final int COLL_EXISTS = 1;
+    private static final int COLL_MISSING = 0;
+    private static final int COLL_UNKNOWN = -1;
+
+    /**
+     * 问一句"这个目录到底在不在"。
+     *
+     * <p>先 HEAD（2xx/3xx 算在，OpenList 挂网盘会把 HEAD 302 到存储直链）。HEAD 说 404
+     * **不能就此下结论** —— 不少服务器（包括 PC 回归里那个严格替身）对目录根本不支持 HEAD，
+     * 一律回 404，于是必须再用一次 PROPFIND Depth 0 确认。两条都明确说"没有"才算没有；
+     * 其余情形（不支持 PROPFIND、连接层出错、405/501）一律"问不出来"，
+     * 由调用方决定怎么办 —— 把问不出来当成"不在"会让本来正常的服务器被反复 MKCOL。
+     */
+    private int collectionState(String remotePath) {
+        Res head;
+        try {
+            head = send("HEAD", remotePath, null, null, false);
+        } catch (IOException e) {
+            return COLL_UNKNOWN;
+        }
+        if (isSuccess(head.code) || head.code == 301 || head.code == 302 || head.code == 307
+                || head.code == 308) {
+            return COLL_EXISTS;
+        }
+        if (head.code != 404 && head.code != 410) {
+            return COLL_UNKNOWN;
+        }
+        Res prop = propfind(remotePath, 0);
+        if (prop == null) {
+            return COLL_UNKNOWN;
+        }
+        if (prop.code == 404 || (prop.body != null && NOT_FOUND_STATUS.matcher(prop.body).find())) {
+            return COLL_MISSING;
+        }
+        return prop.code == 207 ? COLL_EXISTS : COLL_UNKNOWN;
+    }
+
     /**
      * 逐级 MKCOL。失败不抛（认证失败除外）：建目录只是"尽力而为"，
      * 探测请求本身失败（服务器直接掐连接）不该让整次上传作废，
      * 能不能写交由随后的文件 PUT 给出真实结论。
+     *
+     * <p><b>两条自保</b>（都是真机上踩出来的，见 AGENTS.md「建目录」一节）：
+     * <ol>
+     *   <li><b>已经有了就不建。</b> MKCOL 一个已存在的目录在部分服务器上不是回 405，
+     *       而是按自己的命名规则另建一个 `<名字>_<时间戳>`，在父目录里凭空多出一个目录。</li>
+     *   <li><b>建完必须回头确认。</b> 服务器可以回 201 却什么都没建出来（根目录下存在一个
+     *       仅大小写不同的同名项时实测如此：`MKCOL /Pictures` 回 201，随后
+     *       `HEAD /Pictures` 是 302、`PUT /Pictures/x` 是 404）。这时**立刻停手**，
+     *       绝不继续往下建 —— 继续建的话，下一级的 MKCOL 会在父目录里再留一个改名目录，
+     *       而"重试一次就多一个垃圾目录"，累积起来是几百个。</li>
+     * </ol>
+     * 第三态（{@link #COLL_UNKNOWN}）不拦：问不出来的服务器不该被这两条挡住。
      */
     public boolean ensureCollection(String relativeDir) throws IOException {
         String[] segments = split(relativeDir);
@@ -316,6 +366,9 @@ public final class WebDavClient {
                 continue;
             }
             current.append('/').append(segment);
+            if (collectionState(current.toString()) == COLL_EXISTS) {
+                continue;
+            }
             Res res;
             try {
                 res = send("MKCOL", current.toString(), null, null, false);
@@ -330,15 +383,31 @@ public final class WebDavClient {
             if (!isSuccess(res.code) && res.code != 405 && res.code != 409
                     && res.code != 301 && res.code != 501) {
                 created = false;
+                continue;
+            }
+            if (collectionState(current.toString()) == COLL_MISSING) {
+                // 回了成功码却没有这个东西：再建下一级只会在父目录里多留一个改名目录，
+                // 直接认输，把证据打全（上传随后仍会 PUT 一次，由它给出最终结论）
+                Logger.w("event=mkdir_ineffective dir=" + current + " code=" + res.code
+                        + " detail=" + res.detail);
+                return false;
             }
         }
         return created;
     }
 
     private Res propfind(String remotePath, int depth) {
+        return propfind(remotePath, depth, 0);
+    }
+
+    /**
+     * PROPFIND。{@code cap > 0} 时用它当响应体上限（列目录要给大一点的额度，
+     * 默认那点额度会把 XML 截断，解析出的名字残缺）。
+     */
+    private Res propfind(String remotePath, int depth, int cap) {
         try {
             return send("PROPFIND", remotePath, null,
-                    PROPFIND_BODY.getBytes(StandardCharsets.UTF_8), true, depth);
+                    PROPFIND_BODY.getBytes(StandardCharsets.UTF_8), true, depth, cap);
         } catch (Throwable t) {
             // 服务器不支持 PROPFIND 时按"判不了"处理，不把它当成写失败
             Logger.d("event=propfind_failed reason=" + t.getMessage());
