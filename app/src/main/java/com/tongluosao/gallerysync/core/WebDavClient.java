@@ -7,6 +7,7 @@ import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -15,10 +16,15 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -73,15 +79,41 @@ public final class WebDavClient {
      */
     private static final int VERIFY_ATTEMPTS = 3;
     private static final long VERIFY_RETRY_DELAY = 800L;
+    /**
+     * 目录列表（PROPFIND Depth 1）响应体的上限。
+     *
+     * <p>默认那点额度（{@link #DETAIL_LIMIT} 级别）只够看错误原因，拿它列目录会被截断成
+     * 半个 XML，解析出的名字是残缺的 —— 而"没看见这个名字"会让调用方把已经备份过的文件
+     * 再传一遍。一个目录上千项也就一百多 KB，给到 256KB 足够。
+     */
+    private static final int LIST_BODY_LIMIT = 256 * 1024;
     private static final String PROPFIND_BODY =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
                     + "<propfind xmlns=\"DAV:\"><prop><getcontentlength/><resourcetype/>"
-                    + "</prop></propfind>";
+                    + "<getlastmodified/></prop></propfind>";
     /** 命名空间前缀由服务器决定（OpenList 用 D:，别的用 d: 或没有），只认标签名 */
     private static final Pattern CONTENT_LENGTH = Pattern.compile(
             "<[A-Za-z0-9]*:?getcontentlength[^>]*>\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
     private static final Pattern NOT_FOUND_STATUS = Pattern.compile(
             "<D:status>[^<]*404", Pattern.CASE_INSENSITIVE);
+    /** PROPFIND 响应里每一条 resource 的 href；前缀同样由服务器决定 */
+    private static final Pattern HREF = Pattern.compile(
+            "<[A-Za-z0-9]*:?href[^>]*>(.*?)</[A-Za-z0-9]*:?href>",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /**
+     * 把一个 {@code <response>} 整块切出来。
+     *
+     * <p>必须整块切：目录列表里每条 response 都带自己的 {@code getcontentlength}，
+     * 拿整份 XML 去抓第一个长度，会把所有文件都算成第一个的大小 —— 下载侧据此判
+     * "大小一样就不用下"就会漏文件。
+     */
+    private static final Pattern RESPONSE = Pattern.compile(
+            "<[A-Za-z0-9]*:?response[^>]*>(.*?)</[A-Za-z0-9]*:?response>",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** 最后修改时间；下载侧用它跟本地文件的 mtime 比对 */
+    private static final Pattern LAST_MODIFIED = Pattern.compile(
+            "<[A-Za-z0-9]*:?getlastmodified[^>]*>([^<]+)",
+            Pattern.CASE_INSENSITIVE);
 
     private final String mBaseUrl;
     private final String mAuthHeader;
@@ -320,6 +352,236 @@ public final class WebDavClient {
         return res == null ? null : res.code + "\n" + res.body;
     }
 
+    /**
+     * 远端有没有这个文件、有多大。<b>不存在返回 {@code -1}，不抛异常</b> ——
+     * "没有"是一个正常答案，不是故障。
+     *
+     * <p>比 {@link #storedAs} 轻：只问一轮、不重试、不比大小。它服务的是"上传前先看看远端
+     * 有没有同名文件"这条路径（见 {@code UploadQueue.upload}），那里要的是尽量少请求、
+     * 尽量少流量，判错了的代价只是多传一次或少传一次覆盖写。
+     *
+     * <p>只走 HEAD：HEAD 被重定向（OpenList 挂网盘会把 HEAD 302 到存储直链）或服务器
+     * 不支持时才退回 PROPFIND Depth 0。401/403 与连接层失败照常抛，交给队列的重试与熔断。
+     *
+     * @return 远端对象的字节数；{@code -1} 表示服务器明确说"没有这个对象"
+     */
+    public long remoteSize(String remotePath) throws IOException {
+        Res head = send("HEAD", remotePath, null, null, false);
+        if (head.code == 401 || head.code == 403) {
+            throw new IOException("auth failed code=" + head.code + head.detail);
+        }
+        if (head.code == 404) {
+            return -1L;
+        }
+        // 2xx：给了长度就是答案；没给长度（有些服务器 HEAD 不带 Content-Length）再问一次
+        if (isSuccess(head.code) && head.length >= 0L) {
+            return head.length;
+        }
+        Res prop = propfind(remotePath, 0);
+        if (prop == null) {
+            // 不支持 PROPFIND：只有当 HEAD 明确说"有"时才认为它存在，否则判"不知道"。
+            // 判"不知道"返回 -1（= 当作不存在，照传一次覆盖写）比判"存在"安全：
+            // 后者会直接把这一项记成已备份，而远端可能真的没有
+            return isSuccess(head.code) ? 0L : -1L;
+        }
+        if (prop.code == 404
+                || (prop.body != null && NOT_FOUND_STATUS.matcher(prop.body).find())) {
+            return -1L;
+        }
+        if (prop.code != 207) {
+            return isSuccess(head.code) ? 0L : -1L;
+        }
+        long size = contentLengthOf(prop);
+        // PROPFIND 只说"有"、没说多大：用 0 表示"存在但大小未知"
+        return size < 0L ? 0L : size;
+    }
+
+    /**
+     * 列一个目录下的**直接子项名字**（PROPFIND Depth 1）。
+     *
+     * <p>省电的关键在这里：一次请求换回整个目录的名字集合，比"每个文件问一次 HEAD"
+     * 少几十倍往返。子目录以 {@code name/} 结尾，与文件名区分开。
+     *
+     * <p>返回 {@code null} 表示"列不出来"（不支持 PROPFIND、响应被截断、目录不存在），
+     * 调用方必须把它与"目录是空的"分开：{@code null} 时退回逐文件判断，
+     * 空集合时才可以认为"这个目录下什么都没有"。
+     */
+    public Set<String> listNames(String remoteDir) throws IOException {
+        List<RemoteEntry> entries = list(remoteDir);
+        if (entries == null) {
+            return null;
+        }
+        Set<String> names = new HashSet<>();
+        for (RemoteEntry entry : entries) {
+            names.add(entry.dir ? entry.name + "/" : entry.name);
+        }
+        return names;
+    }
+
+    /** 远端目录里的一项：名字、是不是目录、有多大、什么时候改的 */
+    public static final class RemoteEntry {
+        /** 名字（不含任何路径与尾斜杠）。{@code listNames} 会给目录补上尾斜杠 */
+        public final String name;
+        public final boolean dir;
+        /** 字节数；未知或目录为 -1 */
+        public final long size;
+        /** 最后修改时间（毫秒）；服务器没给为 0 */
+        public final long lastModified;
+
+        RemoteEntry(String name, boolean dir, long size, long lastModified) {
+            this.name = name;
+            this.dir = dir;
+            this.size = size;
+            this.lastModified = lastModified;
+        }
+    }
+
+    /**
+     * 列一个目录下的直接子项（PROPFIND Depth 1）。
+     *
+     * <p>返回 {@code null} 表示"列不出来"（不支持 PROPFIND、响应被截断、目录不存在），
+     * 调用方必须把它与"目录是空的"分开：{@code null} 时退回逐文件判断。
+     */
+    public List<RemoteEntry> list(String remoteDir) throws IOException {
+        Res res = propfind(remoteDir, 1, LIST_BODY_LIMIT);
+        if (res == null || res.code == 404 || res.body == null) {
+            return null;
+        }
+        if (res.code != 207) {
+            return null;
+        }
+        if (res.body.length() >= LIST_BODY_LIMIT) {
+            // 顶到额度说明这一条响应被截断了，缺的名字会被当成"远端没有"而重传一遍。
+            // 宁可退回逐文件判断，也不要拿半份名单当全部
+            Logger.d("event=list_truncated dir=" + remoteDir + " bytes=" + res.body.length());
+            return null;
+        }
+        String self = stripLeading(normalize(remoteDir));
+        String basePath = stripLeading(normalize(pathOfUrl(mBaseUrl)));
+        List<RemoteEntry> out = new ArrayList<>();
+        Matcher response = RESPONSE.matcher(res.body);
+        while (response.find()) {
+            String block = response.group(1);
+            Matcher href = HREF.matcher(block);
+            if (!href.find()) {
+                continue;
+            }
+            String name = nameOfHref(href.group(1), self, basePath);
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            boolean dir = name.endsWith("/");
+            if (dir) {
+                name = name.substring(0, name.length() - 1);
+            }
+            long size = -1L;
+            Matcher length = CONTENT_LENGTH.matcher(block);
+            if (length.find()) {
+                size = parseLong(length.group(1));
+            }
+            long modified = 0L;
+            Matcher lastMod = LAST_MODIFIED.matcher(block);
+            if (lastMod.find()) {
+                modified = parseHttpDate(lastMod.group(1));
+            }
+            out.add(new RemoteEntry(name, dir, size, modified));
+        }
+        return out;
+    }
+
+    /** 解析 HTTP 日期（RFC 1123）；解不开返回 0 —— 下载侧只把它当"要不要重下"的参考 */
+    private static long parseHttpDate(String value) {
+        try {
+            SimpleDateFormat format = new SimpleDateFormat(
+                    "EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US);
+            format.setTimeZone(java.util.TimeZone.getTimeZone("GMT"));
+            return format.parse(value.trim()).getTime();
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 把 PROPFIND 里的 href 还原成"这个目录下的一项"，不属于这个目录就返回 null。
+     *
+     * <p>href 的写法各家不同：有给绝对路径的（{@code /dav/root/DCIM/a.jpg}），有只给相对段的。
+     * 所以先减掉服务器挂载点（{@code base_url} 的路径部分，它未必等于 href 的前缀），
+     * 再拿"目标目录自己"当边界比对 —— 不能用 base_url 硬拼，否则换个部署结论就变了。
+     *
+     * @param self     目标目录相对挂载点的路径，无前后斜杠，根目录为空串
+     * @param basePath 挂载点路径，无前后斜杠
+     */
+    private static String nameOfHref(String href, String self, String basePath) {
+        String path = href == null ? "" : href.trim();
+        if (path.isEmpty()) {
+            return null;
+        }
+        // 绝对 URL（少数服务器给 http://host/...）：只取路径部分
+        int scheme = path.indexOf("://");
+        if (scheme >= 0) {
+            int slash = path.indexOf('/', scheme + 3);
+            path = slash < 0 ? "/" : path.substring(slash);
+        }
+        path = stripLeading(decodeUrl(path));
+        boolean dir = path.endsWith("/");
+        if (dir) {
+            path = path.substring(0, path.length() - 1);
+        }
+        // 先减掉服务器挂载点（base_url 的路径部分），href 里通常带着它
+        if (!basePath.isEmpty()) {
+            if (path.equals(basePath)) {
+                return null;    // 就是挂载点本身
+            }
+            if (path.startsWith(basePath + "/")) {
+                path = path.substring(basePath.length() + 1);
+            }
+        }
+        if (path.equals(self)) {
+            return null;        // 目录自己那一条
+        }
+        if (!self.isEmpty() && path.startsWith(self + "/")) {
+            path = path.substring(self.length() + 1);
+        } else if (path.indexOf('/') >= 0) {
+            // 还带斜杠说明它不在这个目录下（是别的分支或孙辈），忽略
+            return null;
+        }
+        // 走到这里 path 应该只剩一段名字；少数服务器本来就直接给相对段，也走这条
+        if (path.isEmpty() || path.indexOf('/') >= 0) {
+            return null;
+        }
+        return dir ? path + "/" : path;
+    }
+
+    private static String stripLeading(String path) {
+        String p = path;
+        while (p.startsWith("/")) {
+            p = p.substring(1);
+        }
+        return p;
+    }
+
+    /** 取 URL 的路径部分（用于换算服务器挂载点）；解析不了就返回空 */
+    private static String pathOfUrl(String url) {
+        try {
+            String p = new URL(url).getPath();
+            return p == null ? "" : p;
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** href 里的百分号转义解回原文；解不开就原样返回（宁可名字对不上，也不要抛） */
+    private static String decodeUrl(String value) {
+        if (value.indexOf('%') < 0) {
+            return value;
+        }
+        try {
+            return URLDecoder.decode(value, "UTF-8");
+        } catch (Throwable t) {
+            return value;
+        }
+    }
+
     /** 从 PROPFIND 的响应体里取 getcontentlength；取不到返回 -1（表示"判不了"，不是"没有"） */
     private static long contentLengthOf(Res prop) {
         Matcher m = prop.body == null ? null : CONTENT_LENGTH.matcher(prop.body);
@@ -386,6 +648,15 @@ public final class WebDavClient {
     /** depth 仅对 PROPFIND 有意义：-1 表示不带该头 */
     private Res send(String method, String remotePath, File file, byte[] body,
             boolean readBody, int depth) throws IOException {
+        return send(method, remotePath, file, body, readBody, depth, 0);
+    }
+
+    /**
+     * @param bodyCap 响应体留存上限，{@code 0} 表示用默认额度（只够记错误原因）。
+     *                列目录必须显式调大，否则 XML 会被截断
+     */
+    private Res send(String method, String remotePath, File file, byte[] body,
+            boolean readBody, int depth, int bodyCap) throws IOException {
         URL url = new URL(mBaseUrl + encodePath(remotePath));
         String host = url.getHost();
         int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
@@ -396,7 +667,7 @@ public final class WebDavClient {
         // 大文件还要再付一遍上传流量。
         boolean reused = mSocket != null;
         try {
-            return exchange(method, host, port, target, file, body, length, readBody, depth);
+            return exchange(method, host, port, target, file, body, length, readBody, depth, bodyCap);
         } catch (IOException e) {
             dropConnection();
             if (!reused) {
@@ -405,7 +676,7 @@ public final class WebDavClient {
             Logger.d("event=conn_reopen method=" + method + " reason=" + e.getMessage());
         }
         try {
-            return exchange(method, host, port, target, file, body, length, readBody, depth);
+            return exchange(method, host, port, target, file, body, length, readBody, depth, bodyCap);
         } catch (IOException e) {
             dropConnection();
             throw transportFailure(method, host, e);
@@ -445,7 +716,7 @@ public final class WebDavClient {
     }
 
     private Res exchange(String method, String host, int port, String target,
-            File file, byte[] body, long length, boolean readBody, int depth)
+            File file, byte[] body, long length, boolean readBody, int depth, int bodyCap)
             throws IOException {
         Socket socket = connect(host, port);
         socket.setSoTimeout(readTimeoutFor(length));
@@ -455,7 +726,7 @@ public final class WebDavClient {
             writeBody(out, file, body, length);
             out.flush();
 
-            Res res = readResponse(method, readBody);
+            Res res = readResponse(method, readBody, bodyCap);
             if (!res.keepAlive) {
                 dropConnection();
             }
@@ -479,6 +750,28 @@ public final class WebDavClient {
     }
 
     private Res readResponse(String method, boolean readBody) throws IOException {
+        return readResponse(method, readBody, 0);
+    }
+
+    /** 状态行 + 响应头。GET 要照着它决定怎么流式读体，所以单独抽出来 */
+    private static final class Head {
+        final int code;
+        final long contentLength;
+        final boolean chunked;
+        final boolean http10;
+        /** 服务器显式说的连接是否留存；没写就是 null */
+        final Boolean keepAlive;
+
+        Head(int code, long contentLength, boolean chunked, boolean http10, Boolean keepAlive) {
+            this.code = code;
+            this.contentLength = contentLength;
+            this.chunked = chunked;
+            this.http10 = http10;
+            this.keepAlive = keepAlive;
+        }
+    }
+
+    private Head readHead() throws IOException {
         BufferedReader reader = mReader;
         String statusLine = reader.readLine();
         if (statusLine == null) {
@@ -507,13 +800,28 @@ public final class WebDavClient {
                         !value.toLowerCase(Locale.US).contains("close"));
             }
         }
+        return new Head(code, contentLength, chunked, http10, headerKeepAlive);
+    }
+
+    /**
+     * @param bodyCap 响应体留存上限；{@code 0} 用默认额度。列目录必须显式调大
+     *                （解析名字需要完整的 XML，截断的名单会被当成"远端没有"）
+     */
+    private Res readResponse(String method, boolean readBody, int bodyCap) throws IOException {
+        BufferedReader reader = mReader;
+        Head head = readHead();
+        int code = head.code;
+        long contentLength = head.contentLength;
+        boolean chunked = head.chunked;
+        Boolean headerKeepAlive = head.keepAlive;
+        boolean http10 = head.http10;
 
         // HEAD 的 Content-Length 说的是"GET 会返回多大"，它自己没有响应体：
         // 照这个长度去排空会把下一条响应的开头吃掉，连接复用从此错位。
         // 1xx/204/304 同理。
         boolean bodyless = "HEAD".equals(method) || code == 204 || code == 304 || code < 200;
 
-        int cap = readBody ? DETAIL_LIMIT * 20 : DETAIL_LIMIT;
+        int cap = bodyCap > 0 ? bodyCap : (readBody ? DETAIL_LIMIT * 20 : DETAIL_LIMIT);
         String snippet;
         boolean drainable;
         if (bodyless) {

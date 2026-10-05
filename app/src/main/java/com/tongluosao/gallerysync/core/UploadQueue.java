@@ -902,6 +902,18 @@ public final class UploadQueue {
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
                 String remoteDir = remoteDirFor(config, task);
                 String remotePath = WebDavClient.joinPath(remoteDir, file.getName());
+                // 远端已经有同名文件就当作"这一份备份过了"，直接跳过，一个字节都不发。
+                // 判据只看名字，**不看内容**（用户要的就是省电省流量，逐字节比对要先把远端
+                // 整份下载下来）。这是**上传前**的分支，与下面那条"必须先发字节再复核"的
+                // 约束不冲突：它根本不产生"复核通过"这个结论，而是"这一项早在远端了"。
+                if (config.isSkipExistingRemote()
+                        && remoteExists(config, index, remoteDir, file.getName())) {
+                    Logger.i("event=upload_skip_remote_exists path=" + task.path
+                            + " remote=" + remotePath + " size=" + task.size);
+                    ok = true;
+                    finalizeOk(task, config, remotePath, "remote_exists");
+                    return;
+                }
                 // 每 64KB 一块回调，下游按 500ms 节流后才发广播 —— lambda 每任务只建一次，
                 // 不在那个循环里分配对象
                 client.setProgressListener((sent, total) -> mPublisher.taskBytes(taskKey, sent));
@@ -918,6 +930,7 @@ public final class UploadQueue {
                 // 两边数量再也对不上。所以 putSend 必须在 enqueueVerify 之前，
                 // 且 putSend 抛异常时这一项绝不会进入复核队列。
                 client.putSend(remotePath, file);
+                rememberRemoteName(remoteDir, file.getName());
                 if (config.isVerifyAsync()
                         && enqueueVerify(taskKey, task, config, remotePath, file.length())) {
                     handedOff = true;
@@ -1256,6 +1269,72 @@ public final class UploadQueue {
             time = System.currentTimeMillis();
         }
         return WebDavClient.monthDir(time);
+    }
+
+    /**
+     * 远端那个目录里已经有同名文件了吗。
+     *
+     * <p>用 {@code PROPFIND Depth 1} 一次拿回整个目录的名字（见 {@link #mRemoteNames}），
+     * 而不是对这一个文件发 HEAD：同一相册目录下的几十项只会付一次往返。
+     *
+     * <p><b>任何失败都返回 false（继续上传）</b>。这个判断只是"省一次上传"的优化，
+     * 它自己坏掉（不支持 PROPFIND、超时、被拦）绝不该让文件传不上去 —— 判错了方向以后果
+     * 最轻：多传一次覆盖写。反过来若在拿不到名单时判"远端有"，那才是丢文件。
+     */
+    private boolean remoteExists(Config config, int index, String remoteDir, String name) {
+        Set<String> names;
+        synchronized (mLock) {
+            RemoteNames cached = mRemoteNames.get(remoteDir);
+            if (cached != null && System.currentTimeMillis() - cached.at < REMOTE_DIR_CACHE_MS) {
+                return cached.names.contains(name);
+            }
+        }
+        try {
+            WebDavClient client = clientFor(config, index);
+            names = client.listNames(remoteDir);
+        } catch (Throwable t) {
+            // 连接层失败（TransportFailure）与协议层失败一视同仁：这一项照传，
+            // 真传不上去会由下面的 putSend 报出来，不该在这里改判定
+            Logger.d("event=remote_list_failed dir=" + remoteDir + " reason=" + t);
+            return false;
+        }
+        if (names == null) {
+            // 服务器不支持 PROPFIND / 响应被截断：判不了，只能照传
+            return false;
+        }
+        synchronized (mLock) {
+            mRemoteNames.put(remoteDir, new RemoteNames(names, System.currentTimeMillis()));
+            trimRemoteNamesLocked();
+        }
+        return names.contains(name);
+    }
+
+    /**
+     * 自己刚传上去的文件名当场记进名单。
+     *
+     * <p>不记的话，同一目录里紧接着传第二项时用的是**上一次**列出来的名单（一分钟内不重列），
+     * 名单里没有刚传完的这一个 —— 如果它恰好与后面某一项同名（同一张照片被相册枚举出两条
+     * 不同 row），后一项就会再传一遍。记进去正好把这种情况收掉。
+     */
+    private void rememberRemoteName(String remoteDir, String name) {
+        synchronized (mLock) {
+            RemoteNames cached = mRemoteNames.get(remoteDir);
+            if (cached == null) {
+                return;
+            }
+            cached.names.add(name);
+        }
+    }
+
+    private void trimRemoteNamesLocked() {
+        if (mRemoteNames.size() <= MAX_CACHED_DIRS) {
+            return;
+        }
+        Iterator<String> it = mRemoteNames.keySet().iterator();
+        while (it.hasNext() && mRemoteNames.size() > MAX_CACHED_DIRS) {
+            it.next();
+            it.remove();
+        }
     }
 
     private static String key(String path, long size, long mtime) {
