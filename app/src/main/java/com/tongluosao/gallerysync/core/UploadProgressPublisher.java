@@ -94,13 +94,17 @@ public final class UploadProgressPublisher {
         public final String path;
         public final long size;
         public final boolean video;
+        /** {@link ProgressProtocol#DIR_UP} 或 {@link ProgressProtocol#DIR_DOWN} */
+        public final String dir;
 
-        public PendingItem(String key, String name, String path, long size, boolean video) {
+        public PendingItem(String key, String name, String path, long size, boolean video,
+                String dir) {
             this.key = key;
             this.name = name;
             this.path = path;
             this.size = size;
             this.video = video;
+            this.dir = dir;
         }
     }
 
@@ -111,15 +115,18 @@ public final class UploadProgressPublisher {
         final String path;
         final long size;
         final boolean video;
+        /** {@link ProgressProtocol#DIR_UP} 或 {@link ProgressProtocol#DIR_DOWN} */
+        final String dir;
         /** 由 worker 线程写、心跳线程读 */
         volatile long sent;
 
-        Active(String key, String name, String path, long size, boolean video) {
+        Active(String key, String name, String path, long size, boolean video, String dir) {
             this.key = key;
             this.name = name;
             this.path = path;
             this.size = size;
             this.video = video;
+            this.dir = dir;
         }
     }
 
@@ -130,7 +137,12 @@ public final class UploadProgressPublisher {
     /** 结构性变化后不等心跳、立刻发帧 */
     private boolean mDirty = true;
 
-    private volatile QueueView mQueueView;
+    /**
+     * 挂上来的队列视图。**可以有多个**：上传与下载各是一条队列，都往同一张进度页上报，
+     * 由这里把计数相加、把列表拼起来 —— 两张进度页（一张上传、一张下载）在界面上没必要，
+     * 用户要看的是"这台手机正在跟远端交换哪些文件"。
+     */
+    private final List<QueueView> mQueueViews = new ArrayList<>();
     private volatile boolean mRunning = true;
     private Thread mThread;
 
@@ -143,11 +155,11 @@ public final class UploadProgressPublisher {
     private long mDoneBytes;
 
     /**
-     * 上一次序列化好的排队列表对应的队列版本，以及上次重建的时刻。
+     * 上一次序列化好的排队列表对应的队列版本（每个队列视图一个），以及上次重建的时刻。
      *
-     * <p>只有心跳线程碰它，不需要加锁。初始版本给 MIN_VALUE，保证第一帧一定带上列表。
+     * <p>只有心跳线程碰它，不需要加锁。初始给 MIN_VALUE，保证第一帧一定带上列表。
      */
-    private int mLastPendingVersion = Integer.MIN_VALUE;
+    private int[] mLastPendingVersions = new int[0];
     private long mLastPendingAt;
 
     private UploadProgressPublisher(Context context) {
@@ -170,12 +182,21 @@ public final class UploadProgressPublisher {
         return publisher;
     }
 
-    public void setQueueView(QueueView view) {
-        mQueueView = view;
+    /** 挂一个队列视图（上传一条、下载一条）。挂着的一律不再摘：队列是进程级的单例 */
+    public void addQueueView(QueueView view) {
+        if (view == null) {
+            return;
+        }
+        synchronized (mLock) {
+            mQueueViews.add(view);
+            mDirty = true;
+            mLock.notifyAll();
+        }
     }
 
-    /** 某项开始上传。size 取自 Task（入队时记下的），不读磁盘 */
-    public void taskStart(String key, String name, String path, long size, boolean video) {
+    /** 某项开始传输。size 取自任务（入队时记下的），不读磁盘 */
+    public void taskStart(String key, String name, String path, long size, boolean video,
+            String dir) {
         boolean sessionStarted = false;
         synchronized (mLock) {
             if (!mSessionOpen) {
@@ -184,14 +205,20 @@ public final class UploadProgressPublisher {
                 mDoneBytes = 0;
                 sessionStarted = true;
             }
-            mActive.put(key, new Active(key, name, path, size, video));
+            mActive.put(key, new Active(key, name, path, size, video, dir));
             mDirty = true;
             mLock.notifyAll();
         }
         if (sessionStarted) {
             Logger.i("event=progress_session_start key=" + key + " size=" + size);
         }
-        Logger.d("event=progress_task_start key=" + key + " name=" + name + " size=" + size);
+        Logger.d("event=progress_task_start key=" + key + " name=" + name + " size=" + size
+                + " dir=" + dir);
+    }
+
+    /** 兼容"只有上传"的旧调用点：方向按上传处理 */
+    public void taskStart(String key, String name, String path, long size, boolean video) {
+        taskStart(key, name, path, size, video, ProgressProtocol.DIR_UP);
     }
 
     /**
@@ -302,11 +329,19 @@ public final class UploadProgressPublisher {
     }
 
     private String buildPayload() throws Exception {
-        QueueView view = mQueueView;
-        int pendingCount = view == null ? 0 : view.pendingCount();
-        long pendingBytes = view == null ? 0 : view.pendingBytes();
-        // 队列还没接线时按"健康"处理：宁可显示正常，也不要凭空吓用户一跳
-        boolean healthy = view == null || view.healthy();
+        List<QueueView> views = new ArrayList<>();
+        synchronized (mLock) {
+            views.addAll(mQueueViews);
+        }
+        int pendingCount = 0;
+        long pendingBytes = 0;
+        boolean healthy = true;
+        for (QueueView view : views) {
+            pendingCount += view.pendingCount();
+            pendingBytes += view.pendingBytes();
+            // 队列还没接线时按"健康"处理：宁可显示正常，也不要凭空吓用户一跳
+            healthy = healthy && view.healthy();
+        }
 
         List<Active> snapshot = new ArrayList<>();
         int doneItems;
@@ -328,8 +363,7 @@ public final class UploadProgressPublisher {
             item.put("s", active.size);
             item.put("b", Math.min(active.sent, active.size));
             item.put("vid", active.video);
-            // 预留下载：将来加下载不用改通道，客户端也已经认识这个字段
-            item.put("dir", ProgressProtocol.DIR_UP);
+            item.put("dir", active.dir);
             activeArray.put(item);
         }
 
@@ -350,7 +384,7 @@ public final class UploadProgressPublisher {
         root.put("pending", pendingCount);
         // 排队列表：只在队列增删过、或隔几秒兜一次底的时候才重新序列化。整张列表十几 KB，
         // 2Hz 地发等于把 Binder 当水管用；平时这一项就省掉了，客户端沿用上一份
-        JSONArray pendingArray = pendingArrayFor(view);
+        JSONArray pendingArray = pendingArrayFor(views);
         if (pendingArray != null) {
             root.put("pl", pendingArray);
         }
@@ -364,36 +398,51 @@ public final class UploadProgressPublisher {
     }
 
     /**
-     * 取（必要时重建）排队列表的 JSON。
+     * 取（必要时重建）排队列表的 JSON，把每个队列视图的列表拼在一起。
      *
      * @return 需要重传时返回新的数组，否则返回 null 表示"沿用上一份"
      */
-    private JSONArray pendingArrayFor(QueueView view) {
-        if (view == null) {
+    private JSONArray pendingArrayFor(List<QueueView> views) {
+        if (views.isEmpty()) {
             return null;
         }
-        int version = view.pendingVersion();
         long now = System.currentTimeMillis();
-        boolean changed = version != mLastPendingVersion;
+        if (mLastPendingVersions.length != views.size()) {
+            // 队列接线的时机晚于心跳线程启动，数组长度要跟着长
+            int[] grown = new int[views.size()];
+            java.util.Arrays.fill(grown, Integer.MIN_VALUE);
+            System.arraycopy(mLastPendingVersions, 0, grown, 0,
+                    Math.min(mLastPendingVersions.length, grown.length));
+            mLastPendingVersions = grown;
+        }
+        boolean changed = false;
+        for (int i = 0; i < views.size(); i++) {
+            int version = views.get(i).pendingVersion();
+            if (version != mLastPendingVersions[i]) {
+                mLastPendingVersions[i] = version;
+                changed = true;
+            }
+        }
         if (!changed && now - mLastPendingAt < PENDING_REFRESH_MS) {
             return null;
         }
-        mLastPendingVersion = version;
         mLastPendingAt = now;
         JSONArray array = new JSONArray();
         try {
-            // 这里**不能**用 pendingCount（"还没轮到的项数"）判空：队列只剩 3 项且全在传时
-            // 它等于 0，会把列表发成空数组，客户端的排队部分直接清空、在传项也没了。
-            // 列表是否为空只由 pendingItems 的实际返回值决定
-            for (PendingItem item : view.pendingItems(MAX_PENDING_ITEMS)) {
-                JSONObject obj = new JSONObject();
-                obj.put("k", item.key);
-                obj.put("n", item.name);
-                obj.put("p", item.path);
-                obj.put("s", item.size);
-                obj.put("vid", item.video);
-                obj.put("dir", ProgressProtocol.DIR_UP);
-                array.put(obj);
+            for (QueueView view : views) {
+                // 这里**不能**用 pendingCount（"还没轮到的项数"）判空：队列只剩 3 项且全在传时
+                // 它等于 0，会把列表发成空数组，客户端的排队部分直接清空、在传项也没了。
+                // 列表是否为空只由 pendingItems 的实际返回值决定
+                for (PendingItem item : view.pendingItems(MAX_PENDING_ITEMS)) {
+                    JSONObject obj = new JSONObject();
+                    obj.put("k", item.key);
+                    obj.put("n", item.name);
+                    obj.put("p", item.path);
+                    obj.put("s", item.size);
+                    obj.put("vid", item.video);
+                    obj.put("dir", item.dir);
+                    array.put(obj);
+                }
             }
         } catch (Throwable t) {
             // 队列侧取列表失败不该让整帧作废：这一帧少一段，下一帧再试

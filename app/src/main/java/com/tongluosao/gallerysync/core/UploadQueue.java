@@ -289,7 +289,7 @@ public final class UploadQueue {
         mConfig = config;
         load();
         mPublisher = UploadProgressPublisher.start(mContext);
-        mPublisher.setQueueView(new UploadProgressPublisher.QueueView() {
+        mPublisher.addQueueView(new UploadProgressPublisher.QueueView() {
             @Override
             public int pendingCount() {
                 synchronized (mLock) {
@@ -339,7 +339,8 @@ public final class UploadQueue {
                             break;
                         }
                         out.add(new UploadProgressPublisher.PendingItem(
-                                task.key(), baseName(task.path), task.path, task.size, task.video));
+                                task.key(), baseName(task.path), task.path, task.size, task.video,
+                                ProgressProtocol.DIR_UP));
                     }
                     return out;
                 }
@@ -840,6 +841,17 @@ public final class UploadQueue {
      * 有新项入队就重置回 60s。空手而归时不会自激：催一次就把下次推远一倍。
      */
     private void onQueueIdle() {
+        // 上传见底是"该做点别的"的信号：下载队列拿它当节拍器（用户在用的时候多补一点，
+        // 没人用的时候就退到几小时一轮）。放在所有 return 之前，否则 mProgress 没接线时
+        // 下载永远等不到这个信号
+        IdleListener listener = mIdleListener;
+        if (listener != null) {
+            try {
+                listener.onIdle();
+            } catch (Throwable t) {
+                Logger.d("event=idle_listener_failed detail=" + t);
+            }
+        }
         // 队列见底或整批在退避，都不该继续占着"正在上传"，否则界面会停在一个不再变化的数字上。
         // 3 路并发下"谁最后结束"不确定，所以这里强制收尾（endAll），而不是减一次引用
         flushState();

@@ -296,6 +296,215 @@ public final class WebDavClient {
         }
     }
 
+    /**
+     * 把一个远端对象下载到本地文件。
+     *
+     * <p>先写同目录下的 {@code <名字>.download.tmp}，整份收完、长度对上之后才
+     * {@code renameTo} 到最终名字。这样做只有一个理由：相册扫描是**按文件出现**触发的，
+     * 半截文件被扫进去就是一个永远打不开的坏图；进程被杀留下的 tmp 也一眼能认出来
+     * （下一轮直接覆盖重下），不会混进相册。
+     *
+     * <p>长度校验只在服务器给了 {@code Content-Length} 时做（分块传输时它可能没有）：
+     * 给不出长度不代表传坏了，但**给了就必须对上**，少了字节的图片同样是坏图。
+     *
+     * <p>连接是复用的，所以这个方法会先把响应体完整读完（或读到分块结束）；返回前连接
+     * 一定处于干净边界。进度按 64KB 回调，与上传共用 {@link ProgressListener}。
+     */
+    public void get(String remotePath, File destArg) throws IOException {
+        // 相对路径的 getParentFile() 是 null，`new File(null, name)` 会抛 NPE。
+        // 调用方给的本就是绝对路径，这里只是把这个前提兜住
+        File dest = destArg.isAbsolute() ? destArg : destArg.getAbsoluteFile();
+        File parent = dest.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("cannot create dir " + parent.getAbsolutePath());
+        }
+        File tmp = new File(parent, dest.getName() + ".download.tmp");
+        long received = 0L;
+        boolean drained = false;
+        try {
+            URL url = new URL(mBaseUrl + encodePath(remotePath));
+            String host = url.getHost();
+            int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
+            String target = url.getFile().isEmpty() ? "/" : url.getFile();
+            boolean reused = mSocket != null;
+            try {
+                received = getOnce(host, port, target, tmp);
+            } catch (IOException e) {
+                dropConnection();
+                if (!reused) {
+                    throw transportFailure("GET", host, e);
+                }
+                Logger.d("event=conn_reopen method=GET reason=" + e.getMessage());
+                received = getOnce(host, port, target, tmp);
+            }
+            drained = true;
+        } finally {
+            if (!drained) {
+                // 没读完就退出：连接里的响应体还在，复用它会串包
+                dropConnection();
+                tmp.delete();
+            }
+        }
+        if (!tmp.renameTo(dest)) {
+            tmp.delete();
+            throw new IOException("cannot rename temp file to " + dest.getAbsolutePath());
+        }
+        Logger.d("event=get_done path=" + remotePath + " bytes=" + received);
+    }
+
+    /**
+     * 一次 GET：读状态行与响应头、把体流式写进 {@code tmp}。
+     *
+     * @return 实际写入的字节数
+     */
+    private long getOnce(String host, int port, String target, File tmp) throws IOException {
+        Socket socket = connect(host, port);
+        // 下载的读超时要按**响应体**上浮，不能按请求体（GET 的请求体恒为 0）——
+        // 一个 600MB 的视频在慢链路上几分钟是常态，用默认 30s 会把好好的下载掐断。
+        socket.setSoTimeout(READ_TIMEOUT_MAX);
+        OutputStream out = mOut;
+        out.write(requestHead("GET", host, port, target, null, null, 0L, -1));
+        out.flush();
+
+        Head head = readHead();
+        if (head.code == 401 || head.code == 403) {
+            throw new IOException("auth failed code=" + head.code);
+        }
+        if (!isSuccess(head.code)) {
+            // 失败响应体可能带着原因：读完（有界）再抛，避免把连接留在半截状态
+            String detail = head.chunked
+                    ? readChunked(mReader, DETAIL_LIMIT)
+                    : readCapped(mReader, head.contentLength, DETAIL_LIMIT);
+            throw new IOException("GET " + target + " failed code=" + head.code
+                    + oneLine(detail));
+        }
+
+        long written;
+        try (OutputStream file = new BufferedOutputStream(
+                new FileOutputStream(tmp), 64 * 1024)) {
+            if (head.chunked) {
+                written = copyChunked(mReader, file);
+            } else if (head.contentLength > 0L) {
+                written = copyExact(mReader, file, head.contentLength);
+            } else {
+                written = copyUntilEof(mReader, file);
+            }
+        }
+        if (head.contentLength > 0L && written != head.contentLength) {
+            throw new IOException("GET truncated path=" + target
+                    + " expected=" + head.contentLength + " got=" + written);
+        }
+        // 没给长度也没说分块的那种响应：边界判不了，这条用完就关
+        boolean bounded = head.chunked || head.contentLength >= 0L;
+        boolean keepAlive = bounded && !head.http10
+                && (head.keepAlive == null || head.keepAlive.booleanValue());
+        if (!keepAlive) {
+            dropConnection();
+        }
+        return written;
+    }
+
+    /** 按 Content-Length 精确复制，顺便回调进度 */
+    private long copyExact(BufferedReader reader, OutputStream out, long length)
+            throws IOException {
+        char[] buf = new char[64 * 1024];
+        long left = length;
+        long done = 0L;
+        while (left > 0L) {
+            int want = (int) Math.min(left, buf.length);
+            int n = reader.read(buf, 0, want);
+            if (n < 0) {
+                break;
+            }
+            out.write(isoBytes(buf, n));
+            done += n;
+            left -= n;
+            reportProgress(done, length);
+        }
+        return done;
+    }
+
+    /** 分块响应：读到 0 长度块为止，同时把拖尾头吃掉 */
+    private long copyChunked(BufferedReader reader, OutputStream out) throws IOException {
+        long done = 0L;
+        while (true) {
+            String sizeLine = reader.readLine();
+            if (sizeLine == null) {
+                throw new IOException("chunked body ended early");
+            }
+            int semi = sizeLine.indexOf(';');
+            String hex = (semi >= 0 ? sizeLine.substring(0, semi) : sizeLine).trim();
+            long size;
+            try {
+                size = Long.parseLong(hex, 16);
+            } catch (Throwable t) {
+                throw new IOException("bad chunk size line: " + sizeLine);
+            }
+            if (size == 0L) {
+                String line;
+                while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                    // 拖尾头不关心
+                }
+                return done;
+            }
+            char[] buf = new char[64 * 1024];
+            long left = size;
+            while (left > 0L) {
+                int want = (int) Math.min(left, buf.length);
+                int n = reader.read(buf, 0, want);
+                if (n < 0) {
+                    throw new IOException("chunked body ended early");
+                }
+                out.write(isoBytes(buf, n));
+                done += n;
+                left -= n;
+                reportProgress(done, -1L);
+            }
+            // 每个块后面是一个 CRLF，readLine 吃掉它
+            reader.readLine();
+        }
+    }
+
+    /** 没给长度也没分块：读到流结束。这类响应之后连接必须丢掉 */
+    private long copyUntilEof(BufferedReader reader, OutputStream out) throws IOException {
+        char[] buf = new char[64 * 1024];
+        long done = 0L;
+        while (true) {
+            int n = reader.read(buf);
+            if (n < 0) {
+                return done;
+            }
+            out.write(isoBytes(buf, n));
+            done += n;
+            reportProgress(done, -1L);
+        }
+    }
+
+    /**
+     * char[] → byte[]。
+     *
+     * <p>读线路用的是 ISO-8859-1 的 BufferedReader，一个 char 恰好对应一个字节，
+     * 所以这一趟转换是无损的（换成 UTF-8 的 reader 才会把二进制流读坏）。
+     */
+    private static byte[] isoBytes(char[] buf, int len) {
+        byte[] bytes = new byte[len];
+        for (int i = 0; i < len; i++) {
+            bytes[i] = (byte) (buf[i] & 0xFF);
+        }
+        return bytes;
+    }
+
+    private void reportProgress(long done, long total) {
+        ProgressListener listener = mProgressListener;
+        if (listener != null) {
+            try {
+                listener.onProgress(done, total);
+            } catch (Throwable t) {
+                // 进度回调不该影响传输
+            }
+        }
+    }
+
     /** 删除远端对象；服务器不支持删除时返回 false，调用方按"尽力清理"处理 */
     public boolean delete(String remotePath) throws IOException {
         Res res = send("DELETE", remotePath, null, null, false);

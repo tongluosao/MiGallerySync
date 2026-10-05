@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import com.tongluosao.gallerysync.core.Config;
+import com.tongluosao.gallerysync.core.DownloadQueue;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.SyncMarker;
 import com.tongluosao.gallerysync.core.UploadQueue;
@@ -45,6 +46,8 @@ public final class GalleryHooks {
     private final ClassLoader mClassLoader;
     private final CloudItemReader mReader;
     private volatile UploadQueue mQueue;
+    /** 下载队列；第一次上传见底时才建（开关关着也建，方便用户随时打开） */
+    private volatile DownloadQueue mDownload;
     private volatile Config mConfig;
     /** 宿主 Application 是否已经 onCreate：配置与它谁先到都有可能，两边都要能补建队列 */
     private volatile boolean mAppStarted;
@@ -72,6 +75,11 @@ public final class GalleryHooks {
         } else if (mAppStarted) {
             // 进程已经起来了，队列却因为"配置还没下发"没建成：配置一到就补建，别再等一轮同步
             ensureQueue();
+        }
+        // 下载队列在第一次上传见底时才建，所以这里通常还是 null；建了的话就要把新配置推下去
+        DownloadQueue download = mDownload;
+        if (download != null) {
+            download.setConfig(config);
         }
     }
 
@@ -407,12 +415,62 @@ public final class GalleryHooks {
                     mQueue = UploadQueue.get(context, mConfig);
                     mQueue.setMarker(markSynced(context));
                     mQueue.setProgress(HostSyncState.create(mClassLoader));
+                    // 下载队列与上传队列并列，共用同一个进度发布器（上传队列构造时就起了）
+                    mQueue.setIdleListener(this::ensureDownloadQueueAwake);
                     Logger.i("event=queue_ready");
                 } else {
                     Logger.w("event=queue_unavailable reason=no_host_context");
                 }
             }
             return mQueue;
+        }
+    }
+
+    /**
+     * 建下载队列。与上传队列同一时刻、同一条件：都在拿到宿主 Context 之后。
+     *
+     * <p>即便 {@code download_enabled} 关着也照建：那个开关随时可能被用户打开，
+     * 而队列的存在只是几条睡着的线程（{@link DownloadQueue} 的循环在开关关闭时
+     * 一分钟醒一次看配置）。这样"打开开关"不需要重启相册。
+     */
+    private void ensureDownloadQueue() {
+        synchronized (this) {
+            if (mDownload != null) {
+                return;
+            }
+            Config config = mConfig;
+            if (config == null) {
+                return;
+            }
+            Context context = HostContext.get(mClassLoader);
+            if (context == null) {
+                return;
+            }
+            DownloadQueue queue = DownloadQueue.get(context, config);
+            UploadQueue upload = mQueue;
+            if (upload != null) {
+                queue.addQueueView(upload.publisher());
+            }
+            queue.setIngest(new ScannerIngest(mClassLoader)::ingest);
+            mDownload = queue;
+            Logger.i("event=download_queue_ready");
+        }
+    }
+
+    /** 上传见底的回调：顺手保证下载队列已经建起来（首次唤醒时才建，省一点启动开销） */
+    private void ensureDownloadQueueAwake() {
+        DownloadQueue queue;
+        synchronized (this) {
+            queue = mDownload;
+        }
+        if (queue == null) {
+            ensureDownloadQueue();
+            synchronized (this) {
+                queue = mDownload;
+            }
+        }
+        if (queue != null) {
+            queue.onUploadIdle();
         }
     }
 
@@ -443,14 +501,21 @@ public final class GalleryHooks {
         };
     }
 
+    /** 热重载交接：停掉上传与下载线程，新 generation 会从 state.json 重建队列 */
     public void shutdown() {
         UploadQueue queue;
+        DownloadQueue download;
         synchronized (this) {
             queue = mQueue;
             mQueue = null;
+            download = mDownload;
+            mDownload = null;
         }
         if (queue != null) {
             queue.shutdown();
+        }
+        if (download != null) {
+            download.shutdown();
         }
     }
 }
