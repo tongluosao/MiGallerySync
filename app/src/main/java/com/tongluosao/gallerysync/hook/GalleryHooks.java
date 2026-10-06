@@ -18,6 +18,7 @@ import com.tongluosao.gallerysync.core.ProgressProtocol;
 import com.tongluosao.gallerysync.core.SyncMarker;
 import com.tongluosao.gallerysync.core.TrashQueue;
 import com.tongluosao.gallerysync.core.UploadQueue;
+import com.tongluosao.gallerysync.core.WebDavClient;
 
 import io.github.libxposed.api.XposedInterface;
 
@@ -486,6 +487,10 @@ public final class GalleryHooks {
             if (mQueue == null) {
                 Context context = HostContext.get(mClassLoader);
                 if (context != null) {
+                    // WebDavClient 需要宿主 Context 才能挑"能出网的网络"（见 addressFor 的说明）：
+                    // 设备上装了纯组网的 VPN 时，相册 UID 的默认路由会被送进一张没有默认路由、
+                    // 也没有 DNS 的表，只有显式绑定到 Wi-Fi/移动网络那条路才解析得了、连得通
+                    WebDavClient.setHostContext(context);
                     // config 必须随构造传入：worker 在构造函数里就启动，晚一步 setConfig
                     // 它第一圈就会读到 null 而白睡 120 秒
                     mQueue = UploadQueue.get(context, mConfig);

@@ -1180,29 +1180,33 @@ public final class WebDavClient {
                 keepAlive);
     }
 
+
     /**
-     * 解析 host，成功一次就记住。
+     * 解析 host 并连出去时，**先绑定到一个真的能出网的 Network**。
      *
-     * <p>解析抖动在真机上真实发生过：同一时刻 adb shell 侧解析 15/15 全通、TCP 443 可达，
-     * 相册进程里却连续抛 UnknownHostException（Java 把 EAI_AGAIN 这类临时失败也报成这个），
-     * 整条队列因此空转。目标在一次备份里不会变，缓存住地址就不会被这种抖动打断。
-     * 连不上时 dropConnection() 会把它清掉，下次重新解析，IP 真的变了也跟得上。
+     * <p><b>为什么必须绑</b>：这台设备装了 EasyTier（`com.kkrainbow.easytier`），它是**纯组网**
+     * 的 VPN —— 路由表里只有 `10.10.0.0/16`、`172.16.10.0/24` 这些网段，**没有默认路由**，
+     * 而且它的 `DnsAddresses` 是**空的**。问题出在 UID 路由上：
+     * <pre>
+     * 13000: from all fwmark 0x0/0x20000 iif lo uidrange 0-10295 lookup tun2
+     * 13000: from all fwmark 0x0/0x20000 iif lo uidrange 10297-20295 lookup tun2
+     * </pre>
+     * 相册的 UID 是 **10261**，落在 `0-10295` 里 —— 于是它的流量被整片送进 `table tun2`，
+     * 那张表没有默认路由、也没有 DNS。结果 `InetAddress.getByName()` 的查询根本没有出网口，
+     * 返回 **NODATA**，Java 报成
+     * `UnknownHostException: No address associated with hostname`。
      *
-     * <p><b>为什么要重试、为什么要回退到系统属性里的 DNS</b>：2026-10-05 实测到更严重的一档 ——
-     * 相册进程连续抛出 4607 次 `UnknownHostException: No address associated with hostname`，
-     * 而**同一时刻**设备 shell 侧 `busybox nslookup` 10/10 成功、`nc -z host 443` 10/10 成功。
-     * 差在两边用的解析器不同：shell 走默认网络，而相册 UID 被代理 VPN（EasyTier）接管，
-     * Android 的**每网络解析器**按应用所在网络的 DNS 列表解析，VPN 那个 `DnsAddresses`
-     * 对这类查询回 NODATA（NODATA ≠ NXDOMAIN，所以 Java 报的是
-     * `No address associated with hostname` 而不是 `Unknown host`）。
+     * <p>**为什么别的 App 没事**：浏览器这类走**平台 HTTP 栈**，栈会按"哪个网络有到目标的路"
+     * 去选网并给 socket 打上对应的 fwmark（`16000: from all fwmark 0x1006f … lookup wlan0`），
+     * 于是绕开了那张空表。而本模块在自己的裸线程里直接 `getByName` + `new Socket()`，
+     * 吃的就是线程默认的 UID 路由 —— 也就是那张空表。
      *
-     * <p>所以这里做两件事：
-     * <ol>
-     *   <li>**瞬时失败重试**：解析失败隔一小会儿再来，NODATA 常常是一次性的；</li>
-     *   <li>**回退到系统属性里的 DNS**：{@code net.dns1/net.dns2} 是**当前默认网络**的解析器
-     *       （实测能正确答出这个主机名）。自己发一次标准 DNS 查询，绕开那个坏掉的每网络解析器。</li>
-     * </ol>
-     * 两级都失败才把异常抛出去 —— 那时确实是目标或链路的问题，交给队列的退避去处理。
+     * <p><b>做法</b>：不靠线程默认路由。每次解析/连接前，用 `ConnectivityManager` 挑一个
+     * **有默认路由、且不是那条纯组网 VPN** 的网络，把解析与建连都显式绑到它上面。
+     * 判定见 {@link #pickUsableNetwork()}。
+     *
+     * <p>缓存仍然保留：解析成功一次就记住 IP，省掉后面的解析。但**绑定不能省** —— 换网、
+     * 或 VPN 起来/落下之后，同一个 IP 该走的出口会变。
      */
     private InetAddress addressFor(String host) throws IOException {
         if (mResolvedAddress != null && host.equals(mResolvedHost)) {
@@ -1213,205 +1217,231 @@ public final class WebDavClient {
             if (attempt > 0) {
                 sleepQuietly(RESOLVE_RETRY_DELAY);
             }
-            try {
-                InetAddress address = InetAddress.getByName(host);
+            InetAddress address = resolveOnUsableNetwork(host);
+            if (address != null) {
                 mResolvedHost = host;
                 mResolvedAddress = address;
                 return address;
-            } catch (IOException e) {
-                last = e;
             }
-            // 每网络解析器答不出来时，试一次"直接问系统 DNS"。
-            // 成功就缓存，后面所有请求都走这个 IP
-            InetAddress viaSystem = resolveViaSystemDns(host);
-            if (viaSystem != null) {
-                Logger.i("event=resolve_via_system_dns host=" + host
-                        + " ip=" + viaSystem.getHostAddress());
-                mResolvedHost = host;
-                mResolvedAddress = viaSystem;
-                return viaSystem;
-            }
+            last = new java.net.UnknownHostException(
+                    "unable to resolve " + host + " on any usable network");
         }
         throw last != null ? last : new IOException("cannot resolve " + host);
     }
 
     /**
-     * 直接向系统属性里记的 DNS 发一次 A 查询。绕开 Android 的每网络解析器。
+     * 在一个"能出网"的网络上解析域名。
      *
-     * <p>只解析 A 记录（IPv4）：这台服务器的 A 记录一直存在且稳定，而 AAAA 在部分链路上
-     * 会返回一个连不通的地址（实测链路是 IPv6 打头的 Wi-Fi DNS + 一条只带 /32 的 VPN 路由）。
-     * 拿不到 A 记录就返回 null，由调用方按"这一趟没解析出来"处理。
+     * <p>先试 {@link #pickUsableNetwork()} 挑出来的那个网络（显式绑定后再解析 —— 这样
+     * 解析器用的是**那个网络的** DNS，而不是被 UID 路由送进的空表）；挑不出来时退回
+     * 不绑定的默认解析（旧行为，至少在没装 VPN 的设备上仍然有效）。
+     *
+     * @return 解析不出来返回 null（调用方重试）
      */
-    private static InetAddress resolveViaSystemDns(String host) {
-        for (String key : new String[]{"net.dns1", "net.dns2", "net.dns3"}) {
-            String server = systemProperty(key);
-            if (server == null || server.trim().isEmpty()) {
-                continue;
-            }
-            String ip = server.trim();
-            // net.dns* 在部分设备上带方括号（IPv6 字面量）；这里只用来做 IPv4 DNS 的地址，
-            // 带冒号的直接跳过 —— 那条路本来就不稳
-            if (ip.indexOf(':') >= 0 || ip.indexOf('[') >= 0) {
-                continue;
-            }
+    private static InetAddress resolveOnUsableNetwork(String host) {
+        Object network = pickUsableNetwork();
+        if (network != null) {
+            // 在目标网络上解析：Android 的每网络解析器据此选对 DNS
             try {
-                InetAddress answer = dnsQueryA(ip, host, 3000);
-                if (answer != null) {
-                    return answer;
+                java.lang.reflect.Method getAllByName = InetAddress.class
+                        .getMethod("getAllByName", String.class, Class.forName("android.net.Network"));
+                Object result = getAllByName.invoke(null, host, network);
+                if (result instanceof InetAddress[] && ((InetAddress[]) result).length > 0) {
+                    // 优先 IPv4：这台服务器的 A 记录稳定，而 AAAA 在链路 IPv6 打头时
+                    // 会给一个连不通的地址（实测过）
+                    InetAddress[] all = (InetAddress[]) result;
+                    for (InetAddress candidate : all) {
+                        if (candidate instanceof java.net.Inet4Address) {
+                            return candidate;
+                        }
+                    }
+                    return all[0];
                 }
             } catch (Throwable t) {
-                // 换下一个 DNS 服务器
+                // 这个网络解析不出来：换下一个（下面还会退回默认解析）
             }
         }
-        return null;
-    }
-
-    /** 读一个系统属性；拿不到返回 null（不抛） */
-    private static String systemProperty(String key) {
         try {
-            Class<?> cls = Class.forName("android.os.SystemProperties");
-            java.lang.reflect.Method get = cls.getDeclaredMethod("get", String.class);
-            get.setAccessible(true);
-            Object value = get.invoke(null, key);
-            return value instanceof String ? (String) value : null;
+            return InetAddress.getByName(host);
         } catch (Throwable t) {
             return null;
         }
     }
 
     /**
-     * 极简 DNS A 查询：一条 UDP 报文，够手写。
+     * 挑一个"能把包发到公网"的 {@code android.net.Network}。
      *
-     * <p>为什么不用 {@code dnsjava} 之类：注入进相册进程的 dex 里多一个库就多一份与宿主
-     * 冲突的风险（见「WebDAV 通路」里为什么不用现成 WebDAV 库那一段），而这里要的只是
-     * "把域名换成 IPv4"，几十行就够。
+     * <p>规则（顺序就是优先级）：
+     * <ol>
+     *   <li>有 `TRANSPORT_WIFI` / `TRANSPORT_ETHERNET` 且**不是** VPN 的 —— 这是最正常的选择；</li>
+     *   <li>有 `NET_CAPABILITY_INTERNET` 且不是 VPN 的 —— 覆盖移动网络；</li>
+     *   <li>以上都没有才退而取 VPN 网络（例如用户真的用 VPN 全局代理时，它才该被选中）。</li>
+     * </ol>
+     *
+     * <p>**为什么要排除 VPN**：纯组网的 VPN（本机这个 EasyTier）没有默认路由、DNS 也为空，
+     * 选它等于把包丢进黑洞。而用户真用 VPN 做全局代理时，那个 VPN 会带默认路由，
+     * 第 3 条兜底仍然会选中它 —— 两种情况都不会错。
+     *
+     * <p>反射访问 `ConnectivityManager`：模块注入在相册进程里，这些是 platform 类，
+     * 但为了不给编译期引入 android.net 的较新 API 依赖（minSdk 28），走反射更稳。
+     * 拿不到就返回 null，调用方退回默认解析。
      */
-    private static InetAddress dnsQueryA(String serverIp, String host, int timeoutMs) {
-        java.net.DatagramSocket socket = null;
+    private static Object pickUsableNetwork() {
         try {
-            // 事务 ID 随便取，反正一条请求一条响应
-            int txId = 0x4D47; // "MG"
-            byte[] query = buildDnsQuery(txId, host);
-            socket = new java.net.DatagramSocket();
-            socket.setSoTimeout(timeoutMs);
-            java.net.DatagramPacket out = new java.net.DatagramPacket(
-                    query, query.length, InetAddress.getByName(serverIp), 53);
-            socket.send(out);
-            byte[] buf = new byte[512];
-            java.net.DatagramPacket in = new java.net.DatagramPacket(buf, buf.length);
-            socket.receive(in);
-            return parseFirstA(in.getData(), in.getLength(), txId);
-        } catch (Throwable t) {
-            return null;
-        } finally {
-            if (socket != null) {
-                socket.close();
-            }
-        }
-    }
-
-    /** 组一条标准查询报文：RD=1，单问题，QType=A */
-    private static byte[] buildDnsQuery(int txId, String host) {
-        String[] labels = host.split("\\.");
-        int len = 12 + 1;
-        for (String label : labels) {
-            len += 1 + label.length();
-        }
-        len += 4; // QType + QClass
-        byte[] out = new byte[len];
-        int p = 0;
-        out[p++] = (byte) (txId >> 8);
-        out[p++] = (byte) txId;
-        out[p++] = 0x01; // RD
-        out[p++] = 0x00;
-        out[p++] = 0x00; // QDCOUNT=1
-        out[p++] = 0x01;
-        out[p++] = 0x00; // ANCOUNT=0
-        out[p++] = 0x00;
-        out[p++] = 0x00; // NSCOUNT=0
-        out[p++] = 0x00;
-        out[p++] = 0x00; // ARCOUNT=0
-        out[p++] = 0x00;
-        for (String label : labels) {
-            out[p++] = (byte) label.length();
-            for (int i = 0; i < label.length(); i++) {
-                out[p++] = (byte) label.charAt(i);
-            }
-        }
-        out[p++] = 0x00;   // root label
-        out[p++] = 0x00;   // QType A (1)
-        out[p++] = 0x01;
-        out[p++] = 0x00;   // QClass IN (1)
-        out[p++] = 0x01;
-        return out;
-    }
-
-    /** 从响应里取第一条 A 记录；没有就返回 null（压缩指针只解到够用的程度） */
-    private static InetAddress parseFirstA(byte[] data, int length, int txId) {
-        if (length < 12) {
-            return null;
-        }
-        int id = ((data[0] & 0xFF) << 8) | (data[1] & 0xFF);
-        if (id != txId) {
-            return null;
-        }
-        int rcode = data[3] & 0x0F;
-        if (rcode != 0) { // 只认 NOERROR；NXDOMAIN/NODATA 都不是我们要的答案
-            return null;
-        }
-        int qd = ((data[4] & 0xFF) << 8) | (data[5] & 0xFF);
-        int an = ((data[6] & 0xFF) << 8) | (data[7] & 0xFF);
-        int p = 12;
-        // 跳过问题段
-        for (int i = 0; i < qd && p < length; i++) {
-            p = skipName(data, p, length);
-            p += 4;
-        }
-        for (int i = 0; i < an && p + 10 <= length; i++) {
-            p = skipName(data, p, length);
-            if (p + 10 > length) {
+            Class<?> cmCls = Class.forName("android.content.Context");
+            Object context = hostContext();
+            if (context == null) {
                 return null;
             }
-            int type = ((data[p] & 0xFF) << 8) | (data[p + 1] & 0xFF);
-            int rdlen = ((data[p + 8] & 0xFF) << 8) | (data[p + 9] & 0xFF);
-            p += 10;
-            if (type == 1 && rdlen == 4 && p + 4 <= length) {
-                byte[] addr = new byte[]{(byte) (data[p] & 0xFF), (byte) (data[p + 1] & 0xFF),
-                        (byte) (data[p + 2] & 0xFF), (byte) (data[p + 3] & 0xFF)};
-                try {
-                    return InetAddress.getByAddress(addr);
-                } catch (Throwable t) {
-                    return null;
+            Object cm = context.getClass().getMethod("getSystemService", String.class)
+                    .invoke(context, "connectivity");
+            if (cm == null) {
+                return null;
+            }
+            java.lang.reflect.Method getNetworks = cm.getClass().getMethod("getAllNetworks");
+            Object[] networks = (Object[]) getNetworks.invoke(cm);
+            if (networks == null || networks.length == 0) {
+                return null;
+            }
+            java.lang.reflect.Method getCaps =
+                    cm.getClass().getMethod("getNetworkCapabilities", Class.forName("android.net.Network"));
+            Object wifiFallback = null;
+            Object internetFallback = null;
+            Object vpnFallback = null;
+            for (Object network : networks) {
+                Object caps = getCaps.invoke(cm, network);
+                if (caps == null) {
+                    continue;
+                }
+                boolean isVpn = hasTransport(caps, "TRANSPORT_VPN");
+                boolean hasInternet = hasCapability(caps, "NET_CAPABILITY_INTERNET");
+                boolean isWifi = hasTransport(caps, "TRANSPORT_WIFI");
+                boolean isEthernet = hasTransport(caps, "TRANSPORT_ETHERNET");
+                if (isVpn) {
+                    if (vpnFallback == null && hasInternet) {
+                        vpnFallback = network;
+                    }
+                    continue;
+                }
+                if ((isWifi || isEthernet) && hasInternet && wifiFallback == null) {
+                    wifiFallback = network;
+                }
+                if (hasInternet && internetFallback == null) {
+                    internetFallback = network;
                 }
             }
-            p += rdlen;
+            if (wifiFallback != null) {
+                return wifiFallback;
+            }
+            if (internetFallback != null) {
+                return internetFallback;
+            }
+            return vpnFallback;
+        } catch (Throwable t) {
+            return null;
         }
-        return null;
     }
 
-    /** 跳过域名：处理 0x00 结尾与 0xC0 压缩指针两种情况 */
-    private static int skipName(byte[] data, int p, int length) {
-        while (p < length) {
-            int b = data[p] & 0xFF;
-            if (b == 0) {
-                return p + 1;
-            }
-            if ((b & 0xC0) == 0xC0) {
-                return p + 2;
-            }
-            p += 1 + b;
+    private static boolean hasTransport(Object caps, String field) {
+        try {
+            int wanted = NetworkCapabilitiesFields.transport(field);
+            java.lang.reflect.Method has = caps.getClass().getMethod("hasTransport", int.class);
+            return wanted != 0 && Boolean.TRUE.equals(has.invoke(caps, wanted));
+        } catch (Throwable t) {
+            return false;
         }
-        return p;
+    }
+
+    private static boolean hasCapability(Object caps, String field) {
+        try {
+            int wanted = NetworkCapabilitiesFields.capability(field);
+            java.lang.reflect.Method has = caps.getClass().getMethod("hasCapability", int.class);
+            return wanted != 0 && Boolean.TRUE.equals(has.invoke(caps, wanted));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 相册进程的 Context。由 {@code GalleryHooks} 在构造客户端前塞进来；
+     * 拿不到就退回"不绑定网络"的旧行为（PC 回归与纯 JVM 环境下没有 android.net）。
+     */
+    private static volatile Object sHostContext;
+
+    /** 由注入侧设置：给 {@link #pickUsableNetwork()} 一个能取 ConnectivityManager 的 Context */
+    public static void setHostContext(Object context) {
+        sHostContext = context;
+    }
+
+    private static Object hostContext() {
+        return sHostContext;
+    }
+
+    /** 缓存 {@code NetworkCapabilities} 里的常量值，避免每次反射取字段 */
+    private static final class NetworkCapabilitiesFields {
+        private static final java.util.Map<String, Integer> TRANSPORTS = new java.util.HashMap<>();
+        private static final java.util.Map<String, Integer> CAPABILITIES = new java.util.HashMap<>();
+
+        static {
+            for (String name : new String[]{"TRANSPORT_WIFI", "TRANSPORT_ETHERNET", "TRANSPORT_VPN",
+                    "TRANSPORT_CELLULAR"}) {
+                try {
+                    Class<?> cls = Class.forName("android.net.NetworkCapabilities");
+                    int value = cls.getField(name).getInt(null);
+                    TRANSPORTS.put(name, value);
+                } catch (Throwable ignored) {
+                    // 拿不到就不认这个 transport，判定自然为 false
+                }
+            }
+            for (String name : new String[]{"NET_CAPABILITY_INTERNET", "NET_CAPABILITY_VALIDATED"}) {
+                try {
+                    Class<?> cls = Class.forName("android.net.NetworkCapabilities");
+                    int value = cls.getField(name).getInt(null);
+                    CAPABILITIES.put(name, value);
+                } catch (Throwable ignored) {
+                    // 同上
+                }
+            }
+        }
+
+        static int transport(String name) {
+            Integer value = TRANSPORTS.get(name);
+            return value == null ? 0 : value;
+        }
+
+        static int capability(String name) {
+            Integer value = CAPABILITIES.get(name);
+            return value == null ? 0 : value;
+        }
     }
 
     private Socket plainSocket(String host, int port) throws IOException {
         Socket socket = new Socket();
-        // 用缓存下来的 IP 建连；TLS 那条路仍把 host 传给 createSocket，SNI 与域名核对不受影响
-        socket.connect(new InetSocketAddress(addressFor(host), port), CONNECT_TIMEOUT);
+        InetAddress address = addressFor(host);
+        // 关键：把**建连**也绑到那个能出网的网络上。
+        // 只解析对是不够的 —— 解析出来的 IP 若仍按线程默认的 UID 路由发出去，
+        // 一样会掉进那条没有默认路由的 VPN 表（见 addressFor 的说明）。
+        // Network.bindSocket 在 minSdk 28 上可用，且是标准做法（平台 HTTP 栈就是这么干的）。
+        bindSocketToUsableNetwork(socket);
+        socket.connect(new InetSocketAddress(address, port), CONNECT_TIMEOUT);
         // 握手阶段也得有上限，否则卡在对端不回应时会一直等下去。
         // exchange() 随后会按请求体大小把它换成真正的读超时
         socket.setSoTimeout(CONNECT_TIMEOUT * 2);
         return socket;
+    }
+
+    /** 把这条 socket 绑到 {@link #pickUsableNetwork()} 挑出来的网络上；挑不出来就不绑 */
+    private static void bindSocketToUsableNetwork(Socket socket) {
+        Object network = pickUsableNetwork();
+        if (network == null) {
+            return;
+        }
+        try {
+            network.getClass().getMethod("bindSocket", java.net.Socket.class)
+                    .invoke(network, socket);
+        } catch (Throwable t) {
+            // 绑不上就按默认路由走，等于旧行为；不能因此让整次上传失败
+        }
     }
 
     private SSLSocket tlsSocket(String host, int port) throws IOException {
@@ -1420,11 +1450,32 @@ public final class WebDavClient {
         Socket raw = plainSocket(host, port);
         SSLSocket socket;
         try {
-            // host 参数用于 SNI；autoClose=true 让外层 close() 一起关掉底层 socket
+            // 这里必须传**主机名**，不能传解析出来的 IP 字面量。两条理由：
+            //
+            // ① "传 IP 免得 createSocket 再解析一次" 这个担心是不成立的。
+            //    本机 Android 的 Conscrypt 里，`OpenSSLSocketFactoryImpl.createSocket(Socket, String,
+            //    int, boolean)` 先查一遍 `socket.isConnected()`（没连上直接抛 SocketException），
+            //    然后只是把参数克隆一份交给 `Platform.createFileDescriptorSocket` /
+            //    `createEngineSocket` —— 整个 conscrypt dex 里 `java/net/InetAddress;->getByName`
+            //    出现 **0 次**（证据：把 /apex/com.android.conscrypt/javalib/conscrypt.jar 里的
+            //    classes.dex 用 dexdump 全量搜过）。JDK 侧同样不解析。而 socket 此时**已经连上了**
+            //    （上面 plainSocket 用我们解析并绑好网络的地址连的），也不可能再解析。
+            //
+            // ② 传 IP 会**真的**削弱域名核对。JSSE 的会话缓存与域名核对都以 peer host 为键：
+            //    传 IP 就等于把 `localhost` 与 `127.0.0.1` 当成同一个 peer，前一次握手留下的会话
+            //    会被另一个主机名**复用**，而会话复用会整个跳过证书链与域名核对。
+            //    PC 回归那条负向用例正是这么抓出来的：先连 localhost（成功），紧接着连 127.0.0.1
+            //    也通过了 —— 而单独连 127.0.0.1 是失败的。传主机名各是各的键，绕不过去。
             socket = (SSLSocket) factory.createSocket(raw, host, port, true);
-            // 裸 SSLSocket 默认不做域名核对，这一行就是它与 HttpsURLConnection 的唯一区别
+            // SNI 必须补上：某些服务器（含本机这台 OpenList）按 SNI 选证书/走哪套配置
             javax.net.ssl.SSLParameters params = socket.getSSLParameters();
             params.setEndpointIdentificationAlgorithm("HTTPS");
+            try {
+                params.setServerNames(java.util.Collections.singletonList(
+                        new javax.net.ssl.SNIHostName(host)));
+            } catch (Throwable t) {
+                // 极老的平台没有 SNIHostName：退回不支持 SNI，但域名核对照旧
+            }
             socket.setSSLParameters(params);
             socket.startHandshake();
             return socket;
