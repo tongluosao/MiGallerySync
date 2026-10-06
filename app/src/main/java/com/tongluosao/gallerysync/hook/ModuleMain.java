@@ -96,6 +96,11 @@ public final class ModuleMain extends XposedModule {
         // 若框架复用了同一个实例，mInstalled 会挡住重装，这里必须先放开
         mInstalled = false;
         install(classLoader);
+        // 装完还得把队列自己拉起来：宿主 onCreate 不会被重放，光等下一轮同步要 1~3 小时
+        GalleryHooks hooks = mHooks;
+        if (hooks != null) {
+            hooks.resumeAfterHotReload();
+        }
     }
 
     private synchronized void install(ClassLoader classLoader) {

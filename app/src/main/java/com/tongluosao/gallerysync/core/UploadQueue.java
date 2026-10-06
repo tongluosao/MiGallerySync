@@ -15,12 +15,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -61,6 +63,28 @@ public final class UploadQueue {
     private static final long COOLDOWN_MAX = 3 * 60_000L;
     /** 重试次数用尽后的长间隔：只针对这一项，不再拖累整队 */
     private static final long RETRY_GIVE_UP = 30 * 60_000L;
+    /**
+     * 放弃之后的间隔上限。
+     *
+     * <p>见 {@link #giveUpDelay(int)}：每再失败一轮就翻一倍，最后停在这个上限。
+     * 封顶 6 小时是"既不放弃这项、也不再拿它换流量"之间的折中 —— 服务器换了、限流解了、
+     * 大文件被放行了，半天之内一定会被再试一次；而每 6 小时最多只付一个请求体。
+     */
+    private static final long RETRY_GIVE_UP_MAX = 6 * 60 * 60_000L;
+
+    /**
+     * "设备这一层"出问题时的整队退避档位：60s / 2min / 5min / 15min / 30min（封顶）。
+     *
+     * <p>与服务器级冷却（{@link #COOLDOWN_BASE} 那套，最长 3 分钟）分开，因为两者的
+     * **时间尺度根本不同**：服务器繁忙是几秒到几分钟，而"解析不出域名"这种环境故障
+     * 往往是运营商/路由/VPN 的问题，几分钟内好不了，且失败的项**一个字节都没发出去**。
+     *
+     * <p>关键是它**不计进 {@code attempts}** —— 否则一次 20 分钟的环境故障会把整批
+     * `attempts` 已经到上限的项各自推向 4~6 小时之后（真机 2026-10-06 11:20 那次就是这样）。
+     * 环境恢复后第一项一试就成，冷却立刻清零，整队马上回到正常节奏。
+     */
+    private static final long ENV_COOLDOWN_BASE = 60_000L;
+    private static final long ENV_COOLDOWN_MAX = 30 * 60_000L;
     private static final long WAIT_NO_TASK = 120_000L;
     private static final long WAIT_NO_NETWORK = 300_000L;
     /**
@@ -172,6 +196,13 @@ public final class UploadQueue {
      */
     private final Set<String> mVerifying = new HashSet<>();
     /**
+     * 因为超过体积上限被跳过的项（键 = 路径@体积），受 {@link #mLock} 保护。
+     *
+     * <p>**只为日志去重**：相册每轮同步都会把同一批脏项再交下来，而超限的项永远传不上去，
+     * 不记一下就变成每轮刷一屏。它不参与任何判定 —— 上限调大之后同一项会正常入队上传。
+     */
+    private final Set<String> mTooLargeLogged = new HashSet<>();
+    /**
      * 交接给复核线程的队列，受 {@link #mLock} 保护。
      *
      * <p>有界（{@link #MAX_VERIFY_BACKLOG}）：复核比上传快得多，正常不会积压；
@@ -227,6 +258,11 @@ public final class UploadQueue {
     /** 冷却档位上次抬升的时刻，用来把并发下同一轮的多个失败并成一次 */
     private long mLastCooldownBumpAt;
     private final Object mCooldownLock = new Object();
+    /** "设备这一层"（解析/网络）连续失败的次数，驱动 {@link #envCooldown()}；成功即清零 */
+    private final AtomicInteger mEnvFailures = new AtomicInteger();
+    private long mLastEnvBumpAt;
+    /** 一次性迁移（{@link #repairBackoffDebt}）是否已经做过，落盘在 state.json 的 debt_fixed */
+    private boolean mDebtFixed;
     /** 下次请相册枚举的时间点。只在 {@link #onQueueIdle} 里读写，而它同一时刻只有一个 worker 能进 */
     private long mNextIdleSyncAt;
     /** 当前催相册的间隔：入队线程会把它重置，所以得 volatile */
@@ -265,13 +301,13 @@ public final class UploadQueue {
      */
     private final LinkedHashMap<String, RemoteNames> mRemoteNames = new LinkedHashMap<>();
 
-    /** {@link #mRemoteNames} 里的一条：名字集合 + 取回来的时刻 */
+    /** {@link #mRemoteNames} 里的一条：名字 → 大小（-1 = 未知/目录）+ 取回来的时刻 */
     private static final class RemoteNames {
-        final Set<String> names;
+        final Map<String, Long> sizes;
         final long at;
 
-        RemoteNames(Set<String> names, long at) {
-            this.names = names;
+        RemoteNames(Map<String, Long> sizes, long at) {
+            this.sizes = sizes;
             this.at = at;
         }
     }
@@ -384,6 +420,9 @@ public final class UploadQueue {
             mRunning = false;
             pending = mPending.size();
             mInflight.clear();
+            // 同路径串行的占用也要清：换代之后由新的一份队列自己重新登记，
+            // 残留的路径会让新 worker 永远挑不到那几项
+            mInflightRemotePaths.clear();
             // 还没轮到复核的项直接作废。它们仍在 mPending 里（没移出、没记 done），
             // 下次启动会被重新 PUT 一遍（覆盖写、幂等），代价只是再传一次，不是丢数据
             cancelled = new ArrayList<>(mVerifyQueue);
@@ -574,6 +613,13 @@ public final class UploadQueue {
             }
         }
         applyConcurrency(config.getUploadConcurrency());
+        // 上限变了就把"已经被跳过"的日志记录清掉：用户把上限调大（或设成不限）之后，
+        // 那些文件本来就要重新入队，日志里也该重新出现一条，不然会以为改动没生效
+        if (previous != null && previous.getMaxUploadBytes() != config.getMaxUploadBytes()) {
+            synchronized (mLock) {
+                mTooLargeLogged.clear();
+            }
+        }
     }
 
     /**
@@ -734,6 +780,11 @@ public final class UploadQueue {
         }
         int added = 0;
         int skipped = 0;
+        int tooLarge = 0;
+        Config config = mConfig;
+        // 上限在入队这一层判，**不是**在 worker 里：这样超限的项一个字节都不会发出去，
+        // 也不会占着并发槽位、不会进重试循环（见 Config.KEY_MAX_UPLOAD_BYTES 的实测依据）。
+        long cap = config == null ? Config.DEFAULT_MAX_UPLOAD_BYTES : config.getMaxUploadBytes();
         synchronized (mLock) {
             for (CloudItemReader.Item item : items) {
                 File file = new File(item.path);
@@ -741,12 +792,24 @@ public final class UploadQueue {
                     skipped++;
                     continue;
                 }
-                String key = key(item.path, file.length(), file.lastModified());
+                long size = file.length();
+                if (cap > 0 && size > cap) {
+                    tooLarge++;
+                    // 每项只喊一次：相册每轮同步都会把同一批脏项再交下来，逐轮重复打日志
+                    // 只会把有用的行淹掉。判据带体积，文件变了会再喊。
+                    if (mTooLargeLogged.add(item.path + "@" + size)) {
+                        Logger.w("event=upload_skip_too_large path=" + item.path
+                                + " size=" + size
+                                + " cap=" + Config.describeBytes(cap));
+                    }
+                    continue;
+                }
+                String key = key(item.path, size, file.lastModified());
                 if (mDone.containsKey(key) || mPending.containsKey(key)) {
                     skipped++;
                     continue;
                 }
-                mPending.put(key, new Task(item.path, file.length(), file.lastModified(),
+                mPending.put(key, new Task(item.path, size, file.lastModified(),
                         item.video, item.date, item.rowId));
                 added++;
             }
@@ -761,7 +824,10 @@ public final class UploadQueue {
                 mLock.notifyAll();
             }
         }
+        // too_large 单独报出来：它不进 pending，也不重试，不说明白的话用户只会看到
+        // "相册里的文件没传上去，日志里也没有失败"，那是最难查的一种表现
         Logger.i("event=enqueue added=" + added + " skipped=" + skipped
+                + " too_large=" + tooLarge
                 + " pending=" + mPending.size() + " done=" + mDone.size());
     }
 
@@ -829,13 +895,25 @@ public final class UploadQueue {
                         // "我还要等多久"，它已经在被处理了，不是在排队
                         continue;
                     }
-                    if (candidate.nextAttemptAt <= now) {
-                        task = candidate;
-                        mInflight.add(candidateKey);
-                        mIdleNotified = false;
-                        break;
+                    if (candidate.nextAttemptAt > now) {
+                        waitMillis = Math.min(waitMillis, candidate.nextAttemptAt - now);
+                        continue;
                     }
-                    waitMillis = Math.min(waitMillis, candidate.nextAttemptAt - now);
+                    // **同一个远端路径一次只能有一个 PUT 在飞**（服务器侧硬约束，见
+                    // inflightRemotePathLocked 的说明）。挡住的项不算进 waitMillis ——
+                    // 它不是"在等退避"，而是"在等那条同路径的请求结束"，那一刻会被唤醒重挑
+                    String claimedPath = remotePathOfLocked(config, candidate);
+                    if (mInflightRemotePaths.contains(claimedPath)) {
+                        continue;
+                    }
+                    task = candidate;
+                    mInflight.add(candidateKey);
+                    // 登记写在任务自己身上：释放时按它删，不重新推一遍（推的话配置中途一改
+                    // 就会删错一个键，那条路径就再也没人能传了）
+                    candidate.inflightPath = claimedPath;
+                    mInflightRemotePaths.add(claimedPath);
+                    mIdleNotified = false;
+                    break;
                 }
                 if (task == null) {
                     // 只有"一项都没人在传、也没有还没定论的复核"才算真的空闲。
@@ -943,6 +1021,13 @@ public final class UploadQueue {
             boolean ok = false;
             // 提到 try 外面：finally 里要用它清掉进度回调
             WebDavClient client = null;
+            // 也提到 try 外面：catch 里要用它做"迟到落盘"的兜底判定（见 lateLanding）
+            String remotePath = null;
+            // 请求体**是不是已经全部发出去了**。这条只有进度回调知道，而它决定了失败之后
+            // 要不要回头问一句"远端是不是已经收全了"（见 lateLanding）：
+            // 字节发完了还报错，多半是服务器那一侧的收尾问题（真机 423 Locked 就是这种），
+            // 而字节都没发完就失败，重试是唯一出路
+            final AtomicBoolean bodySent = new AtomicBoolean(false);
             // 交出去之后 worker 这边就不能再碰 endUpload/taskEnd —— 那两条账由复核线程在
             // 真正知道结果之后记（见 verifyLoop），否则会出现"还没确认就告诉宿主传完了"
             boolean handedOff = false;
@@ -950,22 +1035,42 @@ public final class UploadQueue {
                 client = clientFor(config, index);
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
                 String remoteDir = remoteDirFor(config, task);
-                String remotePath = WebDavClient.joinPath(remoteDir, file.getName());
+                remotePath = WebDavClient.joinPath(remoteDir, file.getName());
                 // 远端已经有同名文件就当作"这一份备份过了"，直接跳过，一个字节都不发。
-                // 判据只看名字，**不看内容**（用户要的就是省电省流量，逐字节比对要先把远端
-                // 整份下载下来）。这是**上传前**的分支，与下面那条"必须先发字节再复核"的
-                // 约束不冲突：它根本不产生"复核通过"这个结论，而是"这一项早在远端了"。
+                // 判据是**名字 + 大小**：名字相同但大小不同不能算备份完成（大小在列目录时
+                // 就带回来了，多这一条不花代价）。这是**上传前**的分支，与下面那条
+                // "必须先发字节再复核"的约束不冲突：它根本不产生"复核通过"这个结论，
+                // 而是"这一份早在远端了"。
                 if (config.isSkipExistingRemote()
-                        && remoteExists(config, index, remoteDir, file.getName())) {
+                        && remoteExists(config, index, remoteDir, file.getName(), file.length())) {
                     Logger.i("event=upload_skip_remote_exists path=" + task.path
                             + " remote=" + remotePath + " size=" + task.size);
+                    // 账要把字节数补齐再收尾。项目里有一条诊断口径：`progress_task_end ok=true`
+                    // 必须带 `sent=size`，`sent=0` 就意味着"没传就算成功"（硬性约束 11 那类
+                    // 错记的指纹）。跳过这条路径恰恰**是合法的**没传字节 —— 远端那一份与本地
+                    // 等长，字节确实在那儿。所以这里如实把进度填成本项大小，而不是把口径改成
+                    // "允许 sent=0"，否则以后真出现错记就再也认不出来了。
+                    mPublisher.taskBytes(taskKey, task.size);
                     ok = true;
                     finalizeOk(task, config, remotePath, "remote_exists");
                     return;
                 }
                 // 每 64KB 一块回调，下游按 500ms 节流后才发广播 —— lambda 每任务只建一次，
-                // 不在那个循环里分配对象
-                client.setProgressListener((sent, total) -> mPublisher.taskBytes(taskKey, sent));
+                // 不在那个循环里分配对象。
+                // 顺带在这里当"急停闸"：热重载换代时 shutdown() 已经把 mRunning 置假并关连接，
+                // 但**正在写到内核缓冲里的大请求体不会因此停手**（真机上见过新旧两代各传一遍
+                // 同一个 1.3GB 文件，服务端对同一路径回 423）。抛出去就地中止这次发送，
+                // 粒度是 64KB，不用等剩下的几百 MB 推完。抛的是 IOException，
+                // 在 send() 里会被包成 TransportFailure —— 那条路径不计入熔断，正合适。
+                client.setProgressListener((sent, total) -> {
+                    mPublisher.taskBytes(taskKey, sent);
+                    if (!mRunning) {
+                        throw new IOException("upload aborted: queue is shutting down");
+                    }
+                    if (sent >= task.size) {
+                        bodySent.set(true);
+                    }
+                });
                 // 绝不预先建目录：OpenList 挂网盘的后端会把 `PUT <dir>/`（空请求体）当成
                 // "创建一个 0 字节的文件"，名字撞车时驱动再自动改名成 dir(1)/dir(2)…，
                 // 真目录被同名文件一挡，后续文件 PUT 就随机 405/423 —— 探测反而制造了故障。
@@ -979,7 +1084,7 @@ public final class UploadQueue {
                 // 两边数量再也对不上。所以 putSend 必须在 enqueueVerify 之前，
                 // 且 putSend 抛异常时这一项绝不会进入复核队列。
                 client.putSend(remotePath, file);
-                rememberRemoteName(remoteDir, file.getName());
+                rememberRemoteName(remoteDir, file.getName(), file.length());
                 if (config.isVerifyAsync()
                         && enqueueVerify(taskKey, task, config, remotePath, file.length())) {
                     handedOff = true;
@@ -991,9 +1096,27 @@ public final class UploadQueue {
                     finalizeOk(task, config, remotePath, String.valueOf(index));
                 }
             } catch (WebDavClient.TransportFailure e) {
-                finalizeFail(task, config, e);
+                // 链路层失败里有一种**不是失败**：请求体已经全部发出去了，只是服务器迟迟不给
+                // 响应（真机 2026-10-06 实测：1.35GB 的 PUT 在 1800 秒里一个字节没回，
+                // 而对象其实已经**完整落盘**，长度分毫不差）。重发一遍要再烧整份上行，
+                // 所以这里回头问一句"远端那一份是不是已经跟我一样大"，是就按成功收尾
+                if (lateLanding(client, config, remotePath, file.length(), bodySent.get())) {
+                    ok = true;
+                    finalizeOk(task, config, remotePath, String.valueOf(index));
+                } else {
+                    finalizeFail(task, config, e);
+                }
             } catch (IOException e) {
-                finalizeFail(task, config, e);
+                // 服务器自己回的错误码（含 423 Locked）也走同一条兜底。由头是同一份真机证据：
+                // 那个 1.35GB 的视频 13:16:57 开始传，**sent=1416598318（一个字节不差）** 之后
+                // 才回 423，而远端那一份早就完整了。字节都发完了还判"失败重传"，
+                // 等于每次同步都再烧一份 1.35GB 上行去换同一个 423
+                if (lateLanding(client, config, remotePath, file.length(), bodySent.get())) {
+                    ok = true;
+                    finalizeOk(task, config, remotePath, String.valueOf(index));
+                } else {
+                    finalizeFail(task, config, e);
+                }
             } catch (Throwable t) {
                 finalizeUnexpected(task, t);
             } finally {
@@ -1019,9 +1142,73 @@ public final class UploadQueue {
             // 这就是"复核不占上传通道"的实质
             synchronized (mLock) {
                 mInflight.remove(taskKey);
+                // 同路径串行的占用一并释放，并喊醒在等它的同伴（那些项没被领走、
+                // 也没进 waitMillis，不喊的话要等到下一次唤醒窗口才动）
+                if (task.inflightPath != null) {
+                    mInflightRemotePaths.remove(task.inflightPath);
+                    task.inflightPath = null;
+                }
                 mLock.notifyAll();
             }
         }
+    }
+
+    /**
+     * 链路失败之后回头确认一次：**远端那一份是不是已经完整了**。
+     *
+     * <p>为什么值得单独做（真机 2026-10-06 实测）：这条链路上，请求体"发完"与"服务器应答"
+     * 之间有巨大的鸿沟 —— 后端（OpenList 挂移动云盘）要先把整个文件收完才回 201，
+     * 上游 1800 秒都不回是常态。于是客户端看到的是"超时失败"，而对象已经躺在远端了：
+     * <pre>
+     *   PC 侧 curl 直传 1.32GB：sent=1416598318（一个字节不少）→ 1800 秒 0 字节响应
+     *   → 事后 PROPFIND 远端：1,416,598,318 字节，完整（手机那一份也早已落盘）
+    *   同一台阶梯探测：200MB 41s / 500MB 168s / 1000MB 278s 全部 201 且落盘
+     * </pre>
+     * 原先的处理是"失败 → 退避 → 重传整份"，代价是每失败一次烧掉一次 1.3GB 上行，
+     * 而且这一项会永远重试下去（同时反复占用一条上传通道）。
+     *
+     * <p>判据必须**严**，因为判错的方向是丢文件/假记账：
+     * <ol>
+     *   <li>这次请求的字节**确实全部发出去了**（{@code bodySent}，由 64KB 进度回调记下）——</li>
+     * </ol>
+     * 这一条是整件事的钥匙：它把"这一项传不动"（本地没发完/连接断了）与"服务器收完了却没
+     * 好好应答"分开。少了它，任何一次上传失败都会被拿去跟远端比对，而远端那一份可能是
+     * **上一轮就存在的**旧文件，那样就会把一次真失败记成成功。
+     *
+     * <p>再加两条：
+     * <ol start="2">
+     *   <li>远端必须有这个名字；</li>
+     *   <li>而且它的大小必须**等于**本地这一份（不是"不小于"）。</li>
+     * </ol>
+     * 比本地小 = 那份是半截的（可能是这次传到一半），必须继续重试；
+     * 比本地大 = 不是同一个对象。问不出来（服务器不支持 HEAD/PROPFIND）就返回 false，
+     * 老老实实走原来的重试逻辑。
+     *
+     * <p>与"先发字节再复核"那条硬性约束的关系：这里**已经发过字节了**（异常正是在发送/
+     * 读响应阶段抛的），确认的是"刚发出去的那一份"。它不是 putSend 的替代品，
+     * 也不改变"上传前绝不产生成功结论"这条原则。
+     *
+     * @return true 表示远端已经有一份与本地等长的对象，这一项可以按成功收尾
+     */
+    private boolean lateLanding(WebDavClient client, Config config, String remotePath, long size,
+                                boolean bodySent) {
+        if (client == null || remotePath == null || size <= 0 || !bodySent) {
+            return false;
+        }
+        try {
+            long remoteSize = client.remoteSize(remotePath);
+            if (remoteSize == size) {
+                Logger.w("event=upload_late_landing path=" + remotePath + " size=" + size
+                        + " action=count_as_done");
+                return true;
+            }
+            Logger.i("event=upload_late_missing path=" + remotePath + " local=" + size
+                    + " remote=" + remoteSize + " action=retry");
+        } catch (Throwable t) {
+            // 问不出来就照旧重试 —— 这里绝不能因为"问不到"就判成功
+            Logger.d("event=upload_late_probe_failed path=" + remotePath + " reason=" + t);
+        }
+        return false;
     }
 
     /**
@@ -1135,6 +1322,7 @@ public final class UploadQueue {
         // 传通一次就说明服务器是活的：冷却清零、催相册的间隔也拉回最短，
         // 不然一次抖动会把后面几十项的间隔一直撑在最大值上
         mCooldownFailures.set(0);
+        mEnvFailures.set(0);
         mIdleSyncDelay = IDLE_SYNC_BASE;
         mUploadedSinceIdle.incrementAndGet();
         Logger.i("event=upload_ok worker=" + worker + " path=" + task.path
@@ -1163,7 +1351,50 @@ public final class UploadQueue {
     private void finalizeFail(Task task, Config config, IOException error) {
         boolean counts = !(error instanceof WebDavClient.TransportFailure)
                 && task.size <= BREAKER_PROBE_MAX;
-        scheduleRetry(task, config, error.getMessage(), counts);
+        scheduleRetry(task, config, error.getMessage(), counts, isEnvironmentFailure(error));
+    }
+
+    /**
+     * 这个失败是不是"设备/环境这一层"的问题，而不是"这一项传不动"。
+     *
+     * <p>判据只有一个：**地址没解析出来**（{@code UnknownHostException} 在因果链上）。
+     * 它意味着请求连发都没发出去，跟文件大小、跟服务器状态都无关；把它算成这一项的失败，
+     * 就是在环境故障期间替用户把整个备份队列往后推。
+     * 明确**不含**读超时与连接中断 —— 那些可能真的是这一项（尤其是大文件）传不动。
+     */
+    private static boolean isEnvironmentFailure(Throwable error) {
+        Throwable cursor = error;
+        for (int depth = 0; cursor != null && depth < 8; depth++) {
+            if (cursor instanceof java.net.UnknownHostException) {
+                return true;
+            }
+            if (cursor.getCause() == cursor) {
+                break;
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
+    }
+
+    /**
+     * 抬升一档"环境退避"，返回这一档的间隔。
+     *
+     * <p>与 {@link #bumpCooldown()} 同一个套路（时间闸门把并发下的同一轮失败并成一次），
+     * 只是档位更粗、上限更长。
+     */
+    private long envCooldown() {
+        synchronized (mCooldownLock) {
+            long now = System.currentTimeMillis();
+            if (now - mLastEnvBumpAt >= ENV_COOLDOWN_BASE) {
+                mLastEnvBumpAt = now;
+                mEnvFailures.updateAndGet(v -> Math.min(v + 1, 8));
+            }
+            int level = Math.max(mEnvFailures.get(), 1);
+            // 60s,2m,5m,15m,30m… 用倍率而不是纯位移：环境故障好得慢，前几档要够快才算"还在试"
+            long[] ladder = {ENV_COOLDOWN_BASE, 2 * 60_000L, 5 * 60_000L, 15 * 60_000L, ENV_COOLDOWN_MAX};
+            int index = Math.min(level - 1, ladder.length - 1);
+            return ladder[index];
+        }
     }
 
     /** 意料之外的异常：不猜它是不是链路问题，只把这一项放远点，别拖累整队 */
@@ -1219,12 +1450,47 @@ public final class UploadQueue {
     }
 
     /**
+     * 已放弃的项再失败一次，该等多久。
+     *
+     * @param rounds 这是第几次"放弃"（0 = {@code max_retry} 刚好用尽的那一次）
+     */
+    private static long giveUpDelay(int rounds) {
+        int shift = Math.min(Math.max(rounds, 0), 5);
+        return Math.min(RETRY_GIVE_UP << shift, RETRY_GIVE_UP_MAX);
+    }
+
+    /**
      * 安排下一次重试。
      *
      * @param counts 是否计入"目标不可用"的熔断计数。退避本身按项计数，
      *               所以下一轮枚举仍会碰到它（没记 localFlag，不会丢）。
      */
-    private void scheduleRetry(Task task, Config config, String reason, boolean counts) {
+    private void scheduleRetry(Task task, Config config, String reason, boolean counts,
+                               boolean envFailure) {
+        if (!mRunning) {
+            // 这一路是被我们自己掐断的（热重载/停机时关连接或抛急停异常），不是这一项的问题。
+            // 记账的后果不小：真机上见过换代时正在跑的 HEAD 被关掉，那一项直接记成
+            // `attempts=8 → upload_give_up`，于是**每次更新模块都把它往后推 30 分钟**，
+            // 而它其实一个字节都没错。留在 mPending 里，新 generation 立刻会领走它
+            Logger.i("event=upload_aborted_shutdown path=" + task.path
+                    + " reason=" + reason);
+            return;
+        }
+        if (envFailure) {
+            // 设备这一层的问题（解析不出地址 / 根本没有可用网络），**不是这一项传不动**。
+            // 计入 attempts 的后果很重：真机 11:20 那次 DNS 抖动里，一批 `attempts` 已经到
+            // 8 的项每次失败都被台阶推到 4 小时后，一次 20 分钟的环境故障等于把整批推迟半天。
+            // 所以整队按"环境退避"走（逐级拉长、恢复即清零），把这一项原样留在队里
+            long envDelay = envCooldown();
+            Logger.w("event=upload_wait_env path=" + task.path
+                    + " delay=" + envDelay + " attempts_kept=" + task.attempts
+                    + " reason=" + reason);
+            synchronized (mLock) {
+                task.nextAttemptAt = System.currentTimeMillis() + envDelay;
+                saveThrottledLocked();
+            }
+            return;
+        }
         task.attempts++;
         if (counts) {
             int failures = mConsecutiveFailures.incrementAndGet();
@@ -1235,10 +1501,15 @@ public final class UploadQueue {
         }
         long delay;
         if (task.attempts >= config.getMaxRetry()) {
-            // 这一项自己重试用尽了，单独放远一点；其它项照常轮转，不被它拖住
-            delay = RETRY_GIVE_UP;
+            // 这一项自己重试用尽了，单独放远一点；其它项照常轮转，不被它拖住。
+            // 间隔按"第几次放弃"逐级翻倍（30min→1h→2h→4h→6h 封顶）：早先固定 30 分钟，
+            // 语义上等于"永远每半小时再发一遍**整个请求体**"—— 2026-10-06 那个 1.32GB 的
+            // 视频一天下来白烧约 10GB 上行（每次都要 4~8 分钟才失败），而且它每次失败都占着
+            // 一条并发槽位。翻倍之后同类项最多一天再碰几次，代价可控且不会丢任务。
+            delay = giveUpDelay(task.attempts - config.getMaxRetry());
             Logger.w("event=upload_give_up path=" + task.path
-                    + " attempts=" + task.attempts + " reason=" + reason);
+                    + " attempts=" + task.attempts + " delay=" + delay
+                    + " reason=" + reason);
         } else {
             // 退避记在"服务器"头上而不是"每一项"头上：整批一起失败时，按项各算各的
             // 会让 1400 多项同时睡满 1~30 分钟，队列整段空转（真机实测连续几分钟零请求）。
@@ -1321,41 +1592,63 @@ public final class UploadQueue {
     }
 
     /**
-     * 远端那个目录里已经有同名文件了吗。
+     * 远端那个目录里已经有**同一个**文件了吗。
      *
-     * <p>用 {@code PROPFIND Depth 1} 一次拿回整个目录的名字（见 {@link #mRemoteNames}），
+     * <p>用 {@code PROPFIND Depth 1} 一次拿回整个目录的名字与大小（见 {@link #mRemoteNames}），
      * 而不是对这一个文件发 HEAD：同一相册目录下的几十项只会付一次往返。
+     *
+     * <p>判据从"**名字**相同"改成"**名字与大小都**相同"（2026-10-06）：大小在列目录时就
+     * 顺手带回来了，多这一条不花任何代价，却把"同名但内容不全/不同"的情况挡在外面 ——
+     * 那种情况按名字跳过会把**不完整的一份**当成备份完成，比多传一次危险得多。
+     * 唯一放宽的是远端报不出大小（-1）：那时按名字判，与老行为一致。
      *
      * <p><b>任何失败都返回 false（继续上传）</b>。这个判断只是"省一次上传"的优化，
      * 它自己坏掉（不支持 PROPFIND、超时、被拦）绝不该让文件传不上去 —— 判错了方向以后果
      * 最轻：多传一次覆盖写。反过来若在拿不到名单时判"远端有"，那才是丢文件。
      */
-    private boolean remoteExists(Config config, int index, String remoteDir, String name) {
-        Set<String> names;
+    private boolean remoteExists(Config config, int index, String remoteDir, String name,
+                                 long size) {
+        Map<String, Long> remote;
         synchronized (mLock) {
             RemoteNames cached = mRemoteNames.get(remoteDir);
             if (cached != null && System.currentTimeMillis() - cached.at < REMOTE_DIR_CACHE_MS) {
-                return cached.names.contains(name);
+                return matches(cached.sizes, name, size);
             }
         }
         try {
             WebDavClient client = clientFor(config, index);
-            names = client.listNames(remoteDir);
+            List<WebDavClient.RemoteEntry> entries = client.list(remoteDir);
+            if (entries == null) {
+                // 服务器不支持 PROPFIND / 响应被截断：判不了，只能照传
+                return false;
+            }
+            Map<String, Long> sizes = new HashMap<>();
+            for (WebDavClient.RemoteEntry entry : entries) {
+                if (!entry.dir) {
+                    sizes.put(entry.name, entry.size);
+                }
+            }
+            synchronized (mLock) {
+                mRemoteNames.put(remoteDir, new RemoteNames(sizes, System.currentTimeMillis()));
+                trimRemoteNamesLocked();
+            }
+            remote = sizes;
         } catch (Throwable t) {
             // 连接层失败（TransportFailure）与协议层失败一视同仁：这一项照传，
             // 真传不上去会由下面的 putSend 报出来，不该在这里改判定
             Logger.d("event=remote_list_failed dir=" + remoteDir + " reason=" + t);
             return false;
         }
-        if (names == null) {
-            // 服务器不支持 PROPFIND / 响应被截断：判不了，只能照传
+        return matches(remote, name, size);
+    }
+
+    /** 名单里这个名字的大小与本地一致吗；远端大小未知（-1）时按名字算 */
+    private static boolean matches(Map<String, Long> remote, String name, long size) {
+        Long remoteSize = remote.get(name);
+        if (remoteSize == null) {
             return false;
         }
-        synchronized (mLock) {
-            mRemoteNames.put(remoteDir, new RemoteNames(names, System.currentTimeMillis()));
-            trimRemoteNamesLocked();
-        }
-        return names.contains(name);
+        return remoteSize < 0 || remoteSize == size;
     }
 
     /**
@@ -1365,13 +1658,13 @@ public final class UploadQueue {
      * 名单里没有刚传完的这一个 —— 如果它恰好与后面某一项同名（同一张照片被相册枚举出两条
      * 不同 row），后一项就会再传一遍。记进去正好把这种情况收掉。
      */
-    private void rememberRemoteName(String remoteDir, String name) {
+    private void rememberRemoteName(String remoteDir, String name, long size) {
         synchronized (mLock) {
             RemoteNames cached = mRemoteNames.get(remoteDir);
             if (cached == null) {
                 return;
             }
-            cached.names.add(name);
+            cached.sizes.put(name, size);
         }
     }
 
@@ -1503,6 +1796,10 @@ public final class UploadQueue {
             root.put("target", targetSignature());
             root.put("pending", pending);
             root.put("done", done);
+            // 一次性迁移标记：修过"环境故障欠下的长退避"就落盘，免得每次启动都重扫一遍
+            if (mDebtFixed) {
+                root.put("debt_fixed", true);
+            }
             // 分开记录模式下把其他目标那几条记录一起带上：不带的话"换回旧账号不用重传"就只在本进程
             // 活着的时候成立，重启一次账就没了（用户看到的还是"又传了一遍"）
             Config config = mConfig;
@@ -1538,6 +1835,7 @@ public final class UploadQueue {
             JSONObject root = new JSONObject(text);
             String savedTarget = root.optString("target", "");
             JSONArray pending = root.optJSONArray("pending");
+            int repaired = 0;
             if (pending != null) {
                 for (int i = 0; i < pending.length(); i++) {
                     JSONObject obj = pending.getJSONObject(i);
@@ -1559,6 +1857,19 @@ public final class UploadQueue {
             JSONObject done = root.optJSONObject("done");
             if (done != null) {
                 readLedger(done, mDone);
+            }
+            // 先认下"这次迁移已经做过"这个事实，再决定要不要跑。
+            // **必须在 load 里把标记读进字段**：修复分支只在"确实清掉了几项"时才置字段，
+            // 于是换代到一个"没东西可修"的新 generation 时字段仍是假，它随后的任何一次落盘
+            // （上传成功、退避、退出）都会把 state.json 里的 debt_fixed **抹掉** ——
+            // 真机 12:30 修了 1282 项，13:01 换代后就因为这个把标记弄丢了，迁移会一次次重跑
+            mDebtFixed = root.optBoolean("debt_fixed", false);
+            if (!mDebtFixed) {
+                repaired = repairBackoffDebt();
+                // 清了几项都要落盘：这个标记本身就是"别再修第二次"的唯一凭据
+                synchronized (mLock) {
+                    writeStateLocked();
+                }
             }
             // 分开记录模式下"其他目标"的记录。老版本没有这个键，读不到就是空的，行为不变
             JSONObject ledgers = root.optJSONObject("ledgers");
@@ -1594,10 +1905,54 @@ public final class UploadQueue {
                 }
             }
             Logger.i("event=state_loaded pending=" + mPending.size() + " done=" + mDone.size()
-                    + " ledgers=" + mLedgers.size());
+                    + " ledgers=" + mLedgers.size()
+                    + (repaired > 0 ? " backoff_repaired=" + repaired : ""));
         } catch (Throwable t) {
             Logger.w("event=state_load_failed", t);
         }
+    }
+
+    /**
+     * 一次性的"时间债"修复：把某一代版本在**环境故障期间**替用户欠下的长退避清掉。
+     *
+     * <p>背景（真机 2026-10-06）：11:20 起这条链路解析不出地址（VPN 的 UID 路由那套老问题），
+     * 而当时的代码把每一次解析失败都算成"这一项传不动"，于是那批 {@code attempts} 已经到
+     * 7~9 的项被逐级推到 2、4、6 小时之后。DNS 两分钟就恢复了，**而每一项都在等一个由别人的
+     * 故障写下的时间戳**，唯一会重写它的动作是"相册重新枚举"（1~3 小时一次）——用户看到的就是
+     * "备份停了"。真机实测：这份 state.json 里 12292 项中有 1282 项带着这种等待
+     * （attempts=7 → 2h 共 1041 项、8 → 4h 共 136 项、9/10 → 6h 共 105 项），
+     * 其余 11010 项本来就是马上可传的。新代码已经不再这样记账（见
+     * {@code scheduleRetry} 的环境退避分支），但**已经写进 state.json 的那一笔要有人还**。
+     *
+     * <p>判据是一个**只属于阶梯退避**的指纹：等待超过 30 分钟。
+     * 正常失败路径最长只能把一项推到 {@link #COOLDOWN_MAX}（3 分钟），
+     * 再长只有两条路 —— 这一项自己重试用尽（{@link #RETRY_GIVE_UP} 起，≥30 分钟），
+     * 或者环境退避；两者都是"暂时别碰它"。所以**逐项**把这种等待清成"立刻可传"：
+     * <ul>
+     *   <li>只动等待 &gt; 30 分钟的项，别的项（含正在排队的 1 万多条）一根汗毛都不碰；</li>
+     *   <li>这些项本来就是"传不动"的（大文件、残包），清掉退避最多白试一轮，
+     *       不会把已经传上去的东西弄坏（幂等覆盖写）；</li>
+     *   <li>只修一次（{@code debt_fixed} 落盘，且 {@link #load()} 会把它读回 {@code mDebtFixed}），
+     *       之后由 {@link #giveUpDelay} 自己管。</li>
+     * </ul>
+     *
+     * @return 被清掉退避的项数（0 表示没动）
+     */
+    private int repairBackoffDebt() {
+        // 判据用"比 give-up 起点还远"，与 RETRY_GIVE_UP(30min) 严格对齐
+        long deadline = System.currentTimeMillis() + RETRY_GIVE_UP;
+        int fixed = 0;
+        for (Task task : mPending.values()) {
+            if (task.nextAttemptAt > deadline) {
+                task.attempts = 0;
+                task.nextAttemptAt = 0L;
+                fixed++;
+            }
+        }
+        mDebtFixed = true;
+        Logger.w("event=backoff_debt_fixed items=" + fixed + " pending=" + mPending.size()
+                + " reason=environment_outage_backoff");
+        return fixed;
     }
 
     /** 把一段 JSON 对象读成记录（键都是"路径|大小|mtime"） */
@@ -1632,6 +1987,46 @@ public final class UploadQueue {
         }
     }
 
+    /**
+     * 该任务会落到哪个远端路径。**领取任务时就要知道**，因为并发写同一个路径会被服务器回 423
+     * （机制见下面 inflightRemotePathLocked 的说明）。
+     *
+     * <p>与 {@code upload()} 里那句 `remoteDirFor(config, task)` + 文件名保持一致：
+     * 同一套函数、同一份配置，所以两边算出来的路径必然相同。
+     */
+    private String remotePathOfLocked(Config config, Task task) {
+        String dir = remoteDirFor(config, task);
+        return WebDavClient.joinPath(dir, new File(task.path).getName());
+    }
+
+    /**
+     * 同一个远端路径**不许有两条在飞的 PUT** —— 服务器侧硬约束，不是优化。
+     *
+     * <p>机制（2026-10-06 服务器侧只读取证拿到确切结论）：OpenList 的 WebDAV 用**进程内的
+     * 内存锁**（`server/webdav.go`: `LockSystem: webdav.NewMemLS()`），而 `handlePut` 是
+     * **读完整个请求体之后**才判锁。同一路径只要有两个 PUT 重叠，后到的那个就吃
+     * **423 Locked**（`webdav: locked`），代价是**把那一整份请求体先收完**（1.3GB = 白烧
+     * 一整份上行）。服务器日志把窗口钉死了（UTC）：
+     * <pre>
+     *   02:29:45 起的那笔持锁 56 分半 → 03:26:15 回 201
+     *   落在它窗口里的 02:29:53 与 03:09:21 两笔 → 全部 423
+     *   04:30:47 起的那笔持锁 61 分钟，期间 04:59:56 / 05:01:37 / 05:05:55 / 05:07:20 /
+     *   05:12:14 / 05:17:03 六笔全部 423
+     * </pre>
+     * 所以**重试越勤撞得越狠**，每一撞都付一整份上行。堵在源头才是解决办法。
+     *
+     * <p>为什么本队列真会撞：任务键是 `路径+大小+mtime`，而远端路径是 `远端目录 + 文件名`
+     * —— 大小或 mtime 一不同就是两个任务键、同一个远端路径（重名照片、被编辑过的照片、
+     * 不同相册目录下的同名文件都是这种）。`mInflight` 只按任务键去重，挡不住。
+     *
+     * <p>与 {@code mInflight} / {@code mVerifying} 的分工：那两条是"这一项别重复领"，
+     * 这一条是"同一个远端路径别并发写"；两者都要，因为一个路径可能对应两个任务键。
+     *
+     * <p>都在 {@code mLock} 内操作：领取时登记、任何返回路径在 finally 里释放。
+     * 漏放会导致那条路径永远没人传（档在"已占用"上）。
+     */
+    private final Set<String> mInflightRemotePaths = new HashSet<>();
+
     private static final class Task {
         final String path;
         final long size;
@@ -1642,6 +2037,8 @@ public final class UploadQueue {
         final String rowId;
         int attempts;
         long nextAttemptAt;
+        /** 领取时登记的远端路径（同路径串行用），释放时按它删 */
+        String inflightPath;
 
         Task(String path, long size, long mtime, boolean video, long date, String rowId) {
             this.path = path;

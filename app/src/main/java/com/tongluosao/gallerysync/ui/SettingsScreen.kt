@@ -299,6 +299,19 @@ private fun BehaviorSection(model: SettingsModel) {
                 summary = stringResource(R.string.summary_upload_concurrency),
                 onSelectedIndexChange = model::onConcurrencyChange
             )
+            OverlayDropdownPreference(
+                items = listOf(
+                    stringResource(R.string.size_cap_unlimited),
+                    stringResource(R.string.size_cap_200mb),
+                    stringResource(R.string.size_cap_500mb),
+                    stringResource(R.string.size_cap_1gb),
+                    stringResource(R.string.size_cap_2gb)
+                ),
+                selectedIndex = model.maxUploadBytesIndex,
+                title = stringResource(R.string.label_max_upload_bytes),
+                summary = stringResource(R.string.summary_max_upload_bytes),
+                onSelectedIndexChange = model::onMaxUploadBytesChange
+            )
         }
         if (model.isReplaceMode) {
             HintLine(stringResource(R.string.warn_replace_mode), error = true)

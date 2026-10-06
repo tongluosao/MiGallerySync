@@ -80,6 +80,22 @@ public final class GalleryHooks {
         return hooks;
     }
 
+    /**
+     * 热重载换代后的自举。
+     *
+     * <p>新 generation 的静态量与方法区都是新的，{@code mAppStarted} 必然是 false —— 可宿主
+     * Application 明明早就 onCreate 过了（我们正跑在它的进程里），而框架**不会**为新一代重放
+     * {@code GalleryApp.onCreate}，新的 {@code invokeList} hook 也要等相册下一轮脏项枚举
+     * （真机实测 1~3 小时）才会被调到。
+     * 少这一步的后果很直接：装完新版本，日志里 {@code install_done} 明明打了，
+     * 备份却一动不动，看起来像"改坏了"，其实只是队列没起来。
+     */
+    public void resumeAfterHotReload() {
+        Logger.i("event=queue_resume reason=hot_reloaded");
+        mAppStarted = true;
+        ensureQueue();
+    }
+
     public void setConfig(Config config) {
         mConfig = config;
         UploadQueue queue = mQueue;

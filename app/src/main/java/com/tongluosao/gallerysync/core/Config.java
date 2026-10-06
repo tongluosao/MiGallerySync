@@ -54,6 +54,20 @@ public final class Config {
      */
     public static final String KEY_SKIP_EXISTING_REMOTE = "skip_existing_remote";
     /**
+     * 单个文件的体积上限，超过就**一个字节都不发**，直接跳过（{@code 0} = 不限）。
+     *
+     * <p>为挂载型后端（OpenList 挂移动云盘那一类）设的闸。真机实测这条链路上单个 PUT 是有
+     * 天花板的：2026-10-06 远端 4619 个对象里最大 493.8MB，超过 500MB 的一个都没有；同一个
+     * 1.32GB 视频当天试了 3 轮共 22 次，每次都是**整包发完之后**才失败（两次
+     * {@code 423 Locked}、一次读超时），对象从头到尾没出现过。
+     *
+     * <p>而失败后的重试代价与体积成正比：没有断点续传，每次重试都从 0 再发一遍完整请求体
+     * （那个 1.3GB 的文件一天白烧了约 10GB 上行，还占着 1/3 的并发槽位）。所以在客户端
+     * 设一道上限，比让它无限重试更省 —— 这些项**不会**被记成已上传，远端换上能收大文件的
+     * 存储之后把上限调大（或设 0）就会自动重来。
+     */
+    public static final String KEY_MAX_UPLOAD_BYTES = "max_upload_bytes";
+    /**
      * 把"已备份"的标记从相册的 {@code localFlag} 挪到模块自己按目标分开记录的本子上。
      *
      * <p>见 {@link #FLAG_MODE_PER_TARGET}。
@@ -109,6 +123,16 @@ public final class Config {
      */
     public static final String DEFAULT_REMOTE_LAYOUT = LAYOUT_ALBUM;
     public static final int DEFAULT_MAX_RETRY = 5;
+    /**
+     * 默认**不限**（0）。
+     *
+     * <p>这道闸是为"后端确定收不下大文件"准备的逃生口，不是默认策略：2026-10-06 那次 1.32GB
+     * 反复失败的根因最后落在服务端反向代理的超时上（nginx 之前 60s，已由用户调到 1800s），
+     * 客户端也跟着把读超时上限提到 30 分钟。在结论明确之前默认拦住大文件，
+     * 等于把用户想备份的视频永久挡在门外 —— 那比多传几次更糟。
+     * 真遇到收不下的后端，在设置页把这一项选成 200MB/500MB 即可。
+     */
+    public static final long DEFAULT_MAX_UPLOAD_BYTES = 0L;
     /** 默认与老版本写死的路数一致：升级后行为不变，想要更快在设置页自己调 */
     public static final int DEFAULT_UPLOAD_CONCURRENCY = 3;
     /** 上限压住连接数：再高对自建服务器与网盘网关都是压测，收益已经很小 */
@@ -135,6 +159,8 @@ public final class Config {
     private final String remoteRoot;
     private final boolean wifiOnly;
     private final int maxRetry;
+    /** 单文件体积上限（字节），0 = 不限，见 {@link #KEY_MAX_UPLOAD_BYTES} */
+    private final long maxUploadBytes;
     private final boolean uiMask;
     private final boolean verboseLog;
     private final String remoteLayout;
@@ -153,6 +179,7 @@ public final class Config {
             remoteRoot = DEFAULT_REMOTE_ROOT;
             wifiOnly = true;
             maxRetry = DEFAULT_MAX_RETRY;
+            maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES;
             uiMask = false;
             verboseLog = true;
             remoteLayout = DEFAULT_REMOTE_LAYOUT;
@@ -169,6 +196,7 @@ public final class Config {
             remoteRoot = prefs.getString(KEY_REMOTE_ROOT, DEFAULT_REMOTE_ROOT);
             wifiOnly = prefs.getBoolean(KEY_WIFI_ONLY, true);
             maxRetry = prefs.getInt(KEY_MAX_RETRY, DEFAULT_MAX_RETRY);
+            maxUploadBytes = readMaxUploadBytes(prefs);
             uiMask = prefs.getBoolean(KEY_UI_MASK, false);
             verboseLog = prefs.getBoolean(KEY_VERBOSE_LOG, true);
             remoteLayout = readLayout(prefs);
@@ -180,6 +208,22 @@ public final class Config {
             localFlagMode = readFlagMode(prefs);
             downloadEnabled = prefs.getBoolean(
                     KEY_DOWNLOAD_ENABLED, DEFAULT_DOWNLOAD_ENABLED);
+        }
+    }
+
+    /**
+     * 读单文件体积上限。
+     *
+     * <p>共享偏好是别的进程写进来的，值可能来自旧版本、手改的 XML 或写坏的配置，类型也可能
+     * 不是 long（例如被写成 int）。这里一律兜住：读不出来就用默认值，**不抛** ——
+     * 在构造器里抛出去等于整个配置解析失败，那会让上传队列起不来（表现成"备份不动了"），
+     * 代价远大于"上限用了默认值"。
+     */
+    private static long readMaxUploadBytes(SharedPreferences prefs) {
+        try {
+            return Math.max(prefs.getLong(KEY_MAX_UPLOAD_BYTES, DEFAULT_MAX_UPLOAD_BYTES), 0L);
+        } catch (Throwable t) {
+            return DEFAULT_MAX_UPLOAD_BYTES;
         }
     }
 
@@ -274,6 +318,11 @@ public final class Config {
         return maxRetry;
     }
 
+    /** 单文件体积上限（字节），0 = 不限。见 {@link #KEY_MAX_UPLOAD_BYTES} */
+    public long getMaxUploadBytes() {
+        return maxUploadBytes;
+    }
+
     public boolean isUiMask() {
         return uiMask;
     }
@@ -331,7 +380,19 @@ public final class Config {
                 + ", verifyAsync=" + verifyAsync
                 + ", skipRemote=" + skipExistingRemote
                 + ", flagMode=" + localFlagMode
+                + ", maxUpload=" + describeBytes(maxUploadBytes)
                 + ", download=" + downloadEnabled + "}";
+    }
+
+    /** 日志里用的体积文案，0 表示不限。别在这里引入本地化 —— 日志只给排查看 */
+    public static String describeBytes(long bytes) {
+        if (bytes <= 0) {
+            return "unlimited";
+        }
+        if (bytes % (1024L * 1024) == 0) {
+            return (bytes / (1024L * 1024)) + "MB";
+        }
+        return bytes + "B";
     }
 
     /** 只保留 scheme + host + port，避免凭据与路径出现在日志里 */

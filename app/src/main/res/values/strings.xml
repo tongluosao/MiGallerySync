@@ -96,4 +96,11 @@
     <string name="progress_unhealthy">WebDAV 暂不可用，正在退避重试；这些照片不会上传到小米云</string>
     <string name="progress_permission_denied">未授予相册读取权限，缩略图不可用（进度仍会更新）</string>
     <string name="action_grant_permission">授予权限</string>
+    <string name="label_max_upload_bytes">单文件上限</string>
+    <string name="summary_max_upload_bytes">超过这个大小的文件一个字节都不发，直接跳过（日志记 upload_skip_too_large）。给"挂网盘的后端收不下大文件"准备的逃生口，默认不限</string>
+    <string name="size_cap_unlimited">不限</string>
+    <string name="size_cap_200mb">200 MB</string>
+    <string name="size_cap_500mb">500 MB</string>
+    <string name="size_cap_1gb">1 GB</string>
+    <string name="size_cap_2gb">2 GB</string>
 </resources>

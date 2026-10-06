@@ -71,6 +71,9 @@ class SettingsModel : CoroutineScope {
     /** 并行路数，取值下标 = 路数 - 1，对应 [CONCURRENCY_ITEMS] */
     var concurrencyIndex by mutableStateOf(Config.DEFAULT_UPLOAD_CONCURRENCY - 1)
         private set
+    /** 单文件体积上限的选项下标，取值见 [SIZE_CAP_VALUES]，下标 0 = 不限 */
+    var maxUploadBytesIndex by mutableStateOf(SIZE_CAP_DEFAULT_INDEX)
+        private set
     var themeModeIndex by mutableStateOf(THEME_SYSTEM)
         private set
 
@@ -176,6 +179,15 @@ class SettingsModel : CoroutineScope {
     fun onConcurrencyChange(index: Int) {
         concurrencyIndex = index.coerceIn(0, CONCURRENCY_ITEMS.lastIndex)
         writeNow(Config.KEY_UPLOAD_CONCURRENCY, concurrencyIndex + 1)
+    }
+
+    /**
+     * 单文件体积上限。落盘的是**字节数**（0 = 不限），与 [SIZE_CAP_VALUES] 一一对应，
+     * 与并行路数那一项同一个套路：界面用下标，配置里存真值。
+     */
+    fun onMaxUploadBytesChange(index: Int) {
+        maxUploadBytesIndex = index.coerceIn(0, SIZE_CAP_VALUES.lastIndex)
+        writeNow(Config.KEY_MAX_UPLOAD_BYTES, SIZE_CAP_VALUES[maxUploadBytesIndex])
     }
 
     fun onThemeModeChange(index: Int) {
@@ -370,6 +382,9 @@ class SettingsModel : CoroutineScope {
         concurrencyIndex = concurrencyIndexOf(
             source.getInt(Config.KEY_UPLOAD_CONCURRENCY, Config.DEFAULT_UPLOAD_CONCURRENCY)
         )
+        maxUploadBytesIndex = sizeCapIndexOf(
+            readLong(source, Config.KEY_MAX_UPLOAD_BYTES, Config.DEFAULT_MAX_UPLOAD_BYTES)
+        )
         replaceModeIndex = modeIndexOf(source.getString(Config.KEY_REPLACE_MODE, Config.DEFAULT_REPLACE_MODE))
         themeModeIndex = source.getInt(KEY_THEME_MODE, THEME_SYSTEM).coerceIn(0, 2)
     }
@@ -408,6 +423,10 @@ class SettingsModel : CoroutineScope {
                 source.getInt(key, Config.DEFAULT_UPLOAD_CONCURRENCY)
             )
 
+            Config.KEY_MAX_UPLOAD_BYTES -> maxUploadBytesIndex = sizeCapIndexOf(
+                readLong(source, key, Config.DEFAULT_MAX_UPLOAD_BYTES)
+            )
+
             Config.KEY_REPLACE_MODE -> replaceModeIndex =
                 modeIndexOf(source.getString(key, Config.DEFAULT_REPLACE_MODE))
 
@@ -438,6 +457,7 @@ class SettingsModel : CoroutineScope {
                 is String -> editor.putString(key, value)
                 is Boolean -> editor.putBoolean(key, value)
                 is Int -> editor.putInt(key, value)
+                is Long -> editor.putLong(key, value)
             }
             editor.apply()
             writeFailed = false
@@ -493,6 +513,23 @@ class SettingsModel : CoroutineScope {
         /** 并行路数的选项文案，下标 = 路数 - 1 */
         val CONCURRENCY_ITEMS = (1..Config.MAX_UPLOAD_CONCURRENCY).map { it.toString() }
 
+        /**
+         * 单文件体积上限的落盘值（字节），顺序必须与界面下拉的文案一致：
+         * 不限（默认）/ 200MB / 500MB / 1GB / 2GB。
+         *
+         * <p>这里**不能**引用 [Config.DEFAULT_MAX_UPLOAD_BYTES]：那个默认值是"不限"（0），
+         * 而中间那几档是给用户手动收窄用的具体阈值，两者含义不同，混着写会撞出两个 0。
+         * 文案在 [SettingsScreen] 里用字符串资源拼，这里只管真值 —— 与并行路数同一个套路。
+         */
+        val SIZE_CAP_VALUES = listOf(
+            0L,
+            200L * 1024 * 1024,
+            500L * 1024 * 1024,
+            1024L * 1024 * 1024,
+            2L * 1024 * 1024 * 1024
+        )
+        val SIZE_CAP_DEFAULT_INDEX = SIZE_CAP_VALUES.indexOf(Config.DEFAULT_MAX_UPLOAD_BYTES).coerceAtLeast(0)
+
         const val THEME_SYSTEM = 0
         const val THEME_LIGHT = 1
         const val THEME_DARK = 2
@@ -525,6 +562,31 @@ class SettingsModel : CoroutineScope {
          */
         private fun concurrencyIndexOf(value: Int): Int {
             return Config.clampConcurrency(value) - 1
+        }
+
+        /**
+         * 读单文件体积上限。共享偏好里的类型不由我们保证（旧版本没有这个键，手改的 XML
+         * 也可能写成 int），所以读不出来就退回默认值 —— 与 [Config] 的读法保持一致。
+         */
+        private fun readLong(source: SharedPreferences, key: String, fallback: Long): Long {
+            return try {
+                source.getLong(key, fallback)
+            } catch (t: Throwable) {
+                fallback
+            }
+        }
+
+        /**
+         * 体积上限的落盘值 -> 下拉下标。
+         *
+         * <p>认不出来的一律落在**默认档**（500MB），而不是"不限"：这个值的另一侧是
+         * "每半小时白烧一个完整请求体"，宁可保守。手改的 XML 写了 300MB 这类中间值也会
+         * 显示成 500MB —— 真正生效的仍是那个 300MB（Config 读的是真值），
+         * 这里只影响下拉框显示的那一格。
+         */
+        private fun sizeCapIndexOf(value: Long): Int {
+            val index = SIZE_CAP_VALUES.indexOf(value)
+            return if (index >= 0) index else SIZE_CAP_DEFAULT_INDEX
         }
 
         /**

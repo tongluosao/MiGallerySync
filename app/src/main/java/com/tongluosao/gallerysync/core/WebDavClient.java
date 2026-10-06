@@ -65,7 +65,19 @@ public final class WebDavClient {
     private static final int READ_TIMEOUT_BASE = 30_000;
     /** 读超时按请求体上浮的分母：相当于给 64KB/s 的下限吞吐留够时间 */
     private static final int READ_TIMEOUT_PER_BYTE_MS = 64;
-    private static final int READ_TIMEOUT_MAX = 600_000;
+    /**
+     * 读超时的上限。
+     *
+     * <p>2026-10-06 从 10 分钟提到 30 分钟：这里卡的其实是"请求体发完之后，等服务器回第一个字节"。
+     * 挂载型后端要把整个请求体转存到网盘（移动云盘那条链路是异步落盘），1.3GB 这种量级处理几分钟
+     * 很正常；而反向代理那一层此前只有 60s，用户已在 nginx 上把超时调到 **1800s**。
+     * 客户端若还停在 600s，就会变成新的瓶颈 —— 明明服务器愿意等，我们先判超时，
+     * 而一次失败要重发整个请求体。两边取同一个数，30 分钟。
+     *
+     * <p>注意它只作用于**读**（`Socket.setSoTimeout`）：发送请求体那一段不受它管，
+     * 所以调大不会让"传一半卡住"的项更难退出。
+     */
+    private static final int READ_TIMEOUT_MAX = 1_800_000;
     /** 失败响应只取开头这么多字节进日志，够看清原因又不会把整页 HTML 灌进去 */
     private static final int DETAIL_LIMIT = 240;
     /**
@@ -76,9 +88,15 @@ public final class WebDavClient {
      * "PUT returned 2xx but the server has no such file"，重传 7 次仍然失败。
      * 隔一小会儿再问两轮，就能把"还没来得及落盘"和"服务器根本没写"分开。
      * 代价只在复核失败时付，正常路径一次都不等。
+     *
+     * <p>窗口长度是**按真机实测放大的**：早先是 3 轮 × 800ms（约 2.4 秒），而 2026-10-06 实测
+     * 同一条链路 40 分钟内 `no such file` 251 次、只成功 225 项，且其中一例（
+     * `IMG_20260625_183844.jpg`，expected=157142）在 PC 侧独立复核时**确实存在于远端、
+     * 长度分毫不差** —— 也就是"其实写成功了却被判失败"。2.4 秒对这条链路的落盘可见延迟太短，
+     * 现在逐级拉长到约 44 秒（1s→3s→10s→30s），且**只在还没落盘时才会等满**。
      */
-    private static final int VERIFY_ATTEMPTS = 3;
-    private static final long VERIFY_RETRY_DELAY = 800L;
+    private static final int VERIFY_ATTEMPTS = 5;
+    private static final long[] VERIFY_RETRY_DELAYS = {1_000L, 3_000L, 10_000L, 30_000L};
     /**
      * 解析失败时的重试次数与间隔。
      *
@@ -92,9 +110,19 @@ public final class WebDavClient {
      *
      * <p>默认那点额度（{@link #DETAIL_LIMIT} 级别）只够看错误原因，拿它列目录会被截断成
      * 半个 XML，解析出的名字是残缺的 —— 而"没看见这个名字"会让调用方把已经备份过的文件
-     * 再传一遍。一个目录上千项也就一百多 KB，给到 256KB 足够。
+     * 再传一遍。
+     *
+     * <p>**256KB 曾经是个错的上限（2026-10-06 实测）**：一条 {@code <D:response>} 里的
+     * href + resourcetype + getcontentlength + getlastmodified 约 300~400 字节，
+     * 于是 256KB 只够约 700 项；而真机上 {@code DCIM/Camera} 一个目录就有 **3257 个对象**
+     * （PROPFIND 响应 1MB 量级）。后果是**在最大的那个相册里 {@code list()} 永远返回 null**，
+     * "远端已有同名就跳过"这条优化一次都没生效过（日志里
+     * {@code upload_skip_remote_exists} 计数恒为 0），每个已备份的文件每轮同步都要重传一遍 ——
+     * 那个 1.35GB 的视频就是这么被反复重发、每次烧掉整份上行。
+     * 现在给到 8MB（约 2 万项），并保留"顶到额度就判截断"的自保：宁可退回逐文件判断，
+     * 也不拿半份名单当全部。
      */
-    private static final int LIST_BODY_LIMIT = 256 * 1024;
+    private static final int LIST_BODY_LIMIT = 8 * 1024 * 1024;
     private static final String PROPFIND_BODY =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
                     + "<propfind xmlns=\"DAV:\"><prop><getcontentlength/><resourcetype/>"
@@ -151,8 +179,15 @@ public final class WebDavClient {
      * 不必把回调一路穿过 {@code send/exchange} 的签名。
      */
     public interface ProgressListener {
-        /** @param sent 已写进 socket 的字节（不含响应） @param total 本次请求体的总字节 */
-        void onProgress(long sent, long total);
+        /**
+         * @param sent 已写进 socket 的字节（不含响应） @param total 本次请求体的总字节
+         * @throws IOException 抛出去就**中止这次发送**。这是"在传的大文件要立刻收手"的出口：
+         *                     热重载换代时旧队列已经被 shutdown，它没有理由再把剩下的几百 MB
+         *                     推上去（真机上见过新旧两代各传一遍同一个 1.3GB 文件，
+         *                     服务端对同一路径回 423 Locked）。每 64KB 回调一次，
+         *                     所以中止的粒度是 64KB，不是"等整个请求体传完"。
+         */
+        void onProgress(long sent, long total) throws IOException;
     }
 
     /** worker 线程写、自己读，跨线程可见性用 volatile */
@@ -192,7 +227,7 @@ public final class WebDavClient {
         long propSize = -1L;
         for (int attempt = 0; attempt < VERIFY_ATTEMPTS; attempt++) {
             if (attempt > 0) {
-                sleepQuietly(VERIFY_RETRY_DELAY);
+                sleepQuietly(verifyRetryDelay(attempt));
             }
 
             Res head = send("HEAD", remotePath, null, null, false);
@@ -739,7 +774,12 @@ public final class WebDavClient {
         return names;
     }
 
-    /** 远端目录里的一项：名字、是不是目录、有多大、什么时候改的 */
+    /**
+     * 远端目录里的一项：名字、是不是目录、有多大、什么时候改的。
+     *
+     * <p>{@code size} 是列目录时**顺手带回来的**（PROPFIND 本来就问了 getcontentlength），
+     * 所以"远端那一份是不是同一个文件"可以零成本判断 —— 见 {@code UploadQueue.remoteExists}。
+     */
     public static final class RemoteEntry {
         /** 名字（不含任何路径与尾斜杠）。{@code listNames} 会给目录补上尾斜杠 */
         public final String name;
@@ -907,6 +947,15 @@ public final class WebDavClient {
     private static long contentLengthOf(Res prop) {
         Matcher m = prop.body == null ? null : CONTENT_LENGTH.matcher(prop.body);
         return m != null && m.find() ? parseLong(m.group(1)) : -1L;
+    }
+
+    /**
+     * 第 {@code attempt} 轮复核之前的等待。下标越界就取最后一档 ——
+     * {@link #VERIFY_ATTEMPTS} 调大时不需要同步改数组，最坏也只是多等一档长间隔。
+     */
+    private static long verifyRetryDelay(int attempt) {
+        int index = Math.min(attempt - 1, VERIFY_RETRY_DELAYS.length - 1);
+        return VERIFY_RETRY_DELAYS[Math.max(index, 0)];
     }
 
     private static void sleepQuietly(long millis) {
@@ -1239,37 +1288,386 @@ public final class WebDavClient {
      * @return 解析不出来返回 null（调用方重试）
      */
     private static InetAddress resolveOnUsableNetwork(String host) {
-        Object network = pickUsableNetwork();
-        if (network != null) {
-            // 在目标网络上解析：Android 的每网络解析器据此选对 DNS
-            try {
-                java.lang.reflect.Method getAllByName = InetAddress.class
-                        .getMethod("getAllByName", String.class, Class.forName("android.net.Network"));
-                Object result = getAllByName.invoke(null, host, network);
-                if (result instanceof InetAddress[] && ((InetAddress[]) result).length > 0) {
-                    // 优先 IPv4：这台服务器的 A 记录稳定，而 AAAA 在链路 IPv6 打头时
-                    // 会给一个连不通的地址（实测过）
-                    InetAddress[] all = (InetAddress[]) result;
-                    for (InetAddress candidate : all) {
-                        if (candidate instanceof java.net.Inet4Address) {
-                            return candidate;
-                        }
-                    }
-                    return all[0];
+        // 按优先级把**所有**候选网络都试一遍，而不是只试挑出来的那一个。
+        // 真机 2026-10-06 实测：同一个 `Network.getAllByName` 在 13:27 还能解析出
+        // 40.115.217.137，13:50 起连续 `InvocationTargetException`（=那个网络这一刻解析不出来），
+        // 而设备上 Wi-Fi 本身是好的 —— 只试一个网络等于"挑错了就整批挂"。
+        // 逐个试的代价只是几次本地调用，换来的是"任一可用网络能解析就行"
+        List<Object> candidates = usableNetworks();
+        if (candidates.isEmpty()) {
+            logResolveTrouble("event=resolve_network_none"
+                    + " reason=" + (hostContext() == null ? "no_host_context" : "no_usable_network"));
+        }
+        for (Object network : candidates) {
+            InetAddress address = queryOnNetwork(network, host);
+            if (address != null) {
+                rememberGoodNetwork(network);
+                // 第一次成功要留一条：这条路径曾经是死代码而没人知道（见 queryOnNetwork），
+                // 只有"确实按网络解析成功过"这句话能让下次排查相信它
+                if (!sLoggedNetworkResolve) {
+                    sLoggedNetworkResolve = true;
+                    Logger.i("event=resolve_on_network_ok net=" + network
+                            + " host=" + host + " addr=" + address.getHostAddress());
                 }
-            } catch (Throwable t) {
-                // 这个网络解析不出来：换下一个（下面还会退回默认解析）
+                return address;
             }
         }
         try {
             return InetAddress.getByName(host);
+        } catch (Throwable t) {
+            logResolveTrouble("event=resolve_default_failed host=" + host + " detail=" + describe(t));
+        }
+        // 最后一条路：自己发一次 DNS 查询，**套接字绑在那个能出网的网络上**。
+        //
+        // 为什么前面两条（系统解析器）会全灭而这条能成：Android 的 DNS 会话是按**请求 UID 的
+        // 默认网络**建的，而本机这个 EasyTier VPN（tun1）用 `ip rule … uidrange 0-10295
+        // lookup tun1` 把相册 UID 10261 的默认网络抢走了，那张表**没有默认路由、DnsAddresses
+        // 也是空的**（真机原样：`DnsAddresses: [ ]`）。于是系统解析器返回 NODATA
+        // （"No address associated with hostname"），连"在 wlan0 这个 Network 上解析"那条
+        // 也走同一个按 UID 选默认网络的机制，照样 NODATA。
+        // 但**数据本身是出得去的**：真机上 `ping -I wlan0 223.5.5.5` 0% 丢包、
+        // `ping -I tun1 223.5.5.5` 100% 丢包、`ip route get <服务器IP> uid 10261` 走 wlan0。
+        // 所以只要把查询包绑到 wlan0 上发出去，答案就能拿到，之后连的也是 wlan0。
+        //
+        // 与"早先那版自写 DNS 查询已删除"的关系（AGENTS.md 里有记）：那一版的立场是"自己
+        // 解出 IP 也没用，包仍从空表发出去" —— 那个判断在当时成立，因为当时**没有**
+        // bindSocket。现在解析之后的建连一定会绑网络（见 bindSocketToUsableNetwork），
+        // 于是这条路是通的；它只作为系统解析器全部失败之后的**兜底**，不是主路径。
+        return resolveWithOwnQuery(host);
+    }
+
+    /** 兜底解析：自己构造一次 A 查询，绑网络发出去；拿不到返回 null */
+    private static InetAddress resolveWithOwnQuery(String host) {
+        // 上一轮凑效的（网络, DNS）先试：解析在每次建连时都会走一遍，不该每次都把
+        // 3 个网络 × 3 个服务器全试完（最坏 9 次超时，那是肉眼可见的卡顿）
+        Object first = sOwnQueryNetwork;
+        String firstServer = sOwnQueryServer;
+        if (first != null && firstServer != null) {
+            InetAddress hit = tryOwnQuery(first, firstServer, host);
+            if (hit != null) {
+                return hit;
+            }
+            sOwnQueryNetwork = null;
+            sOwnQueryServer = null;
+        }
+        for (Object network : usableNetworks()) {
+            for (String server : dnsServersFor(network, host)) {
+                InetAddress answer = tryOwnQuery(network, server, host);
+                if (answer != null) {
+                    sOwnQueryNetwork = network;
+                    sOwnQueryServer = server;
+                    return answer;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static InetAddress tryOwnQuery(Object network, String server, String host) {
+        try {
+            InetAddress answer = queryA(server, host, network);
+            if (answer != null) {
+                rememberGoodNetwork(network);
+                Logger.w("event=resolve_own_query_ok host=" + host
+                        + " dns=" + server + " addr=" + answer.getHostAddress());
+                return answer;
+            }
+        } catch (Throwable t) {
+            // 每次都可能失败，但原因必须留痕（否则又变成一条查不动的死路径）
+            logResolveTrouble("event=resolve_own_query_fail dns=" + server + " detail=" + describe(t));
+        }
+        return null;
+    }
+
+    /** 凑效过一次的兜底查询参数（网络 + DNS 服务器），下次先用它 */
+    private static volatile Object sOwnQueryNetwork;
+    private static volatile String sOwnQueryServer;
+
+    /**
+     * 该用哪些 DNS 服务器去问。
+     *
+     * <p>先问那个网络自己配的（{@code LinkProperties.getDnsServers()}，只取 IPv4 ——
+     * 这台设备的 Wi-Fi 把 IPv6 DNS 排在前面，而链路 IPv6 实测连接不通），
+     * 再补上两个国内公共解析作为兜底。**不写死单一地址**：那属于把用户的解析权交给一个
+     * 我们猜的服务器，而"网络自己配的"才是这台设备的本意。
+     */
+    private static List<String> dnsServersFor(Object network, String host) {
+        List<String> servers = new ArrayList<>();
+        try {
+            Object cm = connectivityManager();
+            if (cm != null) {
+                Object lp = cm.getClass()
+                        .getMethod("getLinkProperties", Class.forName("android.net.Network"))
+                        .invoke(cm, network);
+                if (lp != null) {
+                    Object list = lp.getClass().getMethod("getDnsServers").invoke(lp);
+                    if (list instanceof List) {
+                        for (Object one : (List<?>) list) {
+                            String text = String.valueOf(one);
+                            // InetAddress.toString() 是 "地址/字面量"，末尾那段才是字面量
+                            int slash = text.lastIndexOf('/');
+                            String literal = slash >= 0 ? text.substring(slash + 1) : text;
+                            if (literal.contains(".") && !servers.contains(literal)) {
+                                servers.add(literal);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // 拿不到就只用公共解析
+        }
+        for (String fallback : new String[]{"223.5.5.5", "119.29.29.29"}) {
+            if (!servers.contains(fallback)) {
+                servers.add(fallback);
+            }
+        }
+        return servers;
+    }
+
+    private static Object connectivityManager() {
+        Object context = hostContext();
+        if (context == null) {
+            return null;
+        }
+        try {
+            return context.getClass().getMethod("getSystemService", String.class)
+                    .invoke(context, "connectivity");
         } catch (Throwable t) {
             return null;
         }
     }
 
     /**
-     * 挑一个"能把包发到公网"的 {@code android.net.Network}。
+     * 发一次标准 A 查询（UDP，不重试、不递归处理），把 socket 绑在给定网络上。
+     *
+     * <p>查询报文只问 A 记录：这台服务器的 AAAA 在链路 IPv6 打头时会给一个连不通的地址，
+     * 我们要的从来只是那个 IPv4。
+     */
+    private static InetAddress queryA(String dnsServer, String host, Object network)
+            throws IOException {
+        byte[] query = buildDnsQueryA(host);
+        java.net.DatagramSocket socket = new java.net.DatagramSocket();
+        try {
+            if (network != null) {
+                try {
+                    network.getClass().getMethod("bindSocket", java.net.DatagramSocket.class)
+                            .invoke(network, socket);
+                } catch (Throwable t) {
+                    // 绑不上就按默认路由问；问了不应答自然会被下面判失败
+                }
+            }
+            socket.setSoTimeout(OWN_DNS_TIMEOUT);
+            java.net.DatagramPacket out = new java.net.DatagramPacket(query, query.length,
+                    InetAddress.getByName(dnsServer), 53);
+            socket.send(out);
+            byte[] buffer = new byte[512];
+            java.net.DatagramPacket in = new java.net.DatagramPacket(buffer, buffer.length);
+            socket.receive(in);
+            return firstAddressInDnsReply(in.getData(), in.getLength());
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            socket.close();
+        }
+    }
+
+    /** 拼一条递归查询 A 记录的 DNS 报文（ID 随机、RD=1） */
+    private static byte[] buildDnsQueryA(String host) {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        int id = (int) (System.nanoTime() & 0xFFFF);
+        out.write((id >> 8) & 0xFF);
+        out.write(id & 0xFF);
+        out.write(0x01); // flags 高字节：RD=1（要我递归）
+        out.write(0x00);
+        out.write(0x00); // QDCOUNT 高字节
+        out.write(0x01); // QDCOUNT 低字节
+        out.write(0x00); // ANCOUNT
+        out.write(0x00);
+        out.write(0x00); // NSCOUNT
+        out.write(0x00);
+        out.write(0x00); // ARCOUNT
+        out.write(0x00);
+        for (String label : host.split("\\.")) {
+            byte[] bytes = label.getBytes(StandardCharsets.US_ASCII);
+            out.write(Math.min(bytes.length, 63));
+            out.write(bytes, 0, Math.min(bytes.length, 63));
+        }
+        out.write(0x00); // 名字结束
+        out.write(0x00); // QTYPE 高字节
+        out.write(0x01); // QTYPE 低字节 = A
+        out.write(0x00); // QCLASS 高字节
+        out.write(0x01); // QCLASS 低字节 = IN
+        return out.toByteArray();
+    }
+
+    /**
+     * 从应答里取第一条 A 记录。
+     *
+     * <p>**必须跳过压缩指针**：answer 段的 Name 一般是 `0xC0 xx` 指向报文前面的名字，
+     * 不能当真名字去解析（早先那版就是在这里栽过）。做法是按"跳过名字"的规则走指针，
+     * 只认 type=1、class=1、长度=4 的 RDATA。
+     */
+    private static InetAddress firstAddressInDnsReply(byte[] data, int length) {
+        if (length < 12) {
+            return null;
+        }
+        int answers = ((data[6] & 0xFF) << 8) | (data[7] & 0xFF);
+        if (((data[3] & 0xFF) & 0x0F) != 0) {
+            return null; // RCODE 非 0：没有答案
+        }
+        int at = 12;
+        // 跳过 question 段：名字 + 4 字节（QTYPE/QCLASS）
+        at = skipDnsName(data, at, length);
+        if (at < 0) {
+            return null;
+        }
+        at += 4;
+        for (int i = 0; i < answers && at + 10 <= length; i++) {
+            at = skipDnsName(data, at, length);
+            if (at < 0 || at + 10 > length) {
+                return null;
+            }
+            int type = ((data[at] & 0xFF) << 8) | (data[at + 1] & 0xFF);
+            int klass = ((data[at + 2] & 0xFF) << 8) | (data[at + 3] & 0xFF);
+            int rdLength = ((data[at + 8] & 0xFF) << 8) | (data[at + 9] & 0xFF);
+            int rdAt = at + 10;
+            if (type == 1 && klass == 1 && rdLength == 4 && rdAt + 4 <= length) {
+                byte[] ip = {data[rdAt], data[rdAt + 1], data[rdAt + 2], data[rdAt + 3]};
+                try {
+                    return InetAddress.getByAddress(ip);
+                } catch (Throwable t) {
+                    return null;
+                }
+            }
+            at = rdAt + rdLength;
+        }
+        return null;
+    }
+
+    /** 按 DNS 名字的编码规则跳过一个名字（含压缩指针），返回下一个字段的偏移 */
+    private static int skipDnsName(byte[] data, int at, int length) {
+        while (at < length) {
+            int len = data[at] & 0xFF;
+            if (len == 0) {
+                return at + 1;
+            }
+            if ((len & 0xC0) == 0xC0) {
+                // 压缩指针：两个字节就是全部
+                return at + 2;
+            }
+            at += 1 + len;
+        }
+        return -1;
+    }
+
+    /**
+     * 在指定网络上解析域名（用**那个网络的** DNS，从而绕开 UID 路由送进去的那张空表）。
+     *
+     * <p>**这里的历史教训值得留着**：本方法原先只反射
+     * {@code InetAddress.getAllByName(String, android.net.Network)}，而真机（Android 16）上
+     * **根本没有这个方法** —— 2026-10-06 加了诊断日志才看见：
+     * <pre>
+     *   event=resolve_on_network_failed net=111
+     *   detail=java.lang.NoSuchMethodException: java.net.InetAddress.getAllByName
+     *          [class java.lang.String, class android.net.Network]
+     * </pre>
+     * 也就是说"每网络解析"这条修法从写下的那天起就是**死代码**：每次都静默抛异常、静默退回
+     * 默认解析（=正好是被 UID 路由坑掉的那条路）。它之所以长期看着"能用"，是因为
+     * {@link #addressFor} 会把解析结果缓存进实例 —— 碰巧成功过一次就一直用那个 IP，
+     * 直到 {@code dropConnection()} 清掉缓存、而 VPN 的 uidrange 恰好扩到相册的 UID 上
+     * （真机 11:20 那次），整批上传才同时崩掉。
+     *
+     * <p>所以现在按"确实存在"的顺序试：
+     * <ol>
+     *   <li>{@code Network.getAllByName(String)} —— **公开 API，API 30 起**，这就是正主
+     *       （Android 16 上实测存在；它内部失败会包成 {@code InvocationTargetException}）；</li>
+     *   <li>{@code InetAddress.getAllByName(String, Network)} —— 某些版本的隐藏入口，兼容用。</li>
+     * </ol>
+     * 都拿不到才由调用方退回默认解析（老设备、纯 JVM 回归环境走那条）。
+     *
+     * <p>结果里**优先 IPv4**：这台服务器的 A 记录稳定，而 AAAA 在链路 IPv6 打头时会给一个
+     * 连不通的地址（实测过）。
+     */
+    private static InetAddress queryOnNetwork(Object network, String host) {
+        try {
+            java.lang.reflect.Method getAllByName =
+                    network.getClass().getMethod("getAllByName", String.class);
+            InetAddress picked = firstIpv4(getAllByName.invoke(network, host));
+            if (picked != null) {
+                return picked;
+            }
+        } catch (Throwable t) {
+            // 老运行时（API < 30）没有这个方法：只留痕，不当失败。
+            // InvocationTargetException 要把**内层原因**挖出来，那才是"这个网络为什么解析不出来"
+            // （真机上外层只有一句 InvocationTargetException，看不出是 DNS 超时还是没配 DNS）
+            logResolveTrouble("event=resolve_network_failed net=" + network
+                    + " detail=" + describe(t));
+        }
+        try {
+            java.lang.reflect.Method hidden = InetAddress.class.getMethod(
+                    "getAllByName", String.class, Class.forName("android.net.Network"));
+            InetAddress picked = firstIpv4(hidden.invoke(null, host, network));
+            if (picked != null) {
+                return picked;
+            }
+        } catch (Throwable t) {
+            // 这个方法在多数版本上不存在，属于预期，不单独喊
+        }
+        return null;
+    }
+
+    /** 反射调用失败时把内层原因（InvocationTargetException 的 target）一起写出来 */
+    private static String describe(Throwable t) {
+        if (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null) {
+            Throwable cause = t.getCause();
+            return t.getClass().getSimpleName() + " -> " + cause.getClass().getName()
+                    + ": " + cause.getMessage();
+        }
+        return t.getClass().getName() + ": " + t.getMessage();
+    }
+
+    /** 从 {@code InetAddress[]} 里挑一个可用的，优先 IPv4；空/类型不对返回 null */
+    private static InetAddress firstIpv4(Object result) {
+        if (!(result instanceof InetAddress[])) {
+            return null;
+        }
+        InetAddress[] all = (InetAddress[]) result;
+        if (all.length == 0) {
+            return null;
+        }
+        for (InetAddress candidate : all) {
+            if (candidate instanceof java.net.Inet4Address) {
+                return candidate;
+            }
+        }
+        return all[0];
+    }
+
+    /**
+     * 解析出问题时的留痕，**每个方向每 30 秒最多一条**。
+     *
+     * <p>这是链路故障，失败是按项来的（真机上一轮就是 349 条同一条原因），
+     * 逐条打会把有用的行淹掉，而这条信息本身在这段时间里是重复的。
+     */
+    private static void logResolveTrouble(String message) {
+        long now = System.currentTimeMillis();
+        if (now - sLastResolveLogAt < RESOLVE_LOG_INTERVAL) {
+            return;
+        }
+        sLastResolveLogAt = now;
+        Logger.w(message);
+    }
+
+    private static volatile long sLastResolveLogAt;
+    private static final long RESOLVE_LOG_INTERVAL = 30_000L;
+    /** 兜底 DNS 查询的等待上限：超过这个时间没有应答就换下一个服务器/网络 */
+    private static final int OWN_DNS_TIMEOUT = 3_000;
+    /** "按网络解析成功过"只报一次，避免每次解析都写日志 */
+    private static volatile boolean sLoggedNetworkResolve;
+
+    /**
+     * 按优先级列出所有"能把包发到公网"的 {@code android.net.Network}。
      *
      * <p>规则（顺序就是优先级）：
      * <ol>
@@ -1282,26 +1680,34 @@ public final class WebDavClient {
      * 选它等于把包丢进黑洞。而用户真用 VPN 做全局代理时，那个 VPN 会带默认路由，
      * 第 3 条兜底仍然会选中它 —— 两种情况都不会错。
      *
+     * <p>**为什么返回一整个列表而不是一个**（真机 2026-10-06）：挑出来的那个网络**此刻**
+     * 可能解析不出来（Android 16 上 `Network.getAllByName` 会抛 InvocationTargetException，
+     * 日志里 13:50 起连续 5 次都是它），而设备上另一个网络是好的。解析时逐个试一遍，
+     * 代价只是几次本地调用；只试一个就等于"挑错了就整批挂"。
+     * 建连（{@code bindSocket}）只用一个，用列表里的第一个。
+     *
      * <p>反射访问 `ConnectivityManager`：模块注入在相册进程里，这些是 platform 类，
      * 但为了不给编译期引入 android.net 的较新 API 依赖（minSdk 28），走反射更稳。
-     * 拿不到就返回 null，调用方退回默认解析。
+     * 拿不到就返回空列表，调用方退回默认解析。
      */
-    private static Object pickUsableNetwork() {
+    private static List<Object> usableNetworks() {
+        // 上一轮成功的网络排到最前：绝大多数解析都不用再试第二个
+        List<Object> out = new ArrayList<>();
         try {
             Class<?> cmCls = Class.forName("android.content.Context");
             Object context = hostContext();
             if (context == null) {
-                return null;
+                return out;
             }
             Object cm = context.getClass().getMethod("getSystemService", String.class)
                     .invoke(context, "connectivity");
             if (cm == null) {
-                return null;
+                return out;
             }
             java.lang.reflect.Method getNetworks = cm.getClass().getMethod("getAllNetworks");
             Object[] networks = (Object[]) getNetworks.invoke(cm);
             if (networks == null || networks.length == 0) {
-                return null;
+                return out;
             }
             java.lang.reflect.Method getCaps =
                     cm.getClass().getMethod("getNetworkCapabilities", Class.forName("android.net.Network"));
@@ -1331,15 +1737,66 @@ public final class WebDavClient {
                 }
             }
             if (wifiFallback != null) {
-                return wifiFallback;
+                out.add(wifiFallback);
             }
-            if (internetFallback != null) {
-                return internetFallback;
+            if (internetFallback != null && internetFallback != wifiFallback) {
+                out.add(internetFallback);
             }
-            return vpnFallback;
+            if (vpnFallback != null) {
+                if (out.isEmpty()) {
+                    logResolveTrouble("event=net_pick_vpn_fallback networks=" + networks.length);
+                }
+                out.add(vpnFallback);
+            }
         } catch (Throwable t) {
-            return null;
+            logResolveTrouble("event=net_pick_failed detail=" + describe(t));
+            return out;
         }
+        Object lastGood = sLastGoodNetwork;
+        if (lastGood != null) {
+            int at = indexOfSameNetwork(out, lastGood);
+            if (at > 0) {
+                out.remove(at);
+                out.add(0, lastGood);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 挑一个"能把包发到公网"的网络（建连用：{@code Network.bindSocket} 只接受一个）。
+     *
+     * <p>就是 {@link #usableNetworks()} 的第一个；拿不到返回 null，调用方退回"不绑网络"。
+     */
+    private static Object pickUsableNetwork() {
+        List<Object> networks = usableNetworks();
+        return networks.isEmpty() ? null : networks.get(0);
+    }
+
+    /** 记下这次解析成功的网络，下次优先用它 */
+    private static void rememberGoodNetwork(Object network) {
+        sLastGoodNetwork = network;
+    }
+
+    private static volatile Object sLastGoodNetwork;
+
+    /** 两个 {@code Network} 是不是同一个网络（按 NetId 比，不依赖 toString 的格式） */
+    private static boolean sameNetwork(Object a, Object b) {
+        try {
+            java.lang.reflect.Method netId = a.getClass().getMethod("getNetId");
+            return netId.invoke(a).equals(netId.invoke(b));
+        } catch (Throwable t) {
+            return a.toString().equals(b.toString());
+        }
+    }
+
+    private static int indexOfSameNetwork(List<Object> networks, Object wanted) {
+        for (int i = 0; i < networks.size(); i++) {
+            if (sameNetwork(networks.get(i), wanted)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static boolean hasTransport(Object caps, String field) {
