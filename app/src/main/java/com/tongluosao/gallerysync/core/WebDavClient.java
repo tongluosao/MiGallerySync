@@ -340,6 +340,55 @@ public final class WebDavClient {
     }
 
     /**
+     * 只花几百字节问一句"这条路径现在被别人攥着写锁吗"。
+     *
+     * <p>为什么需要它（2026-10-06 真机实测）：OpenList 判写锁是**读完整个请求体之后**才做的，
+     * 所以一个被锁住的 PUT 会先把**整份文件**推上去，然后才收到 423。实测一个 605,134,181
+     * 字节的视频：16:45:45 开始、16:47:21 收到 423（`sent=605134181`，一个字节不差），
+     * 而这已经是**距上一次尝试 31 分钟**、没有任何并发的一次干净尝试 —— 说明锁不是我们自己
+     * 上次请求留下的，而是服务端那条路径上**攥着不放的锁**。之后 16:52 又白烧一份，
+     * 累计 1.2GB 上行换来两个 423。
+     *
+     * <p>关键观察：423 是**按路径**判的，而判锁这一步只需要读一个请求体 —— 那就用一个
+     * **0 字节**的 PUT 去踩它：被锁就立刻回 423（几乎不耗流量、也不耗时间），没锁就成功、
+     * 我们把那个 0 字节对象顺手删掉。这样"探一次"的成本从"一整个文件"降到"一个空请求"。
+     *
+     * <p>注意它**不能**替代真正的上传，也**不能**用来判"传成功了"：它只回答锁的问题。
+     * 0 字节对象与真实文件同名，但它的大小是 0，而复核走的是"名字 + 大小都相等"，
+     * 所以留着它也绝不会让后续把真实文件误判成"已经传过"。
+     *
+     * @return true 表示"这条路径被锁着"（探针自己收到 423）；探测本身失败会抛异常，
+     *         由调用方按普通失败处理 —— 探测失败**不等于**路径被锁
+     */
+    public boolean probeLocked(String remotePath) throws IOException {
+        // **先确认这个路径上没有真东西**：0 字节 PUT 会覆盖同名对象，而"同名不同大小"
+        // 在备份目录里是真实存在的（相册重命名、同一张图被两个条目引用）。
+        // 如果远端已经躺着一份别的东西，探测就必须让路 —— 宁可让调用方按老办法烧一整份
+        // 上行，也绝不能用一个探针把用户已经备份好的照片覆盖成 0 字节。
+        //
+        // 判据取"**服务器明确说没有**"（-1），而不是"有"：remoteSize 用 0 表示
+        // "存在但大小问不出来"，那种含糊状态下删掉它同样是在毁用户的数据。
+        // 只有确凿的"不存在"才允许探。问不出来（抛异常）也一律不探，由调用方处理。
+        long existing = remoteSize(remotePath);
+        if (existing != -1L) {
+            Logger.d("event=probe_skipped_existing path=" + remotePath + " remote=" + existing);
+            return false;
+        }
+        Res res = putWithDirFallback(remotePath, null, new byte[0]);
+        if (res.code == 423) {
+            return true;
+        }
+        requireSuccess(res, "PUT", remotePath);
+        // 探针对象用完就收拾掉；删不掉不影响结论（0 字节，且复核比大小，不会造成误判）
+        try {
+            send("DELETE", remotePath, null, null, false);
+        } catch (Throwable t) {
+            Logger.d("event=probe_cleanup_failed path=" + remotePath + " detail=" + t);
+        }
+        return false;
+    }
+
+    /**
      * 把一个远端对象下载到本地文件。
      *
      * <p>先写同目录下的 {@code <名字>.download.tmp}，整份收完、长度对上之后才
@@ -1205,12 +1254,16 @@ public final class WebDavClient {
         } else if (chunked) {
             // 分块也要读完：读到 0 长度块为止，之后边界是干净的，连接一样能接着用。
             // 不读就复用，下一条响应会从半截数据开始解析
-            snippet = readChunked(reader, cap);
-            drainable = true;
+            // 但"读完了"必须由这一次读自己作证 —— 它中途超时/遇到解析不了的长度行就退出了，
+            // 那种情况下面不能再算干净（见 Drain 的注释）
+            Drain drain = readChunkedChecked(reader, cap);
+            snippet = drain.text;
+            drainable = drain.clean;
         } else if (contentLength > 0L) {
             // 有确切长度就能排空，多长的体都不影响复用
-            snippet = readCapped(reader, contentLength, cap);
-            drainable = true;
+            Drain drain = readCappedChecked(reader, contentLength, cap);
+            snippet = drain.text;
+            drainable = drain.clean;
         } else if (contentLength == 0L) {
             snippet = "";
             drainable = true;
@@ -2147,6 +2200,115 @@ public final class WebDavClient {
             Logger.d("event=chunk_read_failed collected=" + log.length());
         }
         return log.toString();
+    }
+
+    /**
+     * 排空的结果：日志用的开头一段，以及**这次排空到底有没有走到干净边界**。
+     *
+     * <p>为什么要这个标志（2026-10-06 真机实证）：早先两个排空函数都把异常吞掉然后照常返回，
+     * 调用方无条件认为"体读完了、连接可以复用"。可实际上中途超时、遇到解析不了的分块长度行、
+     * 或对端断开时，**响应体还剩一截留在 socket 缓冲里**；下一个请求从那里开始读，
+     * 读到的就是残留字节 —— 真机日志里表现为
+     * {@code conn_reopen reason=malformed status line: 8c37}（这是一行**分块长度**）、
+     * {@code 10000}（同样）、以及一大段 {@code </D:propstat></D:response>} 的 XML 尾巴（一次被截断的
+     * PROPFIND 列表）。一天里这类被迫重开有 **251 次**，每一次都白费一条连接和一次请求。
+     * 所以排空必须自己作证：只有真正读到了终点才算干净，否则把这个连接丢掉重来。
+     */
+    private static final class Drain {
+        final String text;
+        final boolean clean;
+
+        Drain(String text, boolean clean) {
+            this.text = text == null ? "" : text;
+            this.clean = clean;
+        }
+    }
+
+    /** 按 Content-Length 排空并如实报告是否读完 */
+    private static Drain readCappedChecked(BufferedReader reader, long bodyLen, int cap) {
+        int want = (int) Math.min(bodyLen, cap);
+        char[] buf = new char[Math.max(want, 0)];
+        int total = 0;
+        try {
+            while (total < want) {
+                int n = reader.read(buf, total, want - total);
+                if (n < 0) {
+                    // 还没到声明的长度就 EOF：体是残的
+                    return new Drain(new String(buf, 0, total), false);
+                }
+                total += n;
+            }
+            long remaining = bodyLen - total;
+            while (remaining > 0) {
+                long skipped = reader.skip(remaining);
+                if (skipped <= 0) {
+                    return new Drain(new String(buf, 0, total), false);
+                }
+                remaining -= skipped;
+            }
+        } catch (Throwable t) {
+            // 排空失败不改这次请求的结论，但绝对不能再让这条连接被复用
+            Logger.d("event=body_drain_failed read=" + total + "/" + bodyLen);
+            return new Drain(new String(buf, 0, total), false);
+        }
+        return new Drain(new String(buf, 0, total), true);
+    }
+
+    /** 分块排空并如实报告是否读到终止块 */
+    private static Drain readChunkedChecked(BufferedReader reader, int cap) {
+        StringBuilder log = new StringBuilder();
+        try {
+            while (true) {
+                String sizeLine = reader.readLine();
+                if (sizeLine == null) {
+                    return new Drain(log.toString(), false);
+                }
+                int semi = sizeLine.indexOf(';');
+                String hex = (semi >= 0 ? sizeLine.substring(0, semi) : sizeLine).trim();
+                long size;
+                try {
+                    size = Long.parseLong(hex, 16);
+                } catch (Throwable t) {
+                    Logger.d("event=chunk_size_unparsable line=" + sizeLine);
+                    return new Drain(log.toString(), false);
+                }
+                if (size == 0L) {
+                    // 0 长度块后面是拖尾头，读到空行才是真正的终点
+                    String line;
+                    while ((line = reader.readLine()) != null && !line.isEmpty()) {
+                        // 拖尾头不关心
+                    }
+                    return new Drain(log.toString(), line != null);
+                }
+                long remaining = size;
+                while (remaining > 0) {
+                    int want = (int) Math.min(remaining, 4096);
+                    char[] buf = new char[want];
+                    int total = 0;
+                    while (total < want) {
+                        int n = reader.read(buf, total, want - total);
+                        if (n < 0) {
+                            break;
+                        }
+                        total += n;
+                    }
+                    if (total <= 0) {
+                        return new Drain(log.toString(), false);
+                    }
+                    if (log.length() < cap) {
+                        log.append(buf, 0, Math.min(total, cap - log.length()));
+                    }
+                    remaining -= total;
+                }
+                // 块数据后面的 CRLF
+                if (reader.readLine() == null) {
+                    return new Drain(log.toString(), false);
+                }
+            }
+        } catch (Throwable t) {
+            Logger.d("event=chunk_read_failed collected=" + log.length());
+            return new Drain(log.toString(), false);
+        }
     }
 
     private static String oneLine(String raw) {

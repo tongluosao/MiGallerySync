@@ -85,25 +85,54 @@ public final class UploadQueue {
     /** 同一条路径反复撞锁时的间隔上限，与 {@link #RETRY_GIVE_UP_MAX} 一致（6 小时） */
     private static final long PATH_LOCK_MAX_DELAY = 6 * 60 * 60_000L;
     /**
+     * 估"这条锁大概还要攥多久"时用的速率：**0.4MB/s，取实测最坏那一档**。
+     *
+     * <p>依据（2026-10-06 服务端 + 客户端双侧实测）：锁在"服务器把整份文件推给移动云盘"
+     * 期间一直被攥着，而那一档的吞吐是 605MB → 约 24 分钟、1.32GB → 实测 56m30s
+     * （≈0.42MB/s）；只有 1GB 以下的文件才量到 3.9MB/s。
+     * 取最坏档 = 宁可多等，绝不再白烧一份上行。
+     */
+    private static final long PATH_LOCK_RATE_BYTES_PER_SEC = 400L * 1024L;
+    /**
+     * 按大小估出来的等待上限。取 60 分钟而不是 30：实测 1.32GB 那笔锁了 56m30s，
+     * 卡在 30 分钟会让它下一次仍然撞在锁上 —— 而那一撞的代价是一整份 1.32GB。
+     * 60 分钟能盖住实测最大的那一档，再大的文件靠后面的翻倍档继续拉开。
+     */
+    private static final long PATH_LOCK_GUESS_MAX = 60 * 60_000L;
+    /**
+     * 多大的文件值得在发送前先花几百字节探一次锁。
+     *
+     * <p>0 字节探针换来的是"不必白烧一整份文件"，所以门槛越低越省流量；但每一项都探
+     * 就多一次往返。取 4MB：这个量级以下最坏损失只有几 MB，而它以上一次白烧就是几十
+     * 到几百 MB。已经撞过锁的路径**无视**这个门槛（见上传前的 worthProbing）。
+     */
+    private static final long PATH_LOCK_PROBE_MIN_BYTES = 4L * 1024 * 1024;
+    /**
      * 撞锁后至少要等多久才值得再试一次 —— **按这一项的大小算**。
      *
-     * <p>由头是那条链路的实测吞吐：185MB 的那个视频整份传完花了约 3 分钟，
-     * 1.32GB 的传完花了 56 分钟。也就是说**服务器要先收完整份请求体才可能回 201**，
-     * 锁的释放时间跟文件大小成正比。文件的远端那一份一旦存在，这个大小在下面的
-     * `remoteSize` 里也会被认出来。
-     *
-     * <p>算法（当前档 + 翻倍档，结构上限与上面两个常量一致）：
+     * <p>为什么必须按大小算（2026-10-06 实测的完整机制）：OpenList 判写锁是在**读完请求体
+     * 之后**，然后才把整份文件推给移动云盘 —— 也就是说**锁是在"推给网盘"这段时间里被攥着的**，
+     * 而这段时间与文件大小成正比。实测两个数据点：
      * <pre>
-     *   每档 = max(5 分钟, 这一项大小 / 1.5MB/s)，上限 30 分钟
-     *   第 1 次撞锁 = 当前档；之后每撞一次再翻一倍，到 6 小时封顶
+     *   605,134,181 字节（605MB）: 一整个请求体发完约 80 秒，但锁要等到网盘收完才放，
+     *                             按实测 0.42MB/s 算约 24 分钟
+     *   1,416,598,318 字节（1.32GB）: 服务器日志记着那笔持锁 **56m30s** 才回 201
+     *   而小的（200MB）只要 41 秒就整个完成
      * </pre>
-     * 1.5MB/s 取得比实测中位数低（实测 3.9MB/s 那档是小文件，1.32GB 那档跌到 0.42MB/s），
-     * 低意味着"宁愿多等一会儿，也不再白烧一份上行"—— 这是有意的取向：等一会儿只花时间，
-     * 白烧一份 1.32GB 既花时间又占满一条上行。
+     * 于是出现了最要命的一种自撞：**我们自己的上一次尝试就是锁的持有者**。
+     * 605MB 那项 14:10:30 发完整份后去推网盘（要 20 多分钟），而普通退避 15~30 秒就把
+     * 第二次尝试送上去了 —— 第二次发完 605MB，正好撞上第一次还没放掉的锁，回 423。
+     * 14:10 到 14:20 的 5 次重试就是这么串起来的：**每一次都在撞上一次的自己**，
+     * 白烧 3.0GB，远端一个字节都没多。
+     *
+     * <p>所以这里的速率必须按**最坏**的那档取，而不是平均值（实测 3.9MB/s 那档是 1GB 以下的
+     * 小文件；一旦到 1.3GB 就掉到 0.42MB/s）。取 0.4MB/s 的后果是"有可能多等几分钟"，
+     * 取乐观值的后果是"必然再白烧一整份上行" —— 前者只花时间，后者花时间又占满上行，
+     * 所以取向很明确：宁可多等。
      */
     private static long firstPathLockDelay(long size) {
-        long guess = size / (3L * 1024 * 1024 / 2);   // 1.5MB/s
-        return Math.min(Math.max(guess, PATH_LOCK_FIRST_DELAY), 30 * 60_000L);
+        long guess = size / PATH_LOCK_RATE_BYTES_PER_SEC;   // 0.4MB/s，实测最坏档
+        return Math.min(Math.max(guess, PATH_LOCK_FIRST_DELAY), PATH_LOCK_GUESS_MAX);
     }
 
     /**
@@ -1092,6 +1121,30 @@ public final class UploadQueue {
                     finalizeOk(task, config, remotePath, "remote_exists");
                     return;
                 }
+                // 发字节之前先花几百字节问一句"这条路径被锁着吗"。
+                //
+                // 为什么必须先问（2026-10-06 真机实测，代价 1.2GB 上行）：OpenList 判写锁是
+                // **读完整个请求体之后**才做的，所以被锁的 PUT 一定先把整份文件推完才收到 423。
+                // 那个 605,134,181 字节的视频：16:45:45 起、16:47:21 收到 423（sent=605134181），
+                // 而这是距上次尝试 31 分钟、无任何并发的一次干净尝试 —— 锁在**服务端那条路径**上
+                // 握着不放，与我们的重试间隔毫无关系；16:52 又白烧一份。累计 1.2GB 换两个 423。
+                //
+                // 423 是按路径判的，判锁只需要一个请求体 —— 那就用 **0 字节**的 PUT 去踩：
+                // 锁着就立刻回 423（几乎不耗流量与时间），没锁就成功、顺手删掉那个空对象。
+                // 于是"探一次"的成本从"一整个文件"降到"一个空请求"。
+                //
+                // 只对**大文件**或**已经撞过锁的路径**做：小文件最坏也只是白烧几百 KB，
+                // 不值得为每一项都加一次往返。探测自身失败按普通失败处理（抛出去走重试），
+                // 绝不把"问不出来"当成"被锁"，否则一次网络抖动就会让这一项无故等上几分钟。
+                boolean worthProbing = task.size >= PATH_LOCK_PROBE_MIN_BYTES
+                        || mPathLockStrikes.containsKey(task.path);
+                if (worthProbing && client.probeLocked(remotePath)) {
+                    Logger.w("event=upload_path_locked_probe path=" + task.path
+                            + " remote=" + remotePath + " size=" + task.size
+                            + " note=body_not_sent");
+                    throw new PathLockedException("PUT " + remotePath
+                            + " failed code=423 server=Locked (zero-byte probe)");
+                }
                 // 每 64KB 一块回调，下游按 500ms 节流后才发广播 —— lambda 每任务只建一次，
                 // 不在那个循环里分配对象。
                 // 顺带在这里当"急停闸"：热重载换代时 shutdown() 已经把 mRunning 置假并关连接，
@@ -1401,6 +1454,19 @@ public final class UploadQueue {
     }
 
     /**
+     * "这条路径被锁着"——由**零字节探针**判出来的，一个字节的正文都没发。
+     *
+     * <p>单独一个类型是为了让日志与统计能把它和"真的发了整份文件才收到 423"分开：
+     * 后者白烧了一整份上行，前者只花了一个空请求。两者都进
+     * {@link #schedulePathLocked}，但只有前者是"没有代价的等待"。
+     */
+    private static final class PathLockedException extends IOException {
+        PathLockedException(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * 这次失败是不是"远端那条路径正被别人写"（HTTP 423 Locked）。
      *
      * <p>为什么不按普通失败重试（2026-10-06 真机实测，代价很大）：OpenList 的 WebDAV 是
@@ -1417,7 +1483,10 @@ public final class UploadQueue {
      * 失败当"重试就好了"，正是它把 5 次机会在 11 分钟内全部用光。
      */
     private static boolean isPathLocked(Throwable error) {
-        Throwable cursor = error;
+        if (error instanceof PathLockedException) {
+            // 探针判出来的，确定无疑，不必再走字符串匹配
+            return true;
+        }        Throwable cursor = error;
         for (int depth = 0; cursor != null && depth < 8; depth++) {
             String msg = cursor.getMessage();
             if (msg != null) {
