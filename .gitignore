@@ -1,15 +1,42 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# 本文件是**仓库根**的忽略规则（仓库根 = Gradle 工程根，即这个目录）。
+# 历史见 AGENTS.md「两个"根"」：2026-10-06 之前仓库根在工作区根，那时这些规则分两处写
+# （工作区根那份负责 反编译源码/ 原安装包/ 参考代码/ .tmp-debug/，本目录这份只有 IDE 那几行）。
+# 现在那些目录都在仓库之外，规则没必要再留；但工作区根下**不会**再有任何仓库，
+# 所以凡是将来可能落进这一层的构建产物、缓存、日志、密钥，都要在这里挡住。
+
+# ---- 构建产物与缓存 ----
+build/
+.gradle/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.dex
+*.class
+*.hprof
+
+# ---- 本机配置与 IDE ----
 local.properties
+.idea/
+*.iml
+
+# ---- 崩溃转储与日志 ----
+hs_err_pid*.log
+replay_pid*.log
+java_pid*.hprof
+*.log
+
+# ---- 签名材料（本项目用 debug 签名，但别让任何密钥进版本库）----
+*.jks
+*.keystore
+*.p12
+*.pem
+*.der
+*.pk8
+*.pk12
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
