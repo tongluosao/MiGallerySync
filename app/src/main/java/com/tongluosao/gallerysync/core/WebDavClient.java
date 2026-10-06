@@ -80,6 +80,14 @@ public final class WebDavClient {
     private static final int VERIFY_ATTEMPTS = 3;
     private static final long VERIFY_RETRY_DELAY = 800L;
     /**
+     * 解析失败时的重试次数与间隔。
+     *
+     * <p>代理 VPN 掐住每网络解析器时，NODATA 常常是一次性的；短暂重试能捞回相当一部分。
+     * 三次之间共等 1.5 秒 —— 队列本来就在退避，这点等待比整项失败便宜得多。
+     */
+    private static final int RESOLVE_ATTEMPTS = 3;
+    private static final long RESOLVE_RETRY_DELAY = 700L;
+    /**
      * 目录列表（PROPFIND Depth 1）响应体的上限。
      *
      * <p>默认那点额度（{@link #DETAIL_LIMIT} 级别）只够看错误原因，拿它列目录会被截断成
@@ -1179,15 +1187,221 @@ public final class WebDavClient {
      * 相册进程里却连续抛 UnknownHostException（Java 把 EAI_AGAIN 这类临时失败也报成这个），
      * 整条队列因此空转。目标在一次备份里不会变，缓存住地址就不会被这种抖动打断。
      * 连不上时 dropConnection() 会把它清掉，下次重新解析，IP 真的变了也跟得上。
+     *
+     * <p><b>为什么要重试、为什么要回退到系统属性里的 DNS</b>：2026-10-05 实测到更严重的一档 ——
+     * 相册进程连续抛出 4607 次 `UnknownHostException: No address associated with hostname`，
+     * 而**同一时刻**设备 shell 侧 `busybox nslookup` 10/10 成功、`nc -z host 443` 10/10 成功。
+     * 差在两边用的解析器不同：shell 走默认网络，而相册 UID 被代理 VPN（EasyTier）接管，
+     * Android 的**每网络解析器**按应用所在网络的 DNS 列表解析，VPN 那个 `DnsAddresses`
+     * 对这类查询回 NODATA（NODATA ≠ NXDOMAIN，所以 Java 报的是
+     * `No address associated with hostname` 而不是 `Unknown host`）。
+     *
+     * <p>所以这里做两件事：
+     * <ol>
+     *   <li>**瞬时失败重试**：解析失败隔一小会儿再来，NODATA 常常是一次性的；</li>
+     *   <li>**回退到系统属性里的 DNS**：{@code net.dns1/net.dns2} 是**当前默认网络**的解析器
+     *       （实测能正确答出这个主机名）。自己发一次标准 DNS 查询，绕开那个坏掉的每网络解析器。</li>
+     * </ol>
+     * 两级都失败才把异常抛出去 —— 那时确实是目标或链路的问题，交给队列的退避去处理。
      */
     private InetAddress addressFor(String host) throws IOException {
         if (mResolvedAddress != null && host.equals(mResolvedHost)) {
             return mResolvedAddress;
         }
-        InetAddress address = InetAddress.getByName(host);
-        mResolvedHost = host;
-        mResolvedAddress = address;
-        return address;
+        IOException last = null;
+        for (int attempt = 0; attempt < RESOLVE_ATTEMPTS; attempt++) {
+            if (attempt > 0) {
+                sleepQuietly(RESOLVE_RETRY_DELAY);
+            }
+            try {
+                InetAddress address = InetAddress.getByName(host);
+                mResolvedHost = host;
+                mResolvedAddress = address;
+                return address;
+            } catch (IOException e) {
+                last = e;
+            }
+            // 每网络解析器答不出来时，试一次"直接问系统 DNS"。
+            // 成功就缓存，后面所有请求都走这个 IP
+            InetAddress viaSystem = resolveViaSystemDns(host);
+            if (viaSystem != null) {
+                Logger.i("event=resolve_via_system_dns host=" + host
+                        + " ip=" + viaSystem.getHostAddress());
+                mResolvedHost = host;
+                mResolvedAddress = viaSystem;
+                return viaSystem;
+            }
+        }
+        throw last != null ? last : new IOException("cannot resolve " + host);
+    }
+
+    /**
+     * 直接向系统属性里记的 DNS 发一次 A 查询。绕开 Android 的每网络解析器。
+     *
+     * <p>只解析 A 记录（IPv4）：这台服务器的 A 记录一直存在且稳定，而 AAAA 在部分链路上
+     * 会返回一个连不通的地址（实测链路是 IPv6 打头的 Wi-Fi DNS + 一条只带 /32 的 VPN 路由）。
+     * 拿不到 A 记录就返回 null，由调用方按"这一趟没解析出来"处理。
+     */
+    private static InetAddress resolveViaSystemDns(String host) {
+        for (String key : new String[]{"net.dns1", "net.dns2", "net.dns3"}) {
+            String server = systemProperty(key);
+            if (server == null || server.trim().isEmpty()) {
+                continue;
+            }
+            String ip = server.trim();
+            // net.dns* 在部分设备上带方括号（IPv6 字面量）；这里只用来做 IPv4 DNS 的地址，
+            // 带冒号的直接跳过 —— 那条路本来就不稳
+            if (ip.indexOf(':') >= 0 || ip.indexOf('[') >= 0) {
+                continue;
+            }
+            try {
+                InetAddress answer = dnsQueryA(ip, host, 3000);
+                if (answer != null) {
+                    return answer;
+                }
+            } catch (Throwable t) {
+                // 换下一个 DNS 服务器
+            }
+        }
+        return null;
+    }
+
+    /** 读一个系统属性；拿不到返回 null（不抛） */
+    private static String systemProperty(String key) {
+        try {
+            Class<?> cls = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method get = cls.getDeclaredMethod("get", String.class);
+            get.setAccessible(true);
+            Object value = get.invoke(null, key);
+            return value instanceof String ? (String) value : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 极简 DNS A 查询：一条 UDP 报文，够手写。
+     *
+     * <p>为什么不用 {@code dnsjava} 之类：注入进相册进程的 dex 里多一个库就多一份与宿主
+     * 冲突的风险（见「WebDAV 通路」里为什么不用现成 WebDAV 库那一段），而这里要的只是
+     * "把域名换成 IPv4"，几十行就够。
+     */
+    private static InetAddress dnsQueryA(String serverIp, String host, int timeoutMs) {
+        java.net.DatagramSocket socket = null;
+        try {
+            // 事务 ID 随便取，反正一条请求一条响应
+            int txId = 0x4D47; // "MG"
+            byte[] query = buildDnsQuery(txId, host);
+            socket = new java.net.DatagramSocket();
+            socket.setSoTimeout(timeoutMs);
+            java.net.DatagramPacket out = new java.net.DatagramPacket(
+                    query, query.length, InetAddress.getByName(serverIp), 53);
+            socket.send(out);
+            byte[] buf = new byte[512];
+            java.net.DatagramPacket in = new java.net.DatagramPacket(buf, buf.length);
+            socket.receive(in);
+            return parseFirstA(in.getData(), in.getLength(), txId);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+    }
+
+    /** 组一条标准查询报文：RD=1，单问题，QType=A */
+    private static byte[] buildDnsQuery(int txId, String host) {
+        String[] labels = host.split("\\.");
+        int len = 12 + 1;
+        for (String label : labels) {
+            len += 1 + label.length();
+        }
+        len += 4; // QType + QClass
+        byte[] out = new byte[len];
+        int p = 0;
+        out[p++] = (byte) (txId >> 8);
+        out[p++] = (byte) txId;
+        out[p++] = 0x01; // RD
+        out[p++] = 0x00;
+        out[p++] = 0x00; // QDCOUNT=1
+        out[p++] = 0x01;
+        out[p++] = 0x00; // ANCOUNT=0
+        out[p++] = 0x00;
+        out[p++] = 0x00; // NSCOUNT=0
+        out[p++] = 0x00;
+        out[p++] = 0x00; // ARCOUNT=0
+        out[p++] = 0x00;
+        for (String label : labels) {
+            out[p++] = (byte) label.length();
+            for (int i = 0; i < label.length(); i++) {
+                out[p++] = (byte) label.charAt(i);
+            }
+        }
+        out[p++] = 0x00;   // root label
+        out[p++] = 0x00;   // QType A (1)
+        out[p++] = 0x01;
+        out[p++] = 0x00;   // QClass IN (1)
+        out[p++] = 0x01;
+        return out;
+    }
+
+    /** 从响应里取第一条 A 记录；没有就返回 null（压缩指针只解到够用的程度） */
+    private static InetAddress parseFirstA(byte[] data, int length, int txId) {
+        if (length < 12) {
+            return null;
+        }
+        int id = ((data[0] & 0xFF) << 8) | (data[1] & 0xFF);
+        if (id != txId) {
+            return null;
+        }
+        int rcode = data[3] & 0x0F;
+        if (rcode != 0) { // 只认 NOERROR；NXDOMAIN/NODATA 都不是我们要的答案
+            return null;
+        }
+        int qd = ((data[4] & 0xFF) << 8) | (data[5] & 0xFF);
+        int an = ((data[6] & 0xFF) << 8) | (data[7] & 0xFF);
+        int p = 12;
+        // 跳过问题段
+        for (int i = 0; i < qd && p < length; i++) {
+            p = skipName(data, p, length);
+            p += 4;
+        }
+        for (int i = 0; i < an && p + 10 <= length; i++) {
+            p = skipName(data, p, length);
+            if (p + 10 > length) {
+                return null;
+            }
+            int type = ((data[p] & 0xFF) << 8) | (data[p + 1] & 0xFF);
+            int rdlen = ((data[p + 8] & 0xFF) << 8) | (data[p + 9] & 0xFF);
+            p += 10;
+            if (type == 1 && rdlen == 4 && p + 4 <= length) {
+                byte[] addr = new byte[]{(byte) (data[p] & 0xFF), (byte) (data[p + 1] & 0xFF),
+                        (byte) (data[p + 2] & 0xFF), (byte) (data[p + 3] & 0xFF)};
+                try {
+                    return InetAddress.getByAddress(addr);
+                } catch (Throwable t) {
+                    return null;
+                }
+            }
+            p += rdlen;
+        }
+        return null;
+    }
+
+    /** 跳过域名：处理 0x00 结尾与 0xC0 压缩指针两种情况 */
+    private static int skipName(byte[] data, int p, int length) {
+        while (p < length) {
+            int b = data[p] & 0xFF;
+            if (b == 0) {
+                return p + 1;
+            }
+            if ((b & 0xC0) == 0xC0) {
+                return p + 2;
+            }
+            p += 1 + b;
+        }
+        return p;
     }
 
     private Socket plainSocket(String host, int port) throws IOException {
