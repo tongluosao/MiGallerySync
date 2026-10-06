@@ -73,6 +73,40 @@ public final class UploadQueue {
     private static final long RETRY_GIVE_UP_MAX = 6 * 60 * 60_000L;
 
     /**
+     * 撞上"远端路径写锁"（HTTP 423）之后的首次退避。
+     *
+     * <p>为什么第一次就要 5 分钟，而不是跟普通退避一样 15 秒起：423 不是"抖一下就好了"，
+     * 它是服务器进程内那条路径的写锁还没释放（OpenList 用 `webdav.NewMemLS()`，纯内存锁）。
+     * 而每一次尝试的代价是**一整个请求体**——因为 OpenList 是读完 body 才判锁的。
+     * 真机实测：605MB 的视频在 11 分钟里被普通退避推着重试 5 次，白烧 3.0GB 上行，
+     * 远端一个字节都没多。5 分钟起手，就是让"锁还占着"这种情况不再被反复试探。
+     */
+    private static final long PATH_LOCK_FIRST_DELAY = 5 * 60_000L;
+    /** 同一条路径反复撞锁时的间隔上限，与 {@link #RETRY_GIVE_UP_MAX} 一致（6 小时） */
+    private static final long PATH_LOCK_MAX_DELAY = 6 * 60 * 60_000L;
+    /**
+     * 撞锁后至少要等多久才值得再试一次 —— **按这一项的大小算**。
+     *
+     * <p>由头是那条链路的实测吞吐：185MB 的那个视频整份传完花了约 3 分钟，
+     * 1.32GB 的传完花了 56 分钟。也就是说**服务器要先收完整份请求体才可能回 201**，
+     * 锁的释放时间跟文件大小成正比。文件的远端那一份一旦存在，这个大小在下面的
+     * `remoteSize` 里也会被认出来。
+     *
+     * <p>算法（当前档 + 翻倍档，结构上限与上面两个常量一致）：
+     * <pre>
+     *   每档 = max(5 分钟, 这一项大小 / 1.5MB/s)，上限 30 分钟
+     *   第 1 次撞锁 = 当前档；之后每撞一次再翻一倍，到 6 小时封顶
+     * </pre>
+     * 1.5MB/s 取得比实测中位数低（实测 3.9MB/s 那档是小文件，1.32GB 那档跌到 0.42MB/s），
+     * 低意味着"宁愿多等一会儿，也不再白烧一份上行"—— 这是有意的取向：等一会儿只花时间，
+     * 白烧一份 1.32GB 既花时间又占满一条上行。
+     */
+    private static long firstPathLockDelay(long size) {
+        long guess = size / (3L * 1024 * 1024 / 2);   // 1.5MB/s
+        return Math.min(Math.max(guess, PATH_LOCK_FIRST_DELAY), 30 * 60_000L);
+    }
+
+    /**
      * "设备这一层"出问题时的整队退避档位：60s / 2min / 5min / 15min / 30min（封顶）。
      *
      * <p>与服务器级冷却（{@link #COOLDOWN_BASE} 那套，最长 3 分钟）分开，因为两者的
@@ -423,6 +457,9 @@ public final class UploadQueue {
             // 同路径串行的占用也要清：换代之后由新的一份队列自己重新登记，
             // 残留的路径会让新 worker 永远挑不到那几项
             mInflightRemotePaths.clear();
+            // 撞锁计数同理：它是"这一轮"的观测，换代后从零开始（服务器侧那条锁
+            // 很可能已经自己释放了，不该让新 generation 继承一个几小时的退避）
+            mPathLockStrikes.clear();
             // 还没轮到复核的项直接作废。它们仍在 mPending 里（没移出、没记 done），
             // 下次启动会被重新 PUT 一遍（覆盖写、幂等），代价只是再传一次，不是丢数据
             cancelled = new ArrayList<>(mVerifyQueue);
@@ -1313,6 +1350,9 @@ public final class UploadQueue {
             mPendingVersion++;
             mDone.put(taskKey, System.currentTimeMillis());
             trimDoneLocked();
+            // 这一项总算传上去了，说明那条路径的写锁已经不是问题：把撞击计数清掉，
+            // 否则下次它再撞一次就会被当成"第 N 次撞"直接退到几小时
+            mPathLockStrikes.remove(task.path);
             saveThrottledLocked();
         }
         int failures = mConsecutiveFailures.getAndSet(0);
@@ -1349,9 +1389,101 @@ public final class UploadQueue {
      * 而小文件全过），把它们算进去会让熔断被单个大文件误触发。
      */
     private void finalizeFail(Task task, Config config, IOException error) {
+        if (isPathLocked(error)) {
+            // 423 是**服务器侧那条路径被别人攥着**，不是这一项传不动，更不是服务器挂了。
+            // 它必须单独走一条退避，理由见 schedulePathLocked：每试一次就白烧一整个请求体
+            schedulePathLocked(task, config, error.getMessage());
+            return;
+        }
         boolean counts = !(error instanceof WebDavClient.TransportFailure)
                 && task.size <= BREAKER_PROBE_MAX;
         scheduleRetry(task, config, error.getMessage(), counts, isEnvironmentFailure(error));
+    }
+
+    /**
+     * 这次失败是不是"远端那条路径正被别人写"（HTTP 423 Locked）。
+     *
+     * <p>为什么不按普通失败重试（2026-10-06 真机实测，代价很大）：OpenList 的 WebDAV 是
+     * **读完整个请求体之后**才判写锁的（`handlePut` 先 `io.Copy` 再 `confirmLocks`），
+     * 所以 423 回来的时候**那一整份上行已经烧掉了**。实测一个 605,134,181 字节的视频：
+     * <pre>
+     *   14:10:30 第 1 次 sent=605134181 → 423
+     *   14:12:17 第 2 次 sent=605134181 → 423
+     *   14:15:39 第 3 次 sent=605134181 → 423
+     *   14:17:48 第 4 次 sent=605134181 → 423
+     *   14:19:58 第 5 次 sent=605134181 → 423 → give_up
+     * </pre>
+     * 十一分钟里烧掉 **3.0GB 上行**，远端仓库一个字节都没多。普通退避（15s/30s…）会把这种
+     * 失败当"重试就好了"，正是它把 5 次机会在 11 分钟内全部用光。
+     */
+    private static boolean isPathLocked(Throwable error) {
+        Throwable cursor = error;
+        for (int depth = 0; cursor != null && depth < 8; depth++) {
+            String msg = cursor.getMessage();
+            if (msg != null) {
+                // 状态码是硬判据；`server=Locked` 是 OpenList 回的短语，作补充
+                if (msg.contains("code=423") || msg.contains("server=Locked")) {
+                    return true;
+                }
+            }
+            if (cursor.getCause() == cursor) {
+                break;
+            }
+            cursor = cursor.getCause();
+        }
+        return false;
+    }
+
+    /** 同一条远端路径连续撞锁的次数。撞得越多，退得越远（见 {@link #schedulePathLocked}）。 */
+    private final java.util.Map<String, Integer> mPathLockStrikes = new java.util.HashMap<>();
+
+    /**
+     * 撞上路径写锁之后的退避：**第一次就退到分钟级，之后逐级翻倍到小时级**。
+     *
+     * <p>为什么不涨 {@code attempts}、也不按普通退避走：这不是"这一项的问题"，也不是
+     * "服务器的问题"，而是服务器进程内的一条锁被别人（很可能是上一轮遗留的长请求，
+     * 或者一个泄漏了的内存锁）占着。涨 {@code attempts} 的后果是 5 次机会在十几分钟里被
+     * 用光，然后这一项要等 30 分钟才轮到下一次 —— 而每一次都要先烧掉一整个请求体。
+     *
+     * <p>所以这里改成"按路径记撞击次数、撞击次数决定间隔"：第 1 次 5 分钟，
+     * 之后 30min → 1h → 2h → 4h → 6h 封顶。同时**把 attempts 顶到 max_retry**，
+     * 让它在界面上表现为"暂缓"而不是"正在重试"，也不再跟正常项抢并发槽位
+     * （大文件一次要占一条通道好几分钟）。
+     *
+     * <p>日志给 `event=upload_wait_path_locked`，里面带 `strikes=`，用它就能看出来
+     * 是"偶尔撞一下"还是"这条路径被永久锁死了"。
+     */
+    private void schedulePathLocked(Task task, Config config, String reason) {
+        if (!mRunning) {
+            return;
+        }
+        long delay;
+        int strikes;
+        synchronized (mLock) {
+            Integer seen = mPathLockStrikes.get(task.path);
+            strikes = (seen == null ? 0 : seen) + 1;
+            mPathLockStrikes.put(task.path, strikes);
+            // 这一项**在这一轮之前就已经用尽重试**了（attempts 是落盘的，跨代保留）。
+            // 那种项本来就该按"放弃档"慢慢试，撞锁不该反倒给它挣回一次快速重试 ——
+            // 每次快速重试的代价是一整个请求体（真机 605MB × 11 分钟 5 次 = 3.0GB），
+            // 而它显然还没被任何人解决。所以直接接上放弃档（30min 起、逐级到 6h）
+            boolean alreadyGivenUp = task.attempts >= config.getMaxRetry();
+            task.attempts = Math.max(task.attempts, config.getMaxRetry());
+            if (alreadyGivenUp) {
+                delay = Math.min(giveUpDelay(strikes - 1), PATH_LOCK_MAX_DELAY);
+            } else {
+                delay = strikes == 1
+                        ? firstPathLockDelay(task.size)
+                        : Math.min(firstPathLockDelay(task.size) << Math.min(strikes - 1, 5),
+                                   PATH_LOCK_MAX_DELAY);
+            }
+            task.nextAttemptAt = System.currentTimeMillis() + delay;
+            saveThrottledLocked();
+        }
+        Logger.w("event=upload_wait_path_locked path=" + task.path
+                + " strikes=" + strikes + " delay=" + delay
+                + " attempts_kept=0 reason=" + reason
+                + " note=body_already_burned");
     }
 
     /**
