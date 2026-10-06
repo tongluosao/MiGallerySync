@@ -376,16 +376,11 @@ public final class GalleryHooks {
         int thumbnails = 0;
         int others = 0;
         int unreadable = 0;
-        int limit = config.getMaxItemsPerSync();
-        if (limit <= 0) {
-            if (replaceMode) {
-                Logger.w("event=invoke_list blocked_no_upload reason=limit_invalid limit=" + limit);
-                return true;
-            }
-            // 上限为 0 时一个都入不了队，此时若还拦截就是"相册不传、模块也没传"
-            Logger.w("event=invoke_list not_blocked reason=limit_invalid limit=" + limit);
-            return false;
-        }
+        // 这里**故意不截断**：以前有个 max_items_per_sync 上限，真机量下来它从来没生效过 ——
+        // 相册每次只交来一页（实测最大 998 行），而上限默认就是 1000，等于永远不裁。
+        // 调小它也只是把"一轮喂多少项"切碎，队列该涨还是涨（实测 12649 项待传），
+        // 却会多出"这轮没入队的项下轮再来一遍"的空转，所以整条链路连同设置页那一项一起删了。
+        // 每批的规模由宿主的分页决定，不由模块决定。
         for (Object rawItem : raw) {
             CloudItemReader.Item item = mReader.read(rawItem);
             if (item == null) {
@@ -395,9 +390,7 @@ public final class GalleryHooks {
             if (CloudItemReader.isThumbnailPriority(item.priority)) {
                 thumbnails++;
             } else if (CloudItemReader.isBackupPriority(item.priority)) {
-                if (backup.size() < limit) {
-                    backup.add(item);
-                }
+                backup.add(item);
             } else {
                 others++;
             }

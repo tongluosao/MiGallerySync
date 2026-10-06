@@ -230,7 +230,6 @@ private fun RowScope.ResultText(text: String, color: Color) {
 
 @Composable
 private fun BehaviorSection(model: SettingsModel) {
-    val focusManager = LocalFocusManager.current
     Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
         Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
             OverlayDropdownPreference(
@@ -303,17 +302,6 @@ private fun BehaviorSection(model: SettingsModel) {
         }
         if (model.isReplaceMode) {
             HintLine(stringResource(R.string.warn_replace_mode), error = true)
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
-            SettingsField(
-                value = model.maxItemsText,
-                onValueChange = model::onMaxItemsChange,
-                label = stringResource(R.string.hint_max_items_per_sync),
-                keyboardType = KeyboardType.Number,
-                imeAction = ImeAction.Done,
-                focusManager = focusManager
-            )
-            HintLine(stringResource(R.string.summary_max_items_per_sync))
         }
     }
 }

@@ -17,11 +17,9 @@
     <string name="hint_username">用户名</string>
     <string name="hint_password">密码或应用专用口令</string>
     <string name="hint_remote_root">远端根目录</string>
-    <string name="hint_max_items_per_sync">单次入队上限</string>
 
     <string name="summary_base_url">例如 https://dav.example.com/backup</string>
     <string name="summary_remote_root">这个目录下的结构由「远端目录结构」决定</string>
-    <string name="summary_max_items_per_sync">一轮最多入队多少张，最小 1，默认 1000。调大能让全量首备更快喂满队列</string>
     <string name="summary_password">明文存于 LSPosed 数据库，建议用应用专用口令</string>
     <string name="warn_replace_mode">替换后相册的云端查看与释放空间会失效</string>
 

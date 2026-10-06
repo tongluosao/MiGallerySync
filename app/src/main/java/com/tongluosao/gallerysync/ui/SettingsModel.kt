@@ -47,8 +47,6 @@ class SettingsModel : CoroutineScope {
         private set
     var remoteRoot by mutableStateOf("")
         private set
-    var maxItemsText by mutableStateOf("")
-        private set
     var replaceModeIndex by mutableStateOf(0)
         private set
     var wifiOnly by mutableStateOf(true)
@@ -131,13 +129,6 @@ class SettingsModel : CoroutineScope {
     fun onRemoteRootChange(value: String) {
         remoteRoot = value
         scheduleWrite(Config.KEY_REMOTE_ROOT, value.trim().ifEmpty { Config.DEFAULT_REMOTE_ROOT })
-    }
-
-    /** 上限最小 1：0 会让 Hook 侧一个都入不了队，只能降级放行，填了等于没配置 */
-    fun onMaxItemsChange(value: String) {
-        val digits = value.filter { it.isDigit() }.take(5).trimStart('0')
-        maxItemsText = digits
-        scheduleWrite(Config.KEY_MAX_ITEMS_PER_SYNC, digits.toIntOrNull() ?: Config.DEFAULT_MAX_ITEMS_PER_SYNC)
     }
 
     fun onReplaceModeChange(index: Int) {
@@ -379,7 +370,6 @@ class SettingsModel : CoroutineScope {
         concurrencyIndex = concurrencyIndexOf(
             source.getInt(Config.KEY_UPLOAD_CONCURRENCY, Config.DEFAULT_UPLOAD_CONCURRENCY)
         )
-        maxItemsText = source.getInt(Config.KEY_MAX_ITEMS_PER_SYNC, Config.DEFAULT_MAX_ITEMS_PER_SYNC).toString()
         replaceModeIndex = modeIndexOf(source.getString(Config.KEY_REPLACE_MODE, Config.DEFAULT_REPLACE_MODE))
         themeModeIndex = source.getInt(KEY_THEME_MODE, THEME_SYSTEM).coerceIn(0, 2)
     }
@@ -417,8 +407,6 @@ class SettingsModel : CoroutineScope {
             Config.KEY_UPLOAD_CONCURRENCY -> concurrencyIndex = concurrencyIndexOf(
                 source.getInt(key, Config.DEFAULT_UPLOAD_CONCURRENCY)
             )
-            Config.KEY_MAX_ITEMS_PER_SYNC -> maxItemsText =
-                source.getInt(key, Config.DEFAULT_MAX_ITEMS_PER_SYNC).toString()
 
             Config.KEY_REPLACE_MODE -> replaceModeIndex =
                 modeIndexOf(source.getString(key, Config.DEFAULT_REPLACE_MODE))

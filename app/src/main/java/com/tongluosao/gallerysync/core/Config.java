@@ -16,7 +16,6 @@ public final class Config {
     public static final String KEY_PASSWORD = "password";
     public static final String KEY_REMOTE_ROOT = "remote_root";
     public static final String KEY_WIFI_ONLY = "wifi_only";
-    public static final String KEY_MAX_ITEMS_PER_SYNC = "max_items_per_sync";
     public static final String KEY_MAX_RETRY = "max_retry";
     public static final String KEY_VERBOSE_LOG = "verbose_log";
     public static final String KEY_UI_MASK = "ui_mask";
@@ -109,13 +108,6 @@ public final class Config {
      * 就再也分不清哪张照片来自哪个相册 —— 相册文件夹这一层信息是有价值的，不该丢。
      */
     public static final String DEFAULT_REMOTE_LAYOUT = LAYOUT_ALBUM;
-    /**
-     * 每轮入队上限。相册只在它自己的排期上枚举脏项（空闲时一两小时才一轮），
-     * 这个值决定"一轮能喂给模块多少项"，所以对全量首备的耗时影响很大：
-     * 200 时一万两千张要几十轮，1000 时几轮就喂完了。队列会持久化且按内容去重，
-     * 调大只是让单次入队多一点，不会重复上传。
-     */
-    public static final int DEFAULT_MAX_ITEMS_PER_SYNC = 1000;
     public static final int DEFAULT_MAX_RETRY = 5;
     /** 默认与老版本写死的路数一致：升级后行为不变，想要更快在设置页自己调 */
     public static final int DEFAULT_UPLOAD_CONCURRENCY = 3;
@@ -142,7 +134,6 @@ public final class Config {
     private final String password;
     private final String remoteRoot;
     private final boolean wifiOnly;
-    private final int maxItemsPerSync;
     private final int maxRetry;
     private final boolean uiMask;
     private final boolean verboseLog;
@@ -161,7 +152,6 @@ public final class Config {
             password = "";
             remoteRoot = DEFAULT_REMOTE_ROOT;
             wifiOnly = true;
-            maxItemsPerSync = DEFAULT_MAX_ITEMS_PER_SYNC;
             maxRetry = DEFAULT_MAX_RETRY;
             uiMask = false;
             verboseLog = true;
@@ -178,7 +168,6 @@ public final class Config {
             password = prefs.getString(KEY_PASSWORD, "");
             remoteRoot = prefs.getString(KEY_REMOTE_ROOT, DEFAULT_REMOTE_ROOT);
             wifiOnly = prefs.getBoolean(KEY_WIFI_ONLY, true);
-            maxItemsPerSync = prefs.getInt(KEY_MAX_ITEMS_PER_SYNC, DEFAULT_MAX_ITEMS_PER_SYNC);
             maxRetry = prefs.getInt(KEY_MAX_RETRY, DEFAULT_MAX_RETRY);
             uiMask = prefs.getBoolean(KEY_UI_MASK, false);
             verboseLog = prefs.getBoolean(KEY_VERBOSE_LOG, true);
@@ -281,10 +270,6 @@ public final class Config {
         return wifiOnly;
     }
 
-    public int getMaxItemsPerSync() {
-        return maxItemsPerSync;
-    }
-
     public int getMaxRetry() {
         return maxRetry;
     }
@@ -342,7 +327,6 @@ public final class Config {
                 + ", root=" + remoteRoot
                 + ", layout=" + remoteLayout
                 + ", wifiOnly=" + wifiOnly
-                + ", maxItems=" + maxItemsPerSync
                 + ", workers=" + uploadConcurrency
                 + ", verifyAsync=" + verifyAsync
                 + ", skipRemote=" + skipExistingRemote
