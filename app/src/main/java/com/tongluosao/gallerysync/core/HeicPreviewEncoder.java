@@ -15,6 +15,8 @@ import androidx.heifwriter.HeifWriter;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.MathContext;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
@@ -31,6 +33,8 @@ public final class HeicPreviewEncoder {
     private static final String HEIC_MIME = "image/vnd.android.heic";
     private static final int VERIFY_MAX_EDGE = 512;
     private static final long STOP_TIMEOUT_MS = 30_000L;
+    private static final BigDecimal RATIONAL_RELATIVE_TOLERANCE = new BigDecimal("1e-9");
+    private static final BigDecimal RATIONAL_ABSOLUTE_TOLERANCE = new BigDecimal("1e-12");
     private static final String[] PRESERVED_TAGS = {
             ExifInterface.TAG_GPS_VERSION_ID,
             ExifInterface.TAG_GPS_LATITUDE,
@@ -413,7 +417,8 @@ public final class HeicPreviewEncoder {
         if (preserveMetadata) {
             ExifInterface outputExif = new ExifInterface(file.getAbsolutePath());
             for (Map.Entry<String, String> attribute : expectedExif.entrySet()) {
-                if (!attribute.getValue().equals(outputExif.getAttribute(attribute.getKey()))) {
+                String actual = outputExif.getAttribute(attribute.getKey());
+                if (!attributesMatch(attribute.getKey(), attribute.getValue(), actual)) {
                     throw new IOException("HEIC EXIF verification failed for "
                             + attribute.getKey());
                 }
@@ -422,6 +427,52 @@ public final class HeicPreviewEncoder {
                     ExifInterface.ORIENTATION_UNDEFINED) != ExifInterface.ORIENTATION_NORMAL) {
                 throw new IOException("HEIC orientation metadata was not normalized");
             }
+        }
+    }
+
+    /** Only exposure and aperture values permit equivalent rational/decimal serialization. */
+    private static boolean attributesMatch(String tag, String expected, String actual) {
+        if (expected == null || actual == null) {
+            return expected == null && actual == null;
+        }
+        if (expected.equals(actual)) {
+            return true;
+        }
+        if (!ExifInterface.TAG_EXPOSURE_TIME.equals(tag)
+                && !ExifInterface.TAG_F_NUMBER.equals(tag)) {
+            return false;
+        }
+        BigDecimal expectedValue = parseRationalOrDecimal(expected);
+        BigDecimal actualValue = parseRationalOrDecimal(actual);
+        if (expectedValue == null || actualValue == null
+                || expectedValue.signum() <= 0 || actualValue.signum() <= 0) {
+            return false;
+        }
+        BigDecimal magnitude = expectedValue.abs().max(actualValue.abs());
+        BigDecimal tolerance = magnitude.multiply(RATIONAL_RELATIVE_TOLERANCE)
+                .max(RATIONAL_ABSOLUTE_TOLERANCE);
+        return expectedValue.subtract(actualValue).abs().compareTo(tolerance) <= 0;
+    }
+
+    private static BigDecimal parseRationalOrDecimal(String value) {
+        String trimmed = value == null ? "" : value.trim();
+        int slash = trimmed.indexOf('/');
+        try {
+            if (slash < 0) {
+                return new BigDecimal(trimmed);
+            }
+            if (slash == 0 || slash == trimmed.length() - 1
+                    || slash != trimmed.lastIndexOf('/')) {
+                return null;
+            }
+            BigDecimal numerator = new BigDecimal(trimmed.substring(0, slash).trim());
+            BigDecimal denominator = new BigDecimal(trimmed.substring(slash + 1).trim());
+            if (denominator.signum() == 0) {
+                return null;
+            }
+            return numerator.divide(denominator, MathContext.DECIMAL128);
+        } catch (NumberFormatException | ArithmeticException ignored) {
+            return null;
         }
     }
 

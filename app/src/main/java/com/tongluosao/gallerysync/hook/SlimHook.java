@@ -146,6 +146,7 @@ final class SlimHook {
 
         Config config = mConfig;
         OriginalStore.Record record = null;
+        boolean verifiedByMigration = false;
         if (config != null && hasIdentity(item)) {
             try {
                 record = store.find(config, item.rowId, item.sha1);
@@ -172,6 +173,7 @@ final class SlimHook {
                     }
                     byPath = store.findByLocalPath(original);
                     record = store.find(config, item.rowId, item.sha1);
+                    verifiedByMigration = true;
                 } catch (Throwable t) {
                     Logger.e("event=slim_legacy_migration_failed path=" + item.path, t);
                     return 0L;
@@ -219,7 +221,8 @@ final class SlimHook {
         }
 
         try {
-            if (!store.ensureVerifiedRemoteOriginal(config, item.rowId, item.sha1)) {
+            if (!verifiedByMigration
+                    && !store.ensureVerifiedRemoteOriginal(config, item.rowId, item.sha1)) {
                 Logger.w("event=slim_skipped reason=remote_original_unverified path=" + item.path);
                 return 0L;
             }

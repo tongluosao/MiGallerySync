@@ -4,7 +4,8 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.media.ExifInterface;
+
+import androidx.exifinterface.media.ExifInterface;
 
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -15,6 +16,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Constructor;
+import java.math.BigDecimal;
+import java.math.MathContext;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -249,6 +252,10 @@ final class OriginalStoreInstrumentationScenario {
         require(SYNTHETIC_CAPTURE_DATE.equals(
                         exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)),
                 "HEIC output did not preserve DateTimeOriginal");
+        requireRationalAttribute(exif, ExifInterface.TAG_EXPOSURE_TIME, "1/1000",
+                "HEIC output did not preserve ExposureTime");
+        requireRationalAttribute(exif, ExifInterface.TAG_F_NUMBER, "28/10",
+                "HEIC output did not preserve FNumber");
         require("37/1,46/1,4900/100".equals(
                         exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE))
                         && "N".equals(exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE_REF))
@@ -392,6 +399,8 @@ final class OriginalStoreInstrumentationScenario {
         exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, SYNTHETIC_CAPTURE_DATE);
         exif.setAttribute(ExifInterface.TAG_MAKE, "Synthetic Camera");
         exif.setAttribute(ExifInterface.TAG_MODEL, "Unit Test 1");
+        exif.setAttribute(ExifInterface.TAG_EXPOSURE_TIME, "0.001");
+        exif.setAttribute(ExifInterface.TAG_F_NUMBER, "2.8");
         exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE, "37/1,46/1,4900/100");
         exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE_REF, "N");
         exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE, "122/1,25/1,0/1");
@@ -405,6 +414,37 @@ final class OriginalStoreInstrumentationScenario {
         require(SYNTHETIC_CAPTURE_DATE.equals(
                         verify.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)),
                 "synthetic JPEG does not contain the fixed DateTimeOriginal");
+        requireRationalAttribute(verify, ExifInterface.TAG_EXPOSURE_TIME, "1/1000",
+                "synthetic JPEG does not contain the expected ExposureTime");
+        requireRationalAttribute(verify, ExifInterface.TAG_F_NUMBER, "28/10",
+                "synthetic JPEG does not contain the expected FNumber");
+    }
+
+    private static void requireRationalAttribute(ExifInterface exif, String tag,
+            String expected, String failureMessage) {
+        BigDecimal expectedValue = parseRational(expected);
+        BigDecimal actualValue = parseRational(exif.getAttribute(tag));
+        require(expectedValue != null && actualValue != null
+                        && expectedValue.subtract(actualValue).abs().compareTo(
+                                expectedValue.abs().multiply(new BigDecimal("1e-9")
+                                ).max(new BigDecimal("1e-12"))) <= 0,
+                failureMessage + ": " + exif.getAttribute(tag));
+    }
+
+    private static BigDecimal parseRational(String value) {
+        if (value == null) return null;
+        int slash = value.indexOf('/');
+        try {
+            if (slash < 0) return new BigDecimal(value.trim());
+            if (slash == 0 || slash == value.length() - 1
+                    || slash != value.lastIndexOf('/')) return null;
+            BigDecimal numerator = new BigDecimal(value.substring(0, slash).trim());
+            BigDecimal denominator = new BigDecimal(value.substring(slash + 1).trim());
+            if (denominator.signum() == 0) return null;
+            return numerator.divide(denominator, MathContext.DECIMAL128);
+        } catch (NumberFormatException | ArithmeticException ignored) {
+            return null;
+        }
     }
 
     private static void expectRestoreFailure(OriginalStore store, Config config, String rowSha1,
