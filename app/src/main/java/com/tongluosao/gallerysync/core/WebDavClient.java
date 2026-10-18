@@ -210,8 +210,12 @@ public final class WebDavClient {
     }
 
     public WebDavClient(String baseUrl, String username, String password) {
+        this(baseUrl, buildAuthHeader(username, password));
+    }
+
+    private WebDavClient(String baseUrl, String authorization) {
         mBaseUrl = trimTrailingSlash(baseUrl);
-        mAuthHeader = buildAuthHeader(username, password);
+        mAuthHeader = authorization;
         mPlainHttp = mBaseUrl.regionMatches(true, 0, "http://", 0, 7);
         mSecure = mBaseUrl.regionMatches(true, 0, "https://", 0, 8);
     }
@@ -548,6 +552,11 @@ public final class WebDavClient {
      * @return 实际写入的字节数
      */
     private long getOnce(String host, int port, String target, File tmp) throws IOException {
+        return getOnce(host, port, target, tmp, 5);
+    }
+
+    private long getOnce(String host, int port, String target, File tmp, int redirectsLeft)
+            throws IOException {
         Socket socket = connect(host, port);
         // 下载的读超时要按**响应体**上浮，不能按请求体（GET 的请求体恒为 0）——
         // 一个 600MB 的视频在慢链路上几分钟是常态，用默认 30s 会把好好的下载掐断。
@@ -557,6 +566,27 @@ public final class WebDavClient {
         out.flush();
 
         Head head = readHead();
+        if (head.code == 301 || head.code == 302 || head.code == 303
+                || head.code == 307 || head.code == 308) {
+            if (redirectsLeft <= 0) {
+                throw new IOException("GET redirect limit exceeded");
+            }
+            URL current = new URL(mSecure ? "https" : "http", host, port, target);
+            URL next = downloadRedirect(current, head.location);
+            // A storage signed URL must never receive the WebDAV account credentials.
+            String auth = sameOrigin(current, next) ? mAuthHeader : null;
+            dropConnection(); // The redirect response body has not been consumed.
+            String origin = next.getProtocol() + "://" + next.getAuthority();
+            WebDavClient redirected = new WebDavClient(origin, auth);
+            redirected.setProgressListener(mProgressListener);
+            try {
+                int nextPort = next.getPort() < 0 ? next.getDefaultPort() : next.getPort();
+                return redirected.getOnce(next.getHost(), nextPort,
+                        next.getFile().isEmpty() ? "/" : next.getFile(), tmp, redirectsLeft - 1);
+            } finally {
+                redirected.close();
+            }
+        }
         if (head.code == 401 || head.code == 403) {
             throw new IOException("auth failed code=" + head.code);
         }
@@ -565,8 +595,8 @@ public final class WebDavClient {
             String detail = head.chunked
                     ? readChunked(mReader, DETAIL_LIMIT)
                     : readCapped(mReader, head.contentLength, DETAIL_LIMIT);
-            throw new IOException("GET " + target + " failed code=" + head.code
-                    + oneLine(detail));
+            // Do not log signed redirect URLs or response bodies containing credentials.
+            throw new IOException("GET failed code=" + head.code);
         }
 
         long written;
@@ -574,7 +604,7 @@ public final class WebDavClient {
                 new FileOutputStream(tmp), 64 * 1024)) {
             if (head.chunked) {
                 written = copyChunked(mReader, file);
-            } else if (head.contentLength > 0L) {
+            } else if (head.contentLength >= 0L) {
                 written = copyExact(mReader, file, head.contentLength);
             } else {
                 written = copyUntilEof(mReader, file);
@@ -592,6 +622,36 @@ public final class WebDavClient {
             dropConnection();
         }
         return written;
+    }
+
+    static URL downloadRedirect(URL current, String location) throws IOException {
+        if (location == null || location.isEmpty() || location.indexOf('\r') >= 0
+                || location.indexOf('\n') >= 0) {
+            throw new IOException("invalid GET redirect location");
+        }
+        URL next = new URL(current, location);
+        String protocol = next.getProtocol();
+        if (!("http".equalsIgnoreCase(protocol) || "https".equalsIgnoreCase(protocol))
+                || next.getUserInfo() != null
+                || ("https".equalsIgnoreCase(current.getProtocol())
+                    && !"https".equalsIgnoreCase(protocol))) {
+            throw new IOException("unsafe GET redirect");
+        }
+        String requestTarget = next.getFile();
+        for (int i = 0; i < requestTarget.length(); i++) {
+            char c = requestTarget.charAt(i);
+            if (c <= 0x20 || c == 0x7f) {
+                throw new IOException("invalid GET redirect target");
+            }
+        }
+        return next;
+    }
+
+    static boolean sameOrigin(URL first, URL second) {
+        int firstPort = first.getPort() < 0 ? first.getDefaultPort() : first.getPort();
+        int secondPort = second.getPort() < 0 ? second.getDefaultPort() : second.getPort();
+        return first.getProtocol().equalsIgnoreCase(second.getProtocol())
+                && first.getHost().equalsIgnoreCase(second.getHost()) && firstPort == secondPort;
     }
 
     /** 按 Content-Length 精确复制，顺便回调进度 */
@@ -1557,13 +1617,16 @@ public final class WebDavClient {
         final boolean http10;
         /** 服务器显式说的连接是否留存；没写就是 null */
         final Boolean keepAlive;
+        final String location;
 
-        Head(int code, long contentLength, boolean chunked, boolean http10, Boolean keepAlive) {
+        Head(int code, long contentLength, boolean chunked, boolean http10, Boolean keepAlive,
+                String location) {
             this.code = code;
             this.contentLength = contentLength;
             this.chunked = chunked;
             this.http10 = http10;
             this.keepAlive = keepAlive;
+            this.location = location;
         }
     }
 
@@ -1578,6 +1641,7 @@ public final class WebDavClient {
         long contentLength = -1L;
         boolean chunked = false;
         Boolean headerKeepAlive = null;
+        String location = null;
         String line;
         StringBuilder rawHeaders = new StringBuilder(128);
         while ((line = reader.readLine()) != null && !line.isEmpty()) {
@@ -1604,11 +1668,13 @@ public final class WebDavClient {
             } else if (name.equalsIgnoreCase("Connection")) {
                 headerKeepAlive = Boolean.valueOf(
                         !value.toLowerCase(Locale.US).contains("close"));
+            } else if (name.equalsIgnoreCase("Location")) {
+                location = value;
             }
         }
         mLastStatusLine = statusLine;
         mLastHeaders = rawHeaders.toString();
-        return new Head(code, contentLength, chunked, http10, headerKeepAlive);
+        return new Head(code, contentLength, chunked, http10, headerKeepAlive, location);
     }
 
     /** 最近一条响应的状态行与响应头，仅用于诊断日志（见 verify_failed 的 raw=） */
