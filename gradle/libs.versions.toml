@@ -10,6 +10,8 @@ espressoCore = "3.7.0"
 libxposed = "102.0.0"
 miuix = "0.9.4"
 activityCompose = "1.13.0"
+heifWriter = "1.1.0"
+exifInterface = "1.4.2"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -25,6 +27,8 @@ miuix-preference = { group = "top.yukonga.miuix.kmp", name = "miuix-preference-a
 # 只有引了这个才有（miuix-ui 自带的 icon/basic 只有返回箭头之类几个）
 miuix-icons = { group = "top.yukonga.miuix.kmp", name = "miuix-icons-android", version.ref = "miuix" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-heifwriter = { group = "androidx.heifwriter", name = "heifwriter", version.ref = "heifWriter" }
+androidx-exifinterface = { group = "androidx.exifinterface", name = "exifinterface", version.ref = "exifInterface" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

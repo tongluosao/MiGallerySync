@@ -53,6 +53,10 @@ public final class Config {
      * 文件，模块分不出来，都按"已完成"处理。想要严格一致就把它关掉。
      */
     public static final String KEY_SKIP_EXISTING_REMOTE = "skip_existing_remote";
+    /** 优化图与 HQ 下载完成后是否保留原图元数据。 */
+    public static final String KEY_PRESERVE_METADATA = "preserve_metadata";
+    /** 优化图或下载图是否保留 HEIC 原格式。 */
+    public static final String KEY_PRESERVE_HEIC_FORMAT = "preserve_heic_format";
     /**
      * 单个文件的体积上限，超过就**一个字节都不发**，直接跳过（{@code 0} = 不限）。
      *
@@ -140,6 +144,10 @@ public final class Config {
      * 用户要的就是"省电省性能"，逐字节校验要完整下载一遍远端文件，那是流量意义上的灾难。
      */
     public static final boolean DEFAULT_SKIP_EXISTING_REMOTE = true;
+    /** 默认保留优化图与 HQ 下载原图中的元数据。 */
+    public static final boolean DEFAULT_PRESERVE_METADATA = true;
+    /** 默认保留 HEIC 原格式；设备不支持处理时也应保留原件。 */
+    public static final boolean DEFAULT_PRESERVE_HEIC_FORMAT = true;
     /** 默认与相册共用一条记录：升级后行为不变，不想让相册那条记录被改的人自己去开分开记录 */
     public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
 
@@ -158,6 +166,8 @@ public final class Config {
     private final int uploadConcurrency;
     private final boolean verifyAsync;
     private final boolean skipExistingRemote;
+    private final boolean preserveMetadata;
+    private final boolean preserveHeicFormat;
     private final String localFlagMode;
 
     private Config(SharedPreferences prefs) {
@@ -176,6 +186,8 @@ public final class Config {
             uploadConcurrency = DEFAULT_UPLOAD_CONCURRENCY;
             verifyAsync = DEFAULT_VERIFY_ASYNC;
             skipExistingRemote = DEFAULT_SKIP_EXISTING_REMOTE;
+            preserveMetadata = DEFAULT_PRESERVE_METADATA;
+            preserveHeicFormat = DEFAULT_PRESERVE_HEIC_FORMAT;
             localFlagMode = DEFAULT_LOCAL_FLAG_MODE;
         } else {
             replaceMode = prefs.getString(KEY_REPLACE_MODE, DEFAULT_REPLACE_MODE);
@@ -194,6 +206,9 @@ public final class Config {
             verifyAsync = prefs.getBoolean(KEY_VERIFY_ASYNC, DEFAULT_VERIFY_ASYNC);
             skipExistingRemote = prefs.getBoolean(
                     KEY_SKIP_EXISTING_REMOTE, DEFAULT_SKIP_EXISTING_REMOTE);
+            preserveMetadata = prefs.getBoolean(KEY_PRESERVE_METADATA, DEFAULT_PRESERVE_METADATA);
+            preserveHeicFormat = prefs.getBoolean(
+                    KEY_PRESERVE_HEIC_FORMAT, DEFAULT_PRESERVE_HEIC_FORMAT);
             localFlagMode = readFlagMode(prefs);
         }
     }
@@ -340,6 +355,16 @@ public final class Config {
     /** true 表示上传前先列一次远端目录，名字对上就跳过（不比对内容） */
     public boolean isSkipExistingRemote() {
         return skipExistingRemote;
+    }
+
+    /** true 表示优化图与 HQ 下载完成后保留原图元数据 */
+    public boolean isPreserveMetadata() {
+        return preserveMetadata;
+    }
+
+    /** true 表示优化图与下载图保持 HEIC 原格式 */
+    public boolean isPreserveHeicFormat() {
+        return preserveHeicFormat;
     }
 
     /** true 表示不写相册的 localFlag，改用模块自己按目标分开的记录 */

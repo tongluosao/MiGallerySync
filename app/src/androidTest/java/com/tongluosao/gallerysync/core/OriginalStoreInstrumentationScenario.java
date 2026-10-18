@@ -39,19 +39,20 @@ final class OriginalStoreInstrumentationScenario {
     private static final String REMOTE_PATH = "/synthetic/original.jpg";
     private static final String SYNTHETIC_CAPTURE_DATE = "2018:04:05 06:07:08";
 
-    void run(Context context) throws Exception {
+    String run(Context context) throws Exception {
         File work = new File(context.getCacheDir(), "quality-validation-" + System.nanoTime());
         require(work.mkdirs(), "could not create cache-only test directory");
         try {
-            exercise(work);
+            return exercise(work);
         } finally {
             deleteTree(work);
         }
     }
 
-    private void exercise(File work) throws Exception {
+    private String exercise(File work) throws Exception {
         File source = new File(work, "source-with-exif.jpg");
         createSyntheticJpeg(source);
+        String heicResult = exerciseHeicEncoder(source, work);
         byte[] original = readAll(source);
         String originalHash = sha256(original);
         String rowSha1 = digest("SHA-1", original);
@@ -90,6 +91,22 @@ final class OriginalStoreInstrumentationScenario {
                             ExifInterface.ORIENTATION_UNDEFINED)
                             == ExifInterface.ORIENTATION_NORMAL,
                     "generated preview orientation was not normalized");
+            require("Synthetic Camera".equals(previewExif.getAttribute(ExifInterface.TAG_MAKE)),
+                    "generated preview did not preserve camera make");
+            require("Unit Test 1".equals(previewExif.getAttribute(ExifInterface.TAG_MODEL)),
+                    "generated preview did not preserve camera model");
+            require("37/1,46/1,4900/100".equals(
+                            previewExif.getAttribute(ExifInterface.TAG_GPS_LATITUDE))
+                            && "N".equals(previewExif.getAttribute(
+                                    ExifInterface.TAG_GPS_LATITUDE_REF)),
+                    "generated preview did not preserve GPS coordinates");
+            File noMetadataPreview = new File(work, "preview-no-metadata.jpg");
+            require(DownloadQueue.createCompressedPreview(downloaded, noMetadataPreview, false),
+                    "preview generation with metadata preservation disabled failed");
+            ExifInterface noMetadataExif = new ExifInterface(noMetadataPreview.getAbsolutePath());
+            require(noMetadataExif.getAttribute(ExifInterface.TAG_MAKE) == null
+                            && noMetadataExif.getAttribute(ExifInterface.TAG_GPS_LATITUDE) == null,
+                    "metadata-disabled preview retained allowlisted EXIF");
             BitmapFactory.Options bounds = new BitmapFactory.Options();
             bounds.inJustDecodeBounds = true;
             BitmapFactory.decodeFile(preview.getAbsolutePath(), bounds);
@@ -185,6 +202,93 @@ final class OriginalStoreInstrumentationScenario {
                 require(request.authorization == null || request.authorization.isEmpty(),
                         "Authorization leaked across the cross-port HTTP redirect");
             }
+        }
+        return heicResult;
+    }
+
+    /** Exercise actual platform encoding, while reporting missing device support explicitly. */
+    private static String exerciseHeicEncoder(File source, File work) throws Exception {
+        File output = new File(work, "synthetic-preview.heic");
+        byte[] sentinel = "leave-existing-output-untouched".getBytes(StandardCharsets.US_ASCII);
+        write(output, sentinel);
+        boolean advertised = HeicPreviewEncoder.isPlatformEncoderAdvertised();
+        boolean encoded = HeicPreviewEncoder.encode(source, output,
+                HeicPreviewEncoder.DEFAULT_MAX_EDGE, HeicPreviewEncoder.DEFAULT_QUALITY, true);
+        if (!encoded) {
+            require(Arrays.equals(sentinel, readAll(output)),
+                    "failed HEIC encode changed the pre-existing output file");
+            String failure = HeicPreviewEncoder.getLastFailureReason();
+            String status = advertised
+                    ? "HEIC_NOT_VERIFIED: " + failure
+                    : "HEIC_UNSUPPORTED: no flexible-YUV HEIC encoder advertised; helper returned false"
+                            + (failure == null ? "" : " (" + failure + ")");
+            android.util.Log.w("QualityValidation", status);
+            return status;
+        }
+
+        require(output.isFile() && output.length() > 16L,
+                "HEIC helper succeeded without producing a non-empty output");
+        require(hasHeicFtypBrand(output), "HEIC output has no HEIC-compatible ftyp brand");
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(output.getAbsolutePath(), bounds);
+        require(bounds.outWidth == 360 && bounds.outHeight == 640,
+                "HEIC output did not bake in source orientation: "
+                        + bounds.outWidth + "x" + bounds.outHeight);
+        BitmapFactory.Options decodeOptions = new BitmapFactory.Options();
+        decodeOptions.inSampleSize = 4;
+        Bitmap decoded = BitmapFactory.decodeFile(output.getAbsolutePath(), decodeOptions);
+        require(decoded != null, "HEIC output could not be decoded by the device");
+        decoded.recycle();
+
+        ExifInterface exif = new ExifInterface(output.getAbsolutePath());
+        require("Synthetic Camera".equals(exif.getAttribute(ExifInterface.TAG_MAKE)),
+                "HEIC output did not preserve Make");
+        require("Unit Test 1".equals(exif.getAttribute(ExifInterface.TAG_MODEL)),
+                "HEIC output did not preserve Model");
+        require(SYNTHETIC_CAPTURE_DATE.equals(
+                        exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)),
+                "HEIC output did not preserve DateTimeOriginal");
+        require("37/1,46/1,4900/100".equals(
+                        exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE))
+                        && "N".equals(exif.getAttribute(ExifInterface.TAG_GPS_LATITUDE_REF))
+                        && "122/1,25/1,0/1".equals(
+                                exif.getAttribute(ExifInterface.TAG_GPS_LONGITUDE))
+                        && "E".equals(exif.getAttribute(ExifInterface.TAG_GPS_LONGITUDE_REF)),
+                "HEIC output did not preserve GPS coordinates");
+        require(exif.getAttributeInt(ExifInterface.TAG_ORIENTATION,
+                        ExifInterface.ORIENTATION_UNDEFINED) == ExifInterface.ORIENTATION_NORMAL,
+                "HEIC output orientation metadata was not normalized");
+        String status = "HEIC_ENCODE_VERIFIED: real HEIC signature, decode, orientation and EXIF passed";
+        android.util.Log.i("QualityValidation", status);
+        return status;
+    }
+
+    private static boolean hasHeicFtypBrand(File file) throws IOException {
+        byte[] bytes = new byte[(int) Math.min(4096L, file.length())];
+        try (InputStream input = new FileInputStream(file)) {
+            int total = 0;
+            while (total < bytes.length) {
+                int count = input.read(bytes, total, bytes.length - total);
+                if (count < 0) break;
+                total += count;
+            }
+            if (total < 16 || bytes[4] != 'f' || bytes[5] != 't'
+                    || bytes[6] != 'y' || bytes[7] != 'p') return false;
+            long boxSize = ((bytes[0] & 0xffL) << 24) | ((bytes[1] & 0xffL) << 16)
+                    | ((bytes[2] & 0xffL) << 8) | (bytes[3] & 0xffL);
+            if (boxSize < 16 || boxSize == 1) return false;
+            int end = (int) Math.min(total, Math.min(boxSize, bytes.length));
+            for (int offset = 8; offset + 4 <= end; offset += 4) {
+                if (bytes[offset] == 'h' && bytes[offset + 1] == 'e'
+                        && ((bytes[offset + 2] == 'i'
+                                && (bytes[offset + 3] == 'c' || bytes[offset + 3] == 'x'))
+                        || (bytes[offset + 2] == 'v'
+                                && (bytes[offset + 3] == 'c' || bytes[offset + 3] == 'x')))) {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 
@@ -286,6 +390,12 @@ final class OriginalStoreInstrumentationScenario {
         exif.setAttribute(ExifInterface.TAG_ORIENTATION,
                 Integer.toString(ExifInterface.ORIENTATION_ROTATE_90));
         exif.setAttribute(ExifInterface.TAG_DATETIME_ORIGINAL, SYNTHETIC_CAPTURE_DATE);
+        exif.setAttribute(ExifInterface.TAG_MAKE, "Synthetic Camera");
+        exif.setAttribute(ExifInterface.TAG_MODEL, "Unit Test 1");
+        exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE, "37/1,46/1,4900/100");
+        exif.setAttribute(ExifInterface.TAG_GPS_LATITUDE_REF, "N");
+        exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE, "122/1,25/1,0/1");
+        exif.setAttribute(ExifInterface.TAG_GPS_LONGITUDE_REF, "E");
         exif.saveAttributes();
         ExifInterface verify = new ExifInterface(output.getAbsolutePath());
         require(verify.getAttributeInt(ExifInterface.TAG_ORIENTATION,

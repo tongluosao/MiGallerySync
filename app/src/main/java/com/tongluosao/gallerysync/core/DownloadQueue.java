@@ -7,7 +7,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Paint;
-import android.media.ExifInterface;
+import androidx.exifinterface.media.ExifInterface;
 import android.os.StatFs;
 import android.os.SystemClock;
 
@@ -56,17 +56,14 @@ public final class DownloadQueue {
 
     private static final String STATE_DIR = "webdav_sync";
     private static final String STATE_FILE = "state.json";
+    /** Public storage root used when the remote path can be mapped back to an album. */
+    private static final String PRIMARY_STORAGE_ROOT = "/storage/emulated/0";
+
     /**
-     * 下载落到哪里。
-     *
-     * <p>必须是 DCIM 下的一个子目录：相册只收 DCIM / Pictures 这类公开媒体目录里的文件，
-     * 落在 {@code Android/data} 或模块自己的目录下，扫描引擎会直接跳过 —— 那就成了
-     * "下回来了但相册里看不见"。
-     *
-     * <p>单独一个 {@code MiGallerySync} 子目录而不是直接铺进 DCIM：远端树在这里原样重建，
-     * 不致于把用户的 DCIM 根目录搅乱，用户要清理也有一个明确的边界。
+     * Fallback for date/flat layouts and for album paths already occupied by different bytes.
+     * Everything stays below one reserved directory so the fallback remains easy to inspect.
      */
-    private static final String DOWNLOAD_ROOT = "/storage/emulated/0/DCIM/MiGallerySync";
+    private static final String MIRROR_ROOT = PRIMARY_STORAGE_ROOT + "/DCIM/MiGallerySync";
 
     /** 一轮最多走几个目录（含子目录），防止一次枚举把整棵树拉下来 */
     private static final int MAX_DIRS_PER_ROUND = 200;
@@ -142,12 +139,15 @@ public final class DownloadQueue {
         final String relativePath;
         final long size;
         final String target;
+        final String localPath;
 
-        Pending(String remotePath, String relativePath, long size, String target) {
+        Pending(String remotePath, String relativePath, long size, String target,
+                String localPath) {
             this.remotePath = remotePath;
             this.relativePath = relativePath;
             this.size = size;
             this.target = target;
+            this.localPath = localPath;
         }
     }
 
@@ -386,16 +386,6 @@ public final class DownloadQueue {
                 it.remove();
             }
         }
-    }
-
-    private static boolean isMatchingAlbumFile(Config config, String relativePath,
-            long remoteSize) {
-        if (config == null || !Config.LAYOUT_ALBUM.equals(config.getRemoteLayout())
-                || relativePath == null || remoteSize < 0L) {
-            return false;
-        }
-        File local = new File("/storage/emulated/0", relativePath);
-        return local.isFile() && local.length() == remoteSize;
     }
 
     private void closeClients() {
@@ -656,41 +646,50 @@ public final class DownloadQueue {
                 continue;
             }
             String remotePath = WebDavClient.joinPath(remoteDir, name);
-            File normalLocal = new File(new File(DOWNLOAD_ROOT, relativeDir), name);
+            File normalLocal = destinationFor(config, relative, entry.size);
+            OriginalStore.Record occupied = mOriginalStore.findByLocalPath(normalLocal);
+            if (occupied != null && !remotePath.equals(occupied.remotePath)) {
+                // Another format's JPEG preview must never count as this remote original.
+                normalLocal = new File(MIRROR_ROOT, relative);
+            }
+            migrateLegacyDownload(config, remotePath, relative, normalLocal, generation);
             boolean done;
             boolean scheduled;
             synchronized (mLock) {
                 done = mDone.containsKey(remotePath);
                 scheduled = isScheduledLocked(remotePath);
             }
-            boolean restoreMissingOriginal = !highQuality && done
-                    && isRegisteredPreviewMissingOriginal(remotePath, target, normalLocal);
+            boolean restoreMissingOriginal = !highQuality
+                    && isRegisteredPreviewNeedingOriginalRestore(remotePath, config, normalLocal);
             if (scheduled || (done && !restoreMissingOriginal)) {
                 continue;
             }
-            if (normalLocal.exists() || (highQuality && isCompressibleExtension(name)
-                    && previewPathFor(normalLocal).exists())
-                    || isMatchingAlbumFile(config, relative, entry.size)) {
+            if (normalLocal.exists() && !restoreMissingOriginal) {
                 continue;
             }
-            out.add(new Pending(remotePath, relative, entry.size, target));
+            out.add(new Pending(remotePath, relative, entry.size, target,
+                    normalLocal.getAbsolutePath()));
         }
     }
 
-    /** Let ORIGIN mode fetch raw bytes after this target previously completed an HQ sidecar. */
-    private boolean isRegisteredPreviewMissingOriginal(String remotePath, String target,
+    /** Let ORIGIN mode restore a registered preview after its path or bytes replaced the original. */
+    private boolean isRegisteredPreviewNeedingOriginalRestore(String remotePath, Config config,
             File originalPath) {
-        if (originalPath.exists()) {
-            return false;
-        }
-        OriginalStore.Record record = mOriginalStore.findByLocalPath(originalPath);
-        if (record == null || !target.equals(record.target)
-                || !remotePath.equals(record.remotePath) || record.previewLocalPath == null
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath,
+                originalPath);
+        if (record == null || record.previewLocalPath == null
                 || record.originalLocalPath == null) {
             return false;
         }
         try {
-            return originalPath.getCanonicalPath().equals(record.originalLocalPath);
+            if (!originalPath.getCanonicalPath().equals(record.originalLocalPath)) {
+                return false;
+            }
+            // A JPEG preview can share the original pathname. A sibling JPEG preview can also
+            // remain registered after ORIGIN restores a PNG/WebP original, so recognize an
+            // already restored original by content and avoid fetching it on every scan.
+            return !originalPath.isFile() || originalPath.length() != record.originalLength
+                    || !record.sha256.equals(sha256(originalPath));
         } catch (IOException ignored) {
             return false;
         }
@@ -755,7 +754,7 @@ public final class DownloadQueue {
         int index = workerIndex();
         UploadProgressPublisher publisher = mPublisher;
         long size = Math.max(pending.size, 0L);
-        File normalDest = new File(fullPathOf(pending));
+        File normalDest = new File(pending.localPath);
         File dest = normalDest;
         String key = key(pending);
         boolean ok = false;
@@ -768,14 +767,31 @@ public final class DownloadQueue {
         File compressed = null;
         try {
             ensureWorkCurrent(config, generation);
-            File possiblePreview = previewPathFor(normalDest);
+            boolean restoreRegisteredOriginal = !isHighQualityRequested()
+                    && isRegisteredPreviewNeedingOriginalRestore(pending.remotePath, config,
+                            normalDest);
+            if (restoreRegisteredOriginal) {
+                OriginalStore.Record record = mOriginalStore.findByRemotePath(config,
+                        pending.remotePath, normalDest);
+                if (record == null) {
+                    throw new IOException("registered preview disappeared before restore");
+                }
+                ensureWorkCurrent(config, generation);
+                dest = mOriginalStore.restoreOriginal(config, record, normalDest);
+                markDone(pending.remotePath, pending.target);
+                Ingest ingest = mIngest;
+                if (ingest != null) ingest.ingest(dest.getAbsolutePath());
+                Logger.i("event=download_original_restored remote=" + pending.remotePath
+                        + " local=" + dest.getAbsolutePath());
+                ok = true;
+                return;
+            }
             boolean qualityRequested = isHighQualityRequested()
                     && isCompressibleExtension(normalDest.getName()) && pending.size > 0L;
-            if (normalDest.exists() || (qualityRequested && possiblePreview.exists())
-                    || isMatchingAlbumFile(config, pending.relativePath, pending.size)) {
+            if (normalDest.exists()) {
                 // 本地已经有同名文件：一律不覆盖。用户可能自己改过它，也可能同名但是别的东西
                 Logger.i("event=download_skip_local_exists remote=" + pending.remotePath
-                        + " local=" + (normalDest.exists() ? normalDest : possiblePreview));
+                        + " local=" + normalDest);
                 markDone(pending.remotePath, pending.target);
                 ok = true;
                 return;
@@ -806,14 +822,16 @@ public final class DownloadQueue {
                 ensureWorkCurrent(config, generation);
                 verifyDownloadedOriginal(pending, raw);
                 String digest = sha256(raw);
-                File previewDest = previewPathFor(normalDest);
+                File previewDest = previewPathFor(normalDest, config.isPreserveHeicFormat());
+                boolean previewCollision = !samePath(previewDest, normalDest) && previewDest.exists();
                 File parent = previewDest.getAbsoluteFile().getParentFile();
                 if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
                     throw new IOException("cannot create download directory");
                 }
                 compressed = new File(parent, "." + previewDest.getName() + ".mgs-"
                         + UUID.randomUUID() + ".tmp");
-                boolean compressedOk = createCompressedPreview(raw, compressed)
+                boolean compressedOk = !previewCollision && createCompressedPreview(raw, compressed,
+                        normalDest.getName(), config)
                         && compressed.length() > 0L && compressed.length() < raw.length();
                 if (compressedOk) {
                     // Persist the protected final path before it becomes visible to a media scanner.
@@ -831,7 +849,8 @@ public final class DownloadQueue {
                             + " local=" + dest.getAbsolutePath() + " original=" + raw.length()
                             + " preview=" + dest.length());
                 } else {
-                    Logger.i("event=download_preview_skipped reason=unsupported_or_no_savings"
+                    Logger.i("event=download_preview_skipped reason="
+                            + (previewCollision ? "destination_collision" : "unsupported_or_no_savings")
                             + " remote=" + pending.remotePath);
                     staged = stageBesideDestination(raw, normalDest);
                     ensureWorkCurrent(config, generation);
@@ -982,12 +1001,137 @@ public final class DownloadQueue {
         String lower = name.toLowerCase(Locale.US);
         return lower.endsWith(".jpg") || lower.endsWith(".jpeg")
                 || lower.endsWith(".png") || lower.endsWith(".webp")
-                || lower.endsWith(".bmp");
+                || lower.endsWith(".bmp") || isHeicName(name);
+    }
+
+    public static boolean isHeicName(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.endsWith(".heic") || lower.endsWith(".heif");
     }
 
     static File previewPathFor(File original) {
-        // Preserve the original extension too: photo.png and photo.jpg are distinct originals.
-        return new File(original.getParentFile(), original.getName() + ".hq.jpg");
+        return previewPathFor(original, true);
+    }
+
+    static File previewPathFor(File original, boolean preserveHeic) {
+        String name = original.getName();
+        String lower = name.toLowerCase(Locale.US);
+        if (isHeicName(name) && preserveHeic) return original;
+        if (!isCompressibleExtension(name)) {
+            return original;
+        }
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+            // MiGallery's SlimController uses the source JPEG's own pathname for its optimized
+            // representation. The registry's derived hash protects it until the original returns.
+            return original;
+        }
+        int extension = name.lastIndexOf('.');
+        String stem = extension > 0 ? name.substring(0, extension) : name;
+        return new File(original.getParentFile(), stem + ".jpg");
+    }
+
+    private static boolean samePath(File first, File second) {
+        try {
+            return first.getCanonicalPath().equals(second.getCanonicalPath());
+        } catch (IOException ignored) {
+            return first.getAbsoluteFile().equals(second.getAbsoluteFile());
+        }
+    }
+
+    static boolean previewPathOccupiedByAnotherFile(File original) {
+        File preview = previewPathFor(original);
+        return !samePath(preview, original) && preview.exists();
+    }
+
+    /**
+     * Album backups carry their original storage-relative path, so a missing local file belongs
+     * at that album location. Existing local bytes win: a same-size file is the match, while a
+     * different file sends the remote copy to the reserved mirror without overwriting it.
+     */
+    static File destinationFor(Config config, String relativePath, long remoteSize) {
+        return destinationFor(config == null ? null : config.getRemoteLayout(), relativePath,
+                remoteSize);
+    }
+
+    static File destinationFor(String layout, String relativePath, long remoteSize) {
+        return destinationFor(layout, relativePath, remoteSize,
+                new File(PRIMARY_STORAGE_ROOT), new File(MIRROR_ROOT));
+    }
+
+    static File destinationFor(String layout, String relativePath, long remoteSize,
+            File primaryRoot, File mirrorRoot) {
+        File mirror = new File(mirrorRoot, relativePath);
+        if (!Config.LAYOUT_ALBUM.equals(layout) || !isSafeRelativePath(relativePath)) {
+            return mirror;
+        }
+        File album = new File(primaryRoot, relativePath);
+        if (album.isFile() && remoteSize >= 0L && album.length() == remoteSize) {
+            return album;
+        }
+        return album.exists() ? mirror : album;
+    }
+
+    /** Publish a protected copy at the corrected album path before handing it to Gallery. */
+    private void migrateLegacyDownload(Config config, String remotePath, String relative,
+            File original, int generation) {
+        File legacy = new File(MIRROR_ROOT, relative);
+        File newPreview = previewPathFor(original, config.isPreserveHeicFormat());
+        if (original.exists() || (!samePath(newPreview, original) && newPreview.exists())) return;
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath, legacy);
+        if (record == null) return;
+        File preview = record.previewLocalPath == null ? null : new File(record.previewLocalPath);
+        if (preview != null && isHeicName(original.getName())
+                && preview.getName().toLowerCase(Locale.US).endsWith(".jpg")) {
+            // Legacy JPEG bytes remain JPEG even after the HEIC preference changes.
+            newPreview = previewPathFor(original, false);
+        }
+        if (!samePath(newPreview, original) && newPreview.exists()) return;
+        File source = preview != null && preview.isFile() ? preview : legacy;
+        if (!source.isFile()) return;
+        File staged = null;
+        try {
+            ensureWorkCurrent(config, generation);
+            String digest = sha256(source);
+            boolean derived = preview != null && source.equals(preview);
+            if (derived && !isCompressibleExtension(original.getName())) return;
+            Long expected = record.derivedHashes.get(digest);
+            if (derived ? expected == null || expected.longValue() != source.length()
+                    : source.length() != record.originalLength || !record.sha256.equals(digest)) return;
+            File destination = derived ? newPreview : original;
+            staged = stageBesideDestination(source, destination);
+            if (!digest.equals(sha256(staged))) throw new IOException("legacy copy digest mismatch");
+            ensureWorkCurrent(config, generation);
+            if (derived) {
+                mOriginalStore.registerDownloadedPreview(config, remotePath, record.originalLength,
+                        record.sha256, original, destination, staged);
+            } else {
+                mOriginalStore.registerDownloadedOriginal(config, remotePath, staged,
+                        original, record.originalLength, record.sha256);
+            }
+            ensureWorkCurrent(config, generation);
+            publishStagedFile(staged, destination);
+            staged = null;
+            Ingest ingest = mIngest;
+            if (ingest != null) ingest.ingest(destination.getAbsolutePath());
+            Logger.i("event=download_legacy_album_migrated local=" + destination);
+        } catch (Throwable t) {
+            Logger.w("event=download_legacy_album_migration_failed", t);
+        } finally {
+            if (staged != null) staged.delete();
+        }
+    }
+
+    static boolean isSafeRelativePath(String relativePath) {
+        if (relativePath == null || relativePath.isEmpty()
+                || relativePath.startsWith("/") || relativePath.startsWith("\\")) {
+            return false;
+        }
+        for (String segment : relativePath.replace('\\', '/').split("/", -1)) {
+            if (!isSafeSegment(segment)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Detect animated formats by signature/chunk, since the private staging file has no extension. */
@@ -1054,7 +1198,7 @@ public final class DownloadQueue {
         return false;
     }
 
-    private static boolean makePreview(File original, File output) {
+    private static boolean makePreview(File original, File output, boolean preserveMetadata) {
         Bitmap decoded = null;
         Bitmap oriented = null;
         Bitmap rgb = null;
@@ -1108,7 +1252,7 @@ public final class DownloadQueue {
                 out.flush();
                 out.getFD().sync();
             }
-            copyCaptureTime(original, output);
+            copyCaptureTime(original, output, preserveMetadata);
             BitmapFactory.Options verify = new BitmapFactory.Options();
             verify.inJustDecodeBounds = true;
             BitmapFactory.decodeFile(output.getAbsolutePath(), verify);
@@ -1132,25 +1276,60 @@ public final class DownloadQueue {
     }
 
     /** Re-encoding must not move old photos to today's date when the gallery scans the preview. */
-    private static void copyCaptureTime(File original, File preview) {
-        try {
+    private static void copyCaptureTime(File original, File preview, boolean preserveMetadata)
+            throws IOException {
+        ExifInterface target = new ExifInterface(preview.getAbsolutePath());
+        if (preserveMetadata) {
             ExifInterface source = new ExifInterface(original.getAbsolutePath());
-            ExifInterface target = new ExifInterface(preview.getAbsolutePath());
-            String[] tags = {ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL,
-                    ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_SUBSEC_TIME,
-                    ExifInterface.TAG_SUBSEC_TIME_ORIGINAL, ExifInterface.TAG_SUBSEC_TIME_DIGITIZED};
-            for (String tag : tags) {
+            // Resolve tag names at runtime so a platform that lacks a newer public constant can
+            // still preserve the rest of the allowlist. Deliberately omit dimensions, offsets,
+            // compression, embedded thumbnails, serial numbers, and the source orientation.
+            String[] tagFields = {
+                "TAG_GPS_VERSION_ID", "TAG_GPS_LATITUDE", "TAG_GPS_LATITUDE_REF",
+                "TAG_GPS_LONGITUDE", "TAG_GPS_LONGITUDE_REF", "TAG_GPS_ALTITUDE",
+                "TAG_GPS_ALTITUDE_REF", "TAG_GPS_TIMESTAMP", "TAG_GPS_DATESTAMP",
+                "TAG_GPS_PROCESSING_METHOD", "TAG_GPS_SPEED", "TAG_GPS_SPEED_REF",
+                "TAG_GPS_TRACK", "TAG_GPS_TRACK_REF", "TAG_GPS_IMG_DIRECTION",
+                "TAG_GPS_IMG_DIRECTION_REF", "TAG_GPS_DEST_LATITUDE",
+                "TAG_GPS_DEST_LATITUDE_REF", "TAG_GPS_DEST_LONGITUDE",
+                "TAG_GPS_DEST_LONGITUDE_REF", "TAG_GPS_DEST_BEARING",
+                "TAG_GPS_DEST_BEARING_REF", "TAG_GPS_DEST_DISTANCE",
+                "TAG_GPS_DEST_DISTANCE_REF", "TAG_GPS_AREA_INFORMATION",
+                "TAG_GPS_DOP", "TAG_GPS_MAP_DATUM", "TAG_GPS_SATELLITES",
+                "TAG_GPS_STATUS", "TAG_GPS_MEASURE_MODE", "TAG_GPS_H_POSITIONING_ERROR",
+                "TAG_GPS_DIFFERENTIAL", "TAG_MAKE", "TAG_MODEL", "TAG_EXPOSURE_TIME",
+                "TAG_F_NUMBER", "TAG_ISO_SPEED_RATINGS", "TAG_PHOTOGRAPHIC_SENSITIVITY",
+                "TAG_EXPOSURE_PROGRAM", "TAG_EXPOSURE_BIAS_VALUE", "TAG_METERING_MODE",
+                "TAG_APERTURE_VALUE", "TAG_MAX_APERTURE_VALUE", "TAG_FOCAL_LENGTH",
+                "TAG_FLASH", "TAG_WHITE_BALANCE", "TAG_LIGHT_SOURCE", "TAG_ARTIST",
+                "TAG_COPYRIGHT", "TAG_DATETIME", "TAG_DATETIME_ORIGINAL",
+                "TAG_DATETIME_DIGITIZED", "TAG_SUBSEC_TIME", "TAG_SUBSEC_TIME_ORIGINAL",
+                "TAG_SUBSEC_TIME_DIGITIZED", "TAG_OFFSET_TIME", "TAG_OFFSET_TIME_ORIGINAL",
+                "TAG_OFFSET_TIME_DIGITIZED", "TAG_LENS_MAKE", "TAG_LENS_MODEL",
+                "TAG_LENS_SPECIFICATION", "TAG_FOCAL_LENGTH_IN_35MM_FILM", "TAG_USER_COMMENT",
+                "TAG_IMAGE_DESCRIPTION", "TAG_SOFTWARE"
+            };
+            for (String fieldName : tagFields) {
+                String tag;
+                try {
+                    Object value = ExifInterface.class.getField(fieldName).get(null);
+                    if (!(value instanceof String)) continue;
+                    tag = (String) value;
+                } catch (NoSuchFieldException | IllegalAccessException ignored) {
+                    continue;
+                }
                 String value = source.getAttribute(tag);
                 if (value != null) target.setAttribute(tag, value);
             }
-            // The JPEG pixels have already been rotated/flipped; never copy the old orientation.
-            target.setAttribute(ExifInterface.TAG_ORIENTATION,
-                    String.valueOf(ExifInterface.ORIENTATION_NORMAL));
-            target.saveAttributes();
-        } catch (IOException ignored) {
-            // Some supported bitmap formats have no EXIF block.
         }
-        if (original.lastModified() > 0) preview.setLastModified(original.lastModified());
+        // The JPEG pixels have already been rotated/flipped; never copy the old orientation.
+        target.setAttribute(ExifInterface.TAG_ORIENTATION,
+                String.valueOf(ExifInterface.ORIENTATION_NORMAL));
+        // A failed EXIF write aborts preview creation, keeping the original in place.
+        target.saveAttributes();
+        if (preserveMetadata && original.lastModified() > 0) {
+            preview.setLastModified(original.lastModified());
+        }
     }
 
     /**
@@ -1158,6 +1337,23 @@ public final class DownloadQueue {
      * Returns false for animated or unsupported image data; callers should retain the original.
      */
     public static boolean createCompressedPreview(File original, File output) {
+        return createCompressedPreview(original, output, true);
+    }
+
+    /** Apply the same format and metadata policy to downloads and storage optimization. */
+    public static boolean createCompressedPreview(File original, File output,
+            String originalName, Config config) {
+        boolean metadata = config == null || config.isPreserveMetadata();
+        if (isHeicName(originalName) && (config == null || config.isPreserveHeicFormat())) {
+            return HeicPreviewEncoder.encode(original, output, PREVIEW_MAX_EDGE,
+                    PREVIEW_JPEG_QUALITY, metadata);
+        }
+        return createCompressedPreview(original, output, metadata);
+    }
+
+    /** Create a JPEG preview with optional allowlisted EXIF copying. */
+    public static boolean createCompressedPreview(File original, File output,
+            boolean preserveMetadata) {
         if (original == null || output == null || !original.isFile()) {
             return false;
         }
@@ -1169,7 +1365,7 @@ public final class DownloadQueue {
             if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
                 return false;
             }
-            return makePreview(original, output);
+            return makePreview(original, output, preserveMetadata);
         } catch (Throwable t) {
             Logger.d("event=download_preview_failed reason=" + t);
             output.delete();
@@ -1319,7 +1515,7 @@ public final class DownloadQueue {
     }
 
     private static String fullPathOf(Pending pending) {
-        return DOWNLOAD_ROOT + "/" + pending.relativePath;
+        return pending.localPath;
     }
 
     private static String key(Pending pending) {
@@ -1333,7 +1529,7 @@ public final class DownloadQueue {
 
     private long freeBytes() {
         try {
-            StatFs stat = new StatFs(DOWNLOAD_ROOT);
+            StatFs stat = new StatFs(PRIMARY_STORAGE_ROOT);
             return stat.getAvailableBytes();
         } catch (Throwable t) {
             // 判不出来就当作有空间：这里失败的方向最多是"写满了才发现"，

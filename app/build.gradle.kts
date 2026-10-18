@@ -18,8 +18,8 @@ android {
         testInstrumentationRunner = "com.tongluosao.gallerysync.core.QualityValidationInstrumentation"
         // 发布必须升 versionCode：框架按目标进程里的 loadedVersionCode 判断那一代代码旧不旧。
         // 注意它不是"热重载失败"的原因（那是 onPackageReady 里的 detach()），号涨了也照样会被跳过
-        versionCode = 62
-        versionName = "1.2.6"
+        versionCode = 72
+        versionName = "1.2.16"
     }
 
     buildTypes {
@@ -55,6 +55,10 @@ dependencies {
 
     // 配置界面：Miuix 的 androidx.compose 版本由它的 POM 决定，不在此另钉一套
     implementation(libs.androidx.activity.compose)
+    // HeifWriter uses a bitmap/surface path and HEVC tiled fallback on devices without a
+    // flexible-YUV HEIC image encoder. ExifInterface reads source and output HEIF metadata.
+    implementation(libs.androidx.heifwriter)
+    implementation(libs.androidx.exifinterface)
     implementation(libs.miuix.ui)
     implementation(libs.miuix.preference)
     // 底栏图标（设置/进度）。不加也能编译，只是 MiuixIcons.Settings 这类扩展属性不存在

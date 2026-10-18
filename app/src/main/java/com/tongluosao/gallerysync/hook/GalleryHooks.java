@@ -316,6 +316,10 @@ public final class GalleryHooks {
     private void installSlimHook() {
         SlimHook hook = new SlimHook(mXposed, mClassLoader);
         hook.setConfig(mConfig);
+        hook.setVideoRestorePolicy(() -> {
+            OriginalRestoreHook restore = mOriginalRestoreHook;
+            return restore != null && restore.canRestoreVideos();
+        });
         hook.install();
         mSlimHook = hook;
     }

@@ -44,6 +44,10 @@
 
     <string name="label_skip_existing_remote">远端有同名文件就跳过</string>
     <string name="summary_skip_existing_remote">上传前先看一眼远端有没有同名的，有就当已备份、不比对内容直接跳过。省流量但不会发现内容不同的旧文件</string>
+    <string name="label_preserve_metadata">保留元数据</string>
+    <string name="summary_preserve_metadata">优化与高质量下载保留拍摄时间、位置及相机等元数据；无法安全保留时保留原件</string>
+    <string name="label_preserve_heic_format">HEIC 优化/下载保持原格式</string>
+    <string name="summary_preserve_heic_format">关闭后可将 HEIC 转为 JPEG；开启后保持 HEIC，遇到不支持处理的情况则保留原件</string>
     <string name="label_local_flag_mode">已上传标记记录方式</string>
     <string name="summary_local_flag_mode">与相册共用一条记录最省事，但换账号/换目录后相册仍认为传过了；分开记则各账号各记一份，换回来不用重传</string>
     <string name="flag_mode_shared">与相册共用（改相册标记）</string>

@@ -276,6 +276,18 @@ private fun BehaviorSection(model: SettingsModel) {
                 title = stringResource(R.string.label_skip_existing_remote),
                 summary = stringResource(R.string.summary_skip_existing_remote)
             )
+            SwitchPreference(
+                checked = model.preserveMetadata,
+                onCheckedChange = model::onPreserveMetadataChange,
+                title = stringResource(R.string.label_preserve_metadata),
+                summary = stringResource(R.string.summary_preserve_metadata)
+            )
+            SwitchPreference(
+                checked = model.preserveHeicFormat,
+                onCheckedChange = model::onPreserveHeicFormatChange,
+                title = stringResource(R.string.label_preserve_heic_format),
+                summary = stringResource(R.string.summary_preserve_heic_format)
+            )
             OverlayDropdownPreference(
                 items = listOf(
                     stringResource(R.string.flag_mode_shared),

@@ -15,6 +15,7 @@ import com.tongluosao.gallerysync.core.WebDavClient;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -24,6 +25,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.function.BooleanSupplier;
 
 import io.github.libxposed.api.XposedInterface;
 
@@ -36,7 +40,10 @@ final class SlimHook {
 
     private final XposedInterface mXposed;
     private final ClassLoader mClassLoader;
+    private final Object mConfigLock = new Object();
     private volatile Config mConfig;
+    private volatile SlimScannerHook mScannerHook;
+    private volatile BooleanSupplier mVideoRestorePolicy = () -> false;
 
     SlimHook(XposedInterface xposed, ClassLoader classLoader) {
         mXposed = xposed;
@@ -44,7 +51,19 @@ final class SlimHook {
     }
 
     void setConfig(Config config) {
-        mConfig = config;
+        synchronized (mConfigLock) {
+            mConfig = config;
+            SlimScannerHook scanner = mScannerHook;
+            if (scanner != null) scanner.setConfig(config);
+        }
+    }
+
+    void setVideoRestorePolicy(BooleanSupplier policy) {
+        synchronized (mConfigLock) {
+            mVideoRestorePolicy = policy == null ? () -> false : policy;
+            SlimScannerHook scanner = mScannerHook;
+            if (scanner != null) scanner.setVideoRestorePolicy(mVideoRestorePolicy);
+        }
     }
 
     void install() {
@@ -91,6 +110,12 @@ final class SlimHook {
                         return interceptManaged(item, saveToDb, chain);
                     });
             Logger.i("event=hook_registered method=SlimController.handleSlim(MediaItem,ArrayList)");
+
+            SlimScannerHook scanner = new SlimScannerHook(mXposed, mClassLoader);
+            scanner.setConfig(mConfig);
+            scanner.setVideoRestorePolicy(mVideoRestorePolicy);
+            scanner.install();
+            mScannerHook = scanner;
         } catch (ClassNotFoundException e) {
             Logger.e("event=slim_hook_class_not_found class=" + CLS_CONTROLLER, e);
         } catch (NoSuchMethodException e) {
@@ -132,7 +157,10 @@ final class SlimHook {
 
         if (byPath == null && record == null) {
             if (config != null && config.isReady() && config.isReplace()) {
-                if (item.serverType != 1 || !hasIdentity(item)) {
+                boolean mayMigrateLegacy = item.serverType == 1
+                        ? hasIdentity(item) : item.serverType == 2
+                        && mayMigrateLegacyVideo(original, item);
+                if (!mayMigrateLegacy) {
                     Logger.w("event=slim_skipped reason=legacy_original_unverified path=" + item.path);
                     return 0L;
                 }
@@ -173,10 +201,16 @@ final class SlimHook {
             return 0L;
         }
 
-        // Gallery's JPEG preview builder cannot preserve video originals. Keep managed videos
-        // untouched rather than allowing native slimming to remove their only local copy.
-        if (item.serverType != 1) {
-            Logger.i("event=slim_skipped reason=unsupported_media_type path=" + item.path);
+        if (item.serverType != 1 && item.serverType != 2) {
+            Logger.i("event=slim_skipped reason=unsupported_media_type type=" + item.serverType
+                    + " path=" + item.path);
+            return 0L;
+        }
+        if (item.serverType == 2 && (!videoRestoreReady()
+                || item.sha1 == null || item.sha1.isEmpty()
+                || item.fileName == null || item.fileName.isEmpty())) {
+            Logger.i("event=slim_skipped reason=video_restore_not_ready_or_metadata_missing path="
+                    + item.path);
             return 0L;
         }
         if (!localOriginalMatches(original, record)) {
@@ -211,8 +245,13 @@ final class SlimHook {
         OriginalStore.PathLease previewLease = null;
         boolean previewPublished = false;
         try {
-            staged = File.createTempFile(".slim-", ".jpg", parent);
-            if (!DownloadQueue.createCompressedPreview(original, staged)
+            String previewSuffix = item.serverType == 1 && DownloadQueue.isHeicName(original.getName())
+                    && config.isPreserveHeicFormat() ? ".heic" : ".jpg";
+            staged = File.createTempFile(".slim-", previewSuffix, parent);
+            boolean previewCreated = item.serverType == 1
+                    ? DownloadQueue.createCompressedPreview(original, staged, original.getName(), config)
+                    : createNativeVideoPoster(original, staged, parent, item);
+            if (!previewCreated
                     || !staged.isFile() || staged.length() <= 0
                     || staged.length() >= original.length()) {
                 Logger.i("event=slim_skipped reason=preview_not_smaller path=" + item.path);
@@ -235,7 +274,7 @@ final class SlimHook {
 
             // Create an exclusive, unique destination. Replacing this placeholder publishes only
             // a path allocated by this operation, never an existing user's file.
-            preview = File.createTempFile(".slim-preview-", ".jpg", parent);
+            preview = File.createTempFile(".slim-preview-", previewSuffix, parent);
             // Persist the final path and hold its write lease before publishing the preview. The
             // post-move registration stores its fingerprint for future upload classification.
             if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
@@ -248,40 +287,61 @@ final class SlimHook {
                 return 0L;
             }
 
-            publish(staged, preview);
-            previewPublished = true;
-            if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
-                Logger.w("event=slim_db_update_skipped reason=preview_fingerprint_failed path="
-                        + item.path);
-                return 0L;
-            }
+            synchronized (mConfigLock) {
+                if (!isCurrentTargetLocked(config)) {
+                    Logger.w("event=slim_skipped reason=webdav_target_changed_before_publish path="
+                            + item.path);
+                    return 0L;
+                }
 
-            try {
-                // Dex evidence confirms saveToDB(int, String, String): arg 2 is thumbnailFile,
-                // arg 3 is localFile. Native slimming stores its generated preview as
-                // thumbnailFile and clears localFile to make Gallery treat the original as absent.
-                saveToDb.invoke(null, item.id, preview.getAbsolutePath(), "");
-            } catch (Throwable t) {
-                Logger.e("event=slim_db_update_call_failed path=" + item.path, t);
-            }
+                publish(staged, preview);
+                previewPublished = true;
+                if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
+                    Logger.w("event=slim_db_update_skipped reason=preview_fingerprint_failed path="
+                            + item.path);
+                    return 0L;
+                }
 
-            if (!databasePointsToPreview(context, item.id, preview.getAbsolutePath())) {
-                Logger.w("event=slim_db_update_unconfirmed path=" + item.path
-                        + " preview=" + preview.getAbsolutePath());
-                return 0L;
-            }
+                try {
+                    // Dex evidence confirms saveToDB(int, String, String): arg 2 is thumbnailFile,
+                    // arg 3 is localFile. Native slimming stores its generated preview as
+                    // thumbnailFile and clears localFile to make Gallery treat the original as absent.
+                    saveToDb.invoke(null, item.id, preview.getAbsolutePath(), "");
+                } catch (Throwable t) {
+                    Logger.e("event=slim_db_update_call_failed path=" + item.path, t);
+                }
 
-            long sourceLength = original.length();
-            long previewLength = preview.length();
-            if (!original.delete()) {
-                Logger.w("event=slim_original_delete_failed path=" + item.path
-                        + " preview=" + preview.getAbsolutePath());
-                return 0L;
+                if (!databasePointsToPreview(context, item.id, preview.getAbsolutePath())) {
+                    Logger.w("event=slim_db_update_unconfirmed path=" + item.path
+                            + " preview=" + preview.getAbsolutePath());
+                    return 0L;
+                }
+
+                // Keep the config lock through DB publication and deletion. A config callback
+                // cannot switch the active restore target between this check and the irreversible
+                // source deletion.
+                if (!isCurrentTargetLocked(config)) {
+                    Logger.w("event=slim_skipped reason=webdav_target_changed_before_delete path="
+                            + item.path);
+                    return 0L;
+                }
+                if (item.serverType == 2 && !videoRestoreReady()) {
+                    Logger.w("event=slim_video_restore_lost_before_delete path=" + item.path);
+                    return 0L;
+                }
+
+                long sourceLength = original.length();
+                long previewLength = preview.length();
+                if (!original.delete()) {
+                    Logger.w("event=slim_original_delete_failed path=" + item.path
+                            + " preview=" + preview.getAbsolutePath());
+                    return 0L;
+                }
+                Logger.i("event=slim_original_replaced path=" + item.path
+                        + " preview=" + preview.getAbsolutePath()
+                        + " saved=" + Math.max(0L, sourceLength - previewLength));
+                return Math.max(0L, sourceLength - previewLength);
             }
-            Logger.i("event=slim_original_replaced path=" + item.path
-                    + " preview=" + preview.getAbsolutePath()
-                    + " saved=" + Math.max(0L, sourceLength - previewLength));
-            return Math.max(0L, sourceLength - previewLength);
         } catch (Throwable t) {
             Logger.e("event=slim_optimization_failed path=" + item.path, t);
             // A published preview remains registered and the original remains until the DB has
@@ -296,6 +356,88 @@ final class SlimHook {
             }
             if (previewLease != null) previewLease.close();
             if (originalLease != null) originalLease.close();
+        }
+    }
+
+    private boolean videoRestoreReady() {
+        BooleanSupplier policy = mVideoRestorePolicy;
+        if (policy == null) return false;
+        try {
+            return policy.getAsBoolean();
+        } catch (Throwable t) {
+            Logger.w("event=slim_video_restore_policy_failed", t);
+            return false;
+        }
+    }
+
+    private boolean isCurrentTargetLocked(Config expected) {
+        Config active = mConfig;
+        if (expected == null || active == null || !expected.isReady() || !active.isReady()) {
+            return false;
+        }
+        return OriginalStore.targetKey(expected).equals(OriginalStore.targetKey(active))
+                && Objects.equals(expected.getPassword(), active.getPassword())
+                && Objects.equals(expected.getRemoteLayout(), active.getRemoteLayout());
+    }
+
+    private boolean mayMigrateLegacyVideo(File original, SlimItem item) {
+        if (!videoRestoreReady() || !hasIdentity(item)
+                || item.sha1 == null || item.sha1.isEmpty()
+                || item.fileName == null || item.fileName.isEmpty()
+                || original == null || !original.isFile() || original.length() <= 0L) {
+            return false;
+        }
+        try {
+            return UploadQueue.wasVerifiedUploadCurrentTarget(original.getCanonicalPath(),
+                    original.length(), original.lastModified());
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** Generate Gallery's normal video slim poster in an operation-owned staging directory. */
+    private boolean createNativeVideoPoster(File original, File staged, File parent,
+            SlimItem item) throws Exception {
+        File work = new File(parent, ".video-build-" + UUID.randomUUID());
+        if (!work.mkdir()) return false;
+        try {
+            Class<?> metaWriterClass = mClassLoader.loadClass(
+                    "com.miui.gallery.data.ThumbnailMetaWriter");
+            Constructor<?> metaWriterConstructor = metaWriterClass.getDeclaredConstructor(
+                    String.class, String.class, long.class, String.class, String.class,
+                    String.class);
+            metaWriterConstructor.setAccessible(true);
+            Object metaWriter = metaWriterConstructor.newInstance(item.sha1, item.fileName,
+                    item.date, item.dateTime, item.gpsDateStamp, item.gpsTimeStamp);
+
+            Class<?> cloudUtils = mClassLoader.loadClass("com.miui.gallery.cloud.utils.CloudUtils");
+            Method buildVideoPoster = cloudUtils.getDeclaredMethod("buildBigThumbnailsForVideo",
+                    String.class, String.class, String.class, String.class, metaWriterClass);
+            buildVideoPoster.setAccessible(true);
+            String outputName = ".gallerysync-video-" + item.id + "-"
+                    + UUID.randomUUID() + ".jpg";
+            Object result = buildVideoPoster.invoke(null, original.getAbsolutePath(), item.sha1,
+                    work.getAbsolutePath(), outputName, metaWriter);
+            if (!(result instanceof String) || ((String) result).isEmpty()) return false;
+
+            File generated = new File((String) result);
+            String workPath = work.getCanonicalPath() + File.separator;
+            String generatedPath = generated.getCanonicalPath();
+            if (!generatedPath.startsWith(workPath) || !generated.isFile()
+                    || generated.length() <= 0 || generated.length() >= original.length()) {
+                return false;
+            }
+            Files.move(generated.toPath(), staged.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            return staged.isFile() && staged.length() > 0
+                    && staged.length() < original.length();
+        } finally {
+            File[] leftovers = work.listFiles();
+            if (leftovers != null) {
+                for (File leftover : leftovers) {
+                    if (leftover.isFile()) leftover.delete();
+                }
+            }
+            work.delete();
         }
     }
 
@@ -322,7 +464,8 @@ final class SlimHook {
 
     private static boolean migrateLegacyOriginal(OriginalStore store, Config config,
             File original, SlimItem item) throws IOException {
-        String candidate = UploadQueue.remotePathFor(config, item.path, false, item.date);
+        String candidate = UploadQueue.remotePathFor(config, item.path,
+                item.serverType == 2, item.date);
         if (candidate == null || candidate.isEmpty()) return false;
         int slash = candidate.lastIndexOf('/');
         String requestedParent = slash < 0 ? "" : candidate.substring(0, slash);
@@ -429,6 +572,10 @@ final class SlimHook {
         final Field sha1;
         final Field serverType;
         final Field mixDateTime;
+        final Field fileName;
+        final Field dateTime;
+        final Field gpsDateStamp;
+        final Field gpsTimeStamp;
 
         ItemFields(Class<?> type) throws NoSuchFieldException {
             id = field(type, "id");
@@ -437,6 +584,10 @@ final class SlimHook {
             sha1 = field(type, "sha1");
             serverType = field(type, "serverType");
             mixDateTime = field(type, "mixDateTime");
+            fileName = field(type, "fileName");
+            dateTime = field(type, "dateTime");
+            gpsDateStamp = field(type, "gpsDateStamp");
+            gpsTimeStamp = field(type, "gpsTimeStamp");
         }
 
         private static Field field(Class<?> type, String name) throws NoSuchFieldException {
@@ -452,8 +603,13 @@ final class SlimHook {
             String itemSha1 = (String) sha1.get(media);
             int type = serverType.getInt(media);
             long date = mixDateTime.getLong(media);
+            String itemFileName = (String) fileName.get(media);
+            String itemDateTime = (String) dateTime.get(media);
+            String itemGpsDate = (String) gpsDateStamp.get(media);
+            String itemGpsTime = (String) gpsTimeStamp.get(media);
             return new SlimItem(itemId, local, thumbnail, itemSha1,
-                    itemId < 0 ? null : String.valueOf(itemId), type, date);
+                    itemId < 0 ? null : String.valueOf(itemId), type, date, itemFileName,
+                    itemDateTime, itemGpsDate, itemGpsTime);
         }
     }
 
@@ -465,9 +621,14 @@ final class SlimHook {
         final String rowId;
         final int serverType;
         final long date;
+        final String fileName;
+        final String dateTime;
+        final String gpsDateStamp;
+        final String gpsTimeStamp;
 
         SlimItem(int id, String path, String thumbnailFilePath, String sha1, String rowId,
-                int serverType, long date) {
+                int serverType, long date, String fileName, String dateTime, String gpsDateStamp,
+                String gpsTimeStamp) {
             this.id = id;
             this.path = path;
             this.thumbnailFilePath = thumbnailFilePath;
@@ -475,6 +636,10 @@ final class SlimHook {
             this.rowId = rowId;
             this.serverType = serverType;
             this.date = date;
+            this.fileName = fileName;
+            this.dateTime = dateTime;
+            this.gpsDateStamp = gpsDateStamp;
+            this.gpsTimeStamp = gpsTimeStamp;
         }
     }
 }

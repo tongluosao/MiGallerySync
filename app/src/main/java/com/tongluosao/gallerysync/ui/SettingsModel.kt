@@ -62,6 +62,12 @@ class SettingsModel : CoroutineScope {
     /** 上传前先看远端有没有同名文件，有就跳过（不比对内容） */
     var skipExistingRemote by mutableStateOf(Config.DEFAULT_SKIP_EXISTING_REMOTE)
         private set
+    /** 优化图与 HQ 下载是否保留原图元数据 */
+    var preserveMetadata by mutableStateOf(Config.DEFAULT_PRESERVE_METADATA)
+        private set
+    /** HEIC 优化或下载是否保持原格式 */
+    var preserveHeicFormat by mutableStateOf(Config.DEFAULT_PRESERVE_HEIC_FORMAT)
+        private set
     /** 记录方式下标：0 = 与相册共用，1 = 按目标分开记录。对应 [FLAG_MODE_VALUES] */
     var localFlagModeIndex by mutableStateOf(0)
         private set
@@ -159,6 +165,16 @@ class SettingsModel : CoroutineScope {
     fun onSkipExistingRemoteChange(checked: Boolean) {
         skipExistingRemote = checked
         writeNow(Config.KEY_SKIP_EXISTING_REMOTE, checked)
+    }
+
+    fun onPreserveMetadataChange(checked: Boolean) {
+        preserveMetadata = checked
+        writeNow(Config.KEY_PRESERVE_METADATA, checked)
+    }
+
+    fun onPreserveHeicFormatChange(checked: Boolean) {
+        preserveHeicFormat = checked
+        writeNow(Config.KEY_PRESERVE_HEIC_FORMAT, checked)
     }
 
     /** 落盘的是字符串（shared / per_target），不是下标 —— 详见 Config.KEY_LOCAL_FLAG_MODE */
@@ -365,6 +381,12 @@ class SettingsModel : CoroutineScope {
         skipExistingRemote = source.getBoolean(
             Config.KEY_SKIP_EXISTING_REMOTE, Config.DEFAULT_SKIP_EXISTING_REMOTE
         )
+        preserveMetadata = source.getBoolean(
+            Config.KEY_PRESERVE_METADATA, Config.DEFAULT_PRESERVE_METADATA
+        )
+        preserveHeicFormat = source.getBoolean(
+            Config.KEY_PRESERVE_HEIC_FORMAT, Config.DEFAULT_PRESERVE_HEIC_FORMAT
+        )
         localFlagModeIndex = flagModeIndexOf(
             source.getString(Config.KEY_LOCAL_FLAG_MODE, Config.DEFAULT_LOCAL_FLAG_MODE)
         )
@@ -400,6 +422,12 @@ class SettingsModel : CoroutineScope {
 
             Config.KEY_SKIP_EXISTING_REMOTE -> skipExistingRemote =
                 source.getBoolean(key, Config.DEFAULT_SKIP_EXISTING_REMOTE)
+
+            Config.KEY_PRESERVE_METADATA -> preserveMetadata =
+                source.getBoolean(key, Config.DEFAULT_PRESERVE_METADATA)
+
+            Config.KEY_PRESERVE_HEIC_FORMAT -> preserveHeicFormat =
+                source.getBoolean(key, Config.DEFAULT_PRESERVE_HEIC_FORMAT)
 
             Config.KEY_LOCAL_FLAG_MODE -> localFlagModeIndex = flagModeIndexOf(
                 source.getString(key, Config.DEFAULT_LOCAL_FLAG_MODE)
