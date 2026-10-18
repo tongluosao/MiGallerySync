@@ -14,6 +14,7 @@ import java.util.List;
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.DownloadQueue;
 import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.core.OriginalStore;
 import com.tongluosao.gallerysync.core.ProgressProtocol;
 import com.tongluosao.gallerysync.core.SyncMarker;
 import com.tongluosao.gallerysync.core.TrashQueue;
@@ -59,6 +60,10 @@ public final class GalleryHooks {
     private volatile TrashQueue mTrash;
     /** 删除方向的 hook。它只需要一个 Context 与回收站队列，与上传队列无关 */
     private volatile DeleteHook mDeleteHook;
+    /** WebDAV original restore path, entered only by the Gallery's verified native request chain. */
+    private volatile OriginalRestoreHook mOriginalRestoreHook;
+    /** Protects registered WebDAV originals when Gallery's native slim operation runs. */
+    private volatile SlimHook mSlimHook;
     private volatile Config mConfig;
     /** 宿主 Application 是否已经 onCreate：配置与它谁先到都有可能，两边都要能补建队列 */
     private volatile boolean mAppStarted;
@@ -77,6 +82,8 @@ public final class GalleryHooks {
         hooks.installUploadOutletHook();
         hooks.installAppStartHook();
         hooks.installDirtyCountHook();
+        hooks.installOriginalRestoreHook();
+        hooks.installSlimHook();
         return hooks;
     }
 
@@ -98,6 +105,14 @@ public final class GalleryHooks {
 
     public void setConfig(Config config) {
         mConfig = config;
+        OriginalRestoreHook originalRestore = mOriginalRestoreHook;
+        if (originalRestore != null) {
+            originalRestore.setConfig(config);
+        }
+        SlimHook slimHook = mSlimHook;
+        if (slimHook != null) {
+            slimHook.setConfig(config);
+        }
         UploadQueue queue = mQueue;
         if (queue != null) {
             queue.setConfig(config);
@@ -173,23 +188,57 @@ public final class GalleryHooks {
                     .setId("gallery_upload_outlet")
                     .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
                     .intercept(chain -> {
+                        OriginalStore.PathLease uploadLease = null;
                         try {
-                            Object desc = chain.getArg(1);
-                            String path = (String) filePath.get(desc);
-                            long size = fileSize.getLong(desc);
-                            Config config = mConfig;
-                            boolean shouldBeBlocked = config != null && config.isReplace();
-                            if (shouldBeBlocked) {
-                                Logger.w("event=upload_outlet_unexpected file=" + path
-                                        + " size=" + size
-                                        + " reason=replace_mode_must_not_reach_xiaomi_cloud");
-                            } else {
-                                Logger.d("event=upload_outlet file=" + path + " size=" + size);
+                            try {
+                                Object desc = chain.getArg(1);
+                                String path = (String) filePath.get(desc);
+                                long size = fileSize.getLong(desc);
+                                CloudItemReader.Item item = mReader == null
+                                        ? null : mReader.read(chain.getArg(0));
+                                Context context = HostContext.get(mClassLoader);
+                                if (context == null || path == null || path.isEmpty()) {
+                                    Logger.w("event=upload_outlet_hook_failed blocked=true reason="
+                                            + (context == null ? "no_host_context" : "path_unavailable"));
+                                    return null;
+                                }
+                                OriginalStore store = OriginalStore.get(context.getApplicationContext());
+                                // Hold this read lease until native upload completes. SlimHook takes
+                                // the matching write lease before switching localFile or deleting a
+                                // source, so an upload cannot race the source replacement.
+                                uploadLease = store.lockForUpload(new java.io.File(path));
+                                boolean protectedPath = store.isProtectedUpload(new java.io.File(path),
+                                        item == null ? null : item.rowId,
+                                        item == null ? null : item.sha1);
+                                if (protectedPath) {
+                                    Logger.w("event=native_upload_blocked reason=managed_or_modified_original path=" + path);
+                                    return null;
+                                }
+                                Config config = mConfig;
+                                boolean shouldBeBlocked = config != null && config.isReplace();
+                                if (shouldBeBlocked) {
+                                    Logger.w("event=upload_outlet_unexpected file=" + path
+                                            + " size=" + size
+                                            + " reason=replace_mode_must_not_reach_xiaomi_cloud");
+                                    // H1 normally consumes these requests. If an uncovered Gallery path
+                                    // reaches the transport hook, do not leak it to Xiaomi cloud.
+                                    return null;
+                                } else {
+                                    Logger.d("event=upload_outlet file=" + path + " size=" + size);
+                                }
+                            } catch (Throwable t) {
+                                Logger.e("event=upload_outlet_hook_failed blocked=true", t);
+                                // A read/registry failure at the last native upload boundary is not
+                                // permission to upload an unclassified file. H1/UploadQueue can retry
+                                // when the next batch arrives.
+                                return null;
                             }
-                        } catch (Throwable t) {
-                            Logger.e("event=upload_outlet_hook_failed", t);
+                            return chain.proceed();
+                        } finally {
+                            if (uploadLease != null) {
+                                uploadLease.close();
+                            }
                         }
-                        return chain.proceed();
                     });
             Logger.i("event=hook_registered method=GallerySFSFileTransferManager.doUpload");
         } catch (NoSuchMethodException e) {
@@ -225,6 +274,10 @@ public final class GalleryHooks {
                         try {
                             mAppStarted = true;
                             ensureQueue();
+                            OriginalRestoreHook restoreHook = mOriginalRestoreHook;
+                            if (restoreHook != null) {
+                                restoreHook.onAppStart();
+                            }
                             // 命令接收器与删除 hook 都要宿主 Context，而 install() 那一刻
                             // 启动还没走到这里（实测日志就是 command_receiver_unavailable
                             // reason=no_host_context）。放在 super.onCreate() 之后补装，
@@ -245,6 +298,20 @@ public final class GalleryHooks {
         } catch (Throwable t) {
             Logger.e("event=hook_failed method=GalleryApp.onCreate", t);
         }
+    }
+
+    private void installOriginalRestoreHook() {
+        OriginalRestoreHook hook = new OriginalRestoreHook(mXposed, mClassLoader);
+        hook.setConfig(mConfig);
+        hook.install();
+        mOriginalRestoreHook = hook;
+    }
+
+    private void installSlimHook() {
+        SlimHook hook = new SlimHook(mXposed, mClassLoader);
+        hook.setConfig(mConfig);
+        hook.install();
+        mSlimHook = hook;
     }
 
     /**
@@ -710,6 +777,7 @@ public final class GalleryHooks {
         DownloadQueue download;
         TrashQueue trash;
         BroadcastReceiver receiver;
+        OriginalRestoreHook restoreHook;
         synchronized (this) {
             queue = mQueue;
             mQueue = null;
@@ -719,7 +787,11 @@ public final class GalleryHooks {
             mTrash = null;
             receiver = mCommandReceiver;
             mCommandReceiver = null;
+            restoreHook = mOriginalRestoreHook;
+            mOriginalRestoreHook = null;
+            mSlimHook = null;
         }
+        if (restoreHook != null) restoreHook.shutdown();
         if (receiver != null) {
             try {
                 HostContext.get(mClassLoader).unregisterReceiver(receiver);

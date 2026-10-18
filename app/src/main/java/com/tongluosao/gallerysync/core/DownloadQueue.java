@@ -1,15 +1,28 @@
 package com.tongluosao.gallerysync.core;
 
 import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Matrix;
+import android.graphics.Paint;
+import android.media.ExifInterface;
 import android.os.StatFs;
 
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.BufferedInputStream;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -18,6 +31,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * WebDAV **下载**队列：把远端有、本地没有的文件取回本地。
@@ -81,10 +95,14 @@ public final class DownloadQueue {
 
     /** 下载 worker 的路数：下载的瓶颈几乎总在远端带宽，两路足够叠起等待 */
     private static final int THREADS = 2;
+    /** Maximum long edge for locally compressed previews. */
+    private static final int PREVIEW_MAX_EDGE = 2560;
+    private static final int PREVIEW_JPEG_QUALITY = 84;
 
     private static volatile DownloadQueue sInstance;
 
     private final Context mContext;
+    private final OriginalStore mOriginalStore;
     private final Object mLock = new Object();
 
     /** 认出但还没下完的项。计划线程添、worker 线程取 */
@@ -97,6 +115,8 @@ public final class DownloadQueue {
     private final Set<String> mInflight = new HashSet<>();
 
     private volatile Config mConfig;
+    /** Download completion paths only apply to this WebDAV target. */
+    private String mDownloadTarget;
     private volatile boolean mRunning = true;
     private long mNextRoundAt;
     private long mRoundDelay = ROUND_BASE;
@@ -122,17 +142,21 @@ public final class DownloadQueue {
         final String remotePath;
         final String relativePath;
         final long size;
+        final String target;
 
-        Pending(String remotePath, String relativePath, long size) {
+        Pending(String remotePath, String relativePath, long size, String target) {
             this.remotePath = remotePath;
             this.relativePath = relativePath;
             this.size = size;
+            this.target = target;
         }
     }
 
     private DownloadQueue(Context context, Config config) {
         mContext = context.getApplicationContext();
         mConfig = config;
+        mOriginalStore = OriginalStore.get(mContext);
+        mDownloadTarget = OriginalStore.targetKey(config);
         load();
         mNextRoundAt = System.currentTimeMillis() + START_DELAY;
         mPlanner = new Thread(this::plannerLoop, "MiGallerySync-download-plan");
@@ -158,7 +182,19 @@ public final class DownloadQueue {
     }
 
     public void setConfig(Config config) {
-        mConfig = config;
+        String nextTarget = OriginalStore.targetKey(config);
+        synchronized (mLock) {
+            if (!nextTarget.equals(mDownloadTarget)) {
+                mDownloadTarget = nextTarget;
+                mPending.clear();
+                mDone.clear();
+                mFailures.clear();
+                mPendingVersion++;
+                saveLocked();
+            }
+            mConfig = config;
+            mLock.notifyAll();
+        }
     }
 
     public void setIngest(Ingest ingest) {
@@ -336,8 +372,16 @@ public final class DownloadQueue {
     /** @return 这一轮认出多少个新文件 */
     private int plan(Config config) {
         List<Pending> found = new ArrayList<>();
-        WebDavClient client = clientFor(config, 0);
-        walk(client, config.getRemoteRoot(), "", 0, found);
+        // The directory planner must not share worker 0's connection: listing and downloading
+        // concurrently on one WebDAV client can interleave response bodies.
+        WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                config.getPassword());
+        try {
+            walk(client, config.getRemoteRoot(), "", 0, found,
+                    OriginalStore.targetKey(config), config.isDownloadHighQuality());
+        } finally {
+            client.close();
+        }
         if (found.isEmpty()) {
             Logger.d("event=download_round_empty next_in=" + mRoundDelay);
             return 0;
@@ -373,7 +417,7 @@ public final class DownloadQueue {
      * 是同一套判定 —— 两边都只看名字，都不比对内容。
      */
     private void walk(WebDavClient client, String remoteDir, String relativeDir, int depth,
-            List<Pending> out) {
+            List<Pending> out, String target, boolean highQuality) {
         if (depth > MAX_DEPTH || out.size() >= MAX_DOWNLOADS_PER_ROUND) {
             return;
         }
@@ -400,7 +444,8 @@ public final class DownloadQueue {
             String relative = relativeDir.isEmpty() ? name : relativeDir + "/" + name;
             if (entry.dir) {
                 dirs++;
-                walk(client, WebDavClient.joinPath(remoteDir, name), relative, depth + 1, out);
+                walk(client, WebDavClient.joinPath(remoteDir, name), relative, depth + 1, out,
+                        target, highQuality);
                 continue;
             }
             if (skipByExtension(name)) {
@@ -412,10 +457,12 @@ public final class DownloadQueue {
                     continue;
                 }
             }
-            if (new File(new File(DOWNLOAD_ROOT, relativeDir), name).exists()) {
+            File normalLocal = new File(new File(DOWNLOAD_ROOT, relativeDir), name);
+            if (normalLocal.exists() || (highQuality && isCompressibleExtension(name)
+                    && previewPathFor(normalLocal).exists())) {
                 continue;
             }
-            out.add(new Pending(remotePath, relative, entry.size));
+            out.add(new Pending(remotePath, relative, entry.size, target));
         }
     }
 
@@ -472,19 +519,26 @@ public final class DownloadQueue {
         int index = workerIndex();
         UploadProgressPublisher publisher = mPublisher;
         long size = Math.max(pending.size, 0L);
-        File dest = new File(fullPathOf(pending));
+        File normalDest = new File(fullPathOf(pending));
+        File dest = normalDest;
         String key = key(pending);
         boolean ok = false;
         if (publisher != null) {
-            publisher.taskStart(key, baseName(pending.relativePath), dest.getAbsolutePath(),
+            publisher.taskStart(key, baseName(pending.relativePath), normalDest.getAbsolutePath(),
                     size, false, ProgressProtocol.DIR_DOWN);
         }
+        File raw = null;
+        File staged = null;
+        File compressed = null;
         try {
-            if (dest.exists()) {
+            File possiblePreview = previewPathFor(normalDest);
+            boolean qualityRequested = config.isDownloadHighQuality()
+                    && isCompressibleExtension(normalDest.getName()) && pending.size > 0L;
+            if (normalDest.exists() || (qualityRequested && possiblePreview.exists())) {
                 // 本地已经有同名文件：一律不覆盖。用户可能自己改过它，也可能同名但是别的东西
                 Logger.i("event=download_skip_local_exists remote=" + pending.remotePath
-                        + " local=" + dest.getAbsolutePath());
-                markDone(pending.remotePath);
+                        + " local=" + (normalDest.exists() ? normalDest : possiblePreview));
+                markDone(pending.remotePath, pending.target);
                 ok = true;
                 return;
             }
@@ -496,24 +550,87 @@ public final class DownloadQueue {
                     target.taskBytes(key, done);
                 }
             });
-            try {
-                client.get(pending.remotePath, dest);
-            } finally {
-                client.setProgressListener(null);
+            if (qualityRequested) {
+                File rawDir = new File(mContext.getFilesDir(), STATE_DIR + "/original_staging");
+                if (!rawDir.exists() && !rawDir.mkdirs()) {
+                    throw new IOException("cannot create original staging directory");
+                }
+                raw = File.createTempFile("original-", ".tmp", rawDir);
+                try {
+                    client.get(pending.remotePath, raw);
+                } finally {
+                    client.setProgressListener(null);
+                }
+                verifyDownloadedOriginal(pending, raw);
+                String digest = sha256(raw);
+                File previewDest = previewPathFor(normalDest);
+                File parent = previewDest.getAbsoluteFile().getParentFile();
+                if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+                    throw new IOException("cannot create download directory");
+                }
+                compressed = new File(parent, "." + previewDest.getName() + ".mgs-"
+                        + UUID.randomUUID() + ".tmp");
+                boolean compressedOk = createCompressedPreview(raw, compressed)
+                        && compressed.length() > 0L && compressed.length() < raw.length();
+                if (compressedOk) {
+                    // Persist the protected final path before it becomes visible to a media scanner.
+                    mOriginalStore.registerDownloadedPreview(config, pending.remotePath,
+                            raw.length(), digest, normalDest, previewDest, compressed);
+                    dest = previewDest;
+                    publishStagedFile(compressed, dest);
+                    compressed = null;
+                    Logger.i("event=download_preview_ok remote=" + pending.remotePath
+                            + " local=" + dest.getAbsolutePath() + " original=" + raw.length()
+                            + " preview=" + dest.length());
+                } else {
+                    Logger.i("event=download_preview_skipped reason=unsupported_or_no_savings"
+                            + " remote=" + pending.remotePath);
+                    staged = stageBesideDestination(raw, normalDest);
+                    mOriginalStore.registerDownloadedOriginal(config, pending.remotePath,
+                            staged, normalDest, raw.length(), digest);
+                    dest = normalDest;
+                    publishStagedFile(staged, normalDest);
+                    staged = null;
+                }
+            } else {
+                // Keep raw bytes private until durable mirror protection is in place.
+                File rawDir = new File(mContext.getFilesDir(), STATE_DIR + "/original_staging");
+                if (!rawDir.exists() && !rawDir.mkdirs()) {
+                    throw new IOException("cannot create original staging directory");
+                }
+                raw = File.createTempFile("original-", ".tmp", rawDir);
+                try {
+                    client.get(pending.remotePath, raw);
+                } finally {
+                    client.setProgressListener(null);
+                }
+                verifyDownloadedOriginal(pending, raw);
+                String digest = sha256(raw);
+                staged = stageBesideDestination(raw, normalDest);
+                mOriginalStore.registerDownloadedOriginal(config, pending.remotePath, staged,
+                        normalDest, raw.length(), digest);
+                dest = normalDest;
+                publishStagedFile(staged, normalDest);
+                staged = null;
             }
-            Logger.i("event=download_ok remote=" + pending.remotePath
-                    + " local=" + dest.getAbsolutePath() + " size=" + dest.length());
-            markDone(pending.remotePath);
+            raw.delete();
+            raw = null;
+            markDone(pending.remotePath, pending.target);
             Ingest ingest = mIngest;
             if (ingest != null) {
                 ingest.ingest(dest.getAbsolutePath());
             }
+            Logger.i("event=download_ok remote=" + pending.remotePath
+                    + " local=" + dest.getAbsolutePath() + " size=" + dest.length());
             ok = true;
         } catch (WebDavClient.TransportFailure e) {
+            cleanupUnpublished(raw, staged, compressed);
             fail(pending, e.getMessage());
         } catch (IOException e) {
+            cleanupUnpublished(raw, staged, compressed);
             fail(pending, e.getMessage());
         } catch (Throwable t) {
+            cleanupUnpublished(raw, staged, compressed);
             fail(pending, String.valueOf(t));
             Logger.w("event=download_error remote=" + pending.remotePath, t);
         } finally {
@@ -524,6 +641,325 @@ public final class DownloadQueue {
                 mInflight.remove(pending.remotePath);
                 mLock.notifyAll();
             }
+        }
+    }
+
+    private static void cleanupUnpublished(File raw, File staged, File compressed) {
+        if (staged != null && staged.exists()) {
+            staged.delete();
+        }
+        if (compressed != null && compressed.exists()) {
+            compressed.delete();
+        }
+        if (raw != null && raw.exists()) {
+            raw.delete();
+        }
+    }
+
+    private static void verifyDownloadedOriginal(Pending pending, File file) throws IOException {
+        if (!file.isFile() || file.length() <= 0L) {
+            throw new IOException("download produced an empty original");
+        }
+        if (pending.size > 0L && file.length() != pending.size) {
+            throw new IOException("download length mismatch expected=" + pending.size
+                    + " actual=" + file.length());
+        }
+    }
+
+    private static File stageBesideDestination(File source, File dest) throws IOException {
+        File parent = dest.getAbsoluteFile().getParentFile();
+        if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+            throw new IOException("cannot create download directory");
+        }
+        File stage = new File(parent, "." + dest.getName() + ".mgs-"
+                + UUID.randomUUID() + ".tmp");
+        try (FileInputStream in = new FileInputStream(source);
+                FileOutputStream out = new FileOutputStream(stage)) {
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                out.write(buffer, 0, count);
+            }
+            out.getFD().sync();
+        } catch (Throwable t) {
+            stage.delete();
+            if (t instanceof IOException) {
+                throw (IOException) t;
+            }
+            throw new IOException("cannot stage original", t);
+        }
+        if (stage.length() != source.length()) {
+            stage.delete();
+            throw new IOException("staged original length mismatch");
+        }
+        return stage;
+    }
+
+    private static void publishStagedFile(File staged, File dest) throws IOException {
+        if (dest.exists()) {
+            throw new IOException("download destination appeared before publish: " + dest);
+        }
+        // Same-directory moves publish the complete file at once and fail if another file wins
+        // the race; never replace a file that appeared after planning.
+        Files.move(staged.toPath(), dest.toPath());
+    }
+
+    private static boolean isCompressibleExtension(String name) {
+        String lower = name.toLowerCase(Locale.US);
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                || lower.endsWith(".png") || lower.endsWith(".webp")
+                || lower.endsWith(".bmp");
+    }
+
+    static File previewPathFor(File original) {
+        // Preserve the original extension too: photo.png and photo.jpg are distinct originals.
+        return new File(original.getParentFile(), original.getName() + ".hq.jpg");
+    }
+
+    /** Detect animated formats by signature/chunk, since the private staging file has no extension. */
+    private static boolean isAnimatedImage(File file) throws IOException {
+        byte[] header = new byte[12];
+        try (InputStream input = new BufferedInputStream(new FileInputStream(file))) {
+            int count = input.read(header);
+            if (count >= 6 && header[0] == 'G' && header[1] == 'I'
+                    && header[2] == 'F' && header[3] == '8'
+                    && (header[4] == '7' || header[4] == '9') && header[5] == 'a') {
+                // GIF may be static, but keeping it raw is the safe choice without frame decoding.
+                return true;
+            }
+            byte[] png = new byte[]{(byte) 0x89, 'P', 'N', 'G', 13, 10, 26, 10};
+            if (count >= png.length) {
+                boolean matchesPng = true;
+                for (int i = 0; i < png.length; i++) {
+                    matchesPng &= header[i] == png[i];
+                }
+                if (matchesPng) {
+                    return containsAscii(file, "acTL");
+                }
+            }
+            if (count >= 12 && header[0] == 'R' && header[1] == 'I' && header[2] == 'F'
+                    && header[3] == 'F' && header[8] == 'W' && header[9] == 'E'
+                    && header[10] == 'B' && header[11] == 'P') {
+                return containsAscii(file, "ANIM") || containsAscii(file, "ANMF");
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsAscii(File file, String needle) throws IOException {
+        byte[] wanted = needle.getBytes(StandardCharsets.US_ASCII);
+        byte[] window = new byte[wanted.length];
+        int filled = 0;
+        byte[] buffer = new byte[32 * 1024];
+        try (InputStream in = new BufferedInputStream(new FileInputStream(file))) {
+            int count;
+            while ((count = in.read(buffer)) != -1) {
+                for (int b = 0; b < count; b++) {
+                    if (filled < window.length) {
+                        window[filled++] = buffer[b];
+                        if (filled < window.length) {
+                            continue;
+                        }
+                    } else {
+                        System.arraycopy(window, 1, window, 0, window.length - 1);
+                        window[window.length - 1] = buffer[b];
+                    }
+                    boolean match = true;
+                    for (int i = 0; i < wanted.length; i++) {
+                        if (window[i] != wanted[i]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean makePreview(File original, File output) {
+        Bitmap decoded = null;
+        Bitmap oriented = null;
+        Bitmap rgb = null;
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(original.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return false;
+            }
+            int sample = 1;
+            while (Math.max(bounds.outWidth / sample, bounds.outHeight / sample)
+                    > PREVIEW_MAX_EDGE * 2) {
+                sample *= 2;
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = sample;
+            decoded = BitmapFactory.decodeFile(original.getAbsolutePath(), options);
+            if (decoded == null) {
+                return false;
+            }
+            Matrix orientation = orientationMatrix(original);
+            if (orientation == null || orientation.isIdentity()) {
+                oriented = decoded;
+            } else {
+                oriented = Bitmap.createBitmap(decoded, 0, 0, decoded.getWidth(),
+                        decoded.getHeight(), orientation, true);
+            }
+            int longEdge = Math.max(oriented.getWidth(), oriented.getHeight());
+            if (longEdge > PREVIEW_MAX_EDGE) {
+                float scale = (float) PREVIEW_MAX_EDGE / (float) longEdge;
+                Bitmap resized = Bitmap.createScaledBitmap(oriented,
+                        Math.max(1, Math.round(oriented.getWidth() * scale)),
+                        Math.max(1, Math.round(oriented.getHeight() * scale)), true);
+                if (resized != oriented) {
+                    if (oriented != decoded) {
+                        oriented.recycle();
+                    }
+                    oriented = resized;
+                }
+            }
+            rgb = Bitmap.createBitmap(oriented.getWidth(), oriented.getHeight(),
+                    Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(rgb);
+            canvas.drawColor(Color.WHITE);
+            canvas.drawBitmap(oriented, 0f, 0f, new Paint(Paint.FILTER_BITMAP_FLAG));
+            try (FileOutputStream out = new FileOutputStream(output)) {
+                if (!rgb.compress(Bitmap.CompressFormat.JPEG, PREVIEW_JPEG_QUALITY, out)) {
+                    return false;
+                }
+                out.flush();
+                out.getFD().sync();
+            }
+            copyCaptureTime(original, output);
+            BitmapFactory.Options verify = new BitmapFactory.Options();
+            verify.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(output.getAbsolutePath(), verify);
+            return verify.outWidth > 0 && verify.outHeight > 0
+                    && Math.max(verify.outWidth, verify.outHeight) <= PREVIEW_MAX_EDGE;
+        } catch (Throwable t) {
+            Logger.d("event=download_preview_failed reason=" + t);
+            output.delete();
+            return false;
+        } finally {
+            if (rgb != null && !rgb.isRecycled()) {
+                rgb.recycle();
+            }
+            if (oriented != null && oriented != decoded && !oriented.isRecycled()) {
+                oriented.recycle();
+            }
+            if (decoded != null && !decoded.isRecycled()) {
+                decoded.recycle();
+            }
+        }
+    }
+
+    /** Re-encoding must not move old photos to today's date when the gallery scans the preview. */
+    private static void copyCaptureTime(File original, File preview) {
+        try {
+            ExifInterface source = new ExifInterface(original.getAbsolutePath());
+            ExifInterface target = new ExifInterface(preview.getAbsolutePath());
+            String[] tags = {ExifInterface.TAG_DATETIME, ExifInterface.TAG_DATETIME_ORIGINAL,
+                    ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_SUBSEC_TIME,
+                    ExifInterface.TAG_SUBSEC_TIME_ORIGINAL, ExifInterface.TAG_SUBSEC_TIME_DIGITIZED};
+            for (String tag : tags) {
+                String value = source.getAttribute(tag);
+                if (value != null) target.setAttribute(tag, value);
+            }
+            // The JPEG pixels have already been rotated/flipped; never copy the old orientation.
+            target.setAttribute(ExifInterface.TAG_ORIENTATION,
+                    String.valueOf(ExifInterface.ORIENTATION_NORMAL));
+            target.saveAttributes();
+        } catch (IOException ignored) {
+            // Some supported bitmap formats have no EXIF block.
+        }
+        if (original.lastModified() > 0) preview.setLastModified(original.lastModified());
+    }
+
+    /**
+     * Create a JPEG preview in a caller-selected directory without publishing it to MediaStore.
+     * Returns false for animated or unsupported image data; callers should retain the original.
+     */
+    public static boolean createCompressedPreview(File original, File output) {
+        if (original == null || output == null || !original.isFile()) {
+            return false;
+        }
+        try {
+            if (isAnimatedImage(original)) {
+                return false;
+            }
+            File parent = output.getAbsoluteFile().getParentFile();
+            if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+                return false;
+            }
+            return makePreview(original, output);
+        } catch (Throwable t) {
+            Logger.d("event=download_preview_failed reason=" + t);
+            output.delete();
+            return false;
+        }
+    }
+
+    private static Matrix orientationMatrix(File file) {
+        try {
+            ExifInterface exif = new ExifInterface(file.getAbsolutePath());
+            int orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL);
+            Matrix matrix = new Matrix();
+            switch (orientation) {
+                case ExifInterface.ORIENTATION_FLIP_HORIZONTAL:
+                    matrix.setScale(-1f, 1f);
+                    break;
+                case ExifInterface.ORIENTATION_ROTATE_180:
+                    matrix.setRotate(180f);
+                    break;
+                case ExifInterface.ORIENTATION_FLIP_VERTICAL:
+                    matrix.setScale(1f, -1f);
+                    break;
+                case ExifInterface.ORIENTATION_TRANSPOSE:
+                    matrix.setRotate(90f);
+                    matrix.postScale(-1f, 1f);
+                    break;
+                case ExifInterface.ORIENTATION_ROTATE_90:
+                    matrix.setRotate(90f);
+                    break;
+                case ExifInterface.ORIENTATION_TRANSVERSE:
+                    matrix.setRotate(270f);
+                    matrix.postScale(-1f, 1f);
+                    break;
+                case ExifInterface.ORIENTATION_ROTATE_270:
+                    matrix.setRotate(270f);
+                    break;
+                default:
+                    return null;
+            }
+            return matrix;
+        } catch (Throwable ignored) {
+            // A missing or malformed EXIF block means the encoded pixels already define orientation.
+            return null;
+        }
+    }
+
+    private static String sha256(File file) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            try (InputStream in = new FileInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = in.read(buffer)) != -1) {
+                    digest.update(buffer, 0, count);
+                }
+            }
+            StringBuilder out = new StringBuilder(64);
+            for (byte value : digest.digest()) {
+                out.append(String.format(Locale.US, "%02x", value & 0xff));
+            }
+            return out.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required by Android", e);
         }
     }
 
@@ -538,8 +974,11 @@ public final class DownloadQueue {
                 + " reason=" + reason);
     }
 
-    private void markDone(String remotePath) {
+    private void markDone(String remotePath, String target) {
         synchronized (mLock) {
+            if (!target.equals(mDownloadTarget)) {
+                return;
+            }
             mDone.put(remotePath, System.currentTimeMillis());
             trimDoneLocked();
             saveLocked();
@@ -687,6 +1126,7 @@ public final class DownloadQueue {
                 done.put(entry.getKey(), entry.getValue());
             }
             root.put("dl_done", done);
+            root.put("dl_target", mDownloadTarget);
             try (FileOutputStream out = new FileOutputStream(tmp)) {
                 out.write(root.toString().getBytes(StandardCharsets.UTF_8));
             }
@@ -712,7 +1152,9 @@ public final class DownloadQueue {
             JSONObject root = new JSONObject(new String(
                     Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8));
             JSONObject done = root.optJSONObject("dl_done");
-            if (done == null) {
+            if (done == null || !mDownloadTarget.equals(root.optString("dl_target", ""))) {
+                Logger.i("event=download_state_target_changed old="
+                        + root.optString("dl_target", "<legacy>") + " new=" + mDownloadTarget);
                 return;
             }
             Iterator<String> keys = done.keys();

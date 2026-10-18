@@ -80,6 +80,8 @@ public final class Config {
      * 打开它就等于让那些文件自动落到相册里。想要"双向同步"的用户自己开。
      */
     public static final String KEY_DOWNLOAD_ENABLED = "download_enabled";
+    /** 远端有原图时，在本地补齐高质量压缩副本；不会改变或覆盖远端原图。 */
+    public static final String KEY_DOWNLOAD_HIGH_QUALITY = "download_high_quality";
 
     /** 替换：拦截原链路，只上传 WebDAV */
     public static final String MODE_REPLACE = "replace";
@@ -151,6 +153,8 @@ public final class Config {
     public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
     /** 默认关闭：反向数据流必须是用户显式要求才开，见 {@link #KEY_DOWNLOAD_ENABLED} */
     public static final boolean DEFAULT_DOWNLOAD_ENABLED = false;
+    /** 默认保持旧下载行为：不请求高质量副本。 */
+    public static final boolean DEFAULT_DOWNLOAD_HIGH_QUALITY = false;
 
     private final String replaceMode;
     private final String baseUrl;
@@ -169,6 +173,7 @@ public final class Config {
     private final boolean skipExistingRemote;
     private final String localFlagMode;
     private final boolean downloadEnabled;
+    private final boolean downloadHighQuality;
 
     private Config(SharedPreferences prefs) {
         if (prefs == null) {
@@ -188,6 +193,7 @@ public final class Config {
             skipExistingRemote = DEFAULT_SKIP_EXISTING_REMOTE;
             localFlagMode = DEFAULT_LOCAL_FLAG_MODE;
             downloadEnabled = DEFAULT_DOWNLOAD_ENABLED;
+            downloadHighQuality = DEFAULT_DOWNLOAD_HIGH_QUALITY;
         } else {
             replaceMode = prefs.getString(KEY_REPLACE_MODE, DEFAULT_REPLACE_MODE);
             baseUrl = prefs.getString(KEY_BASE_URL, "");
@@ -208,6 +214,8 @@ public final class Config {
             localFlagMode = readFlagMode(prefs);
             downloadEnabled = prefs.getBoolean(
                     KEY_DOWNLOAD_ENABLED, DEFAULT_DOWNLOAD_ENABLED);
+            downloadHighQuality = prefs.getBoolean(
+                    KEY_DOWNLOAD_HIGH_QUALITY, DEFAULT_DOWNLOAD_HIGH_QUALITY);
         }
     }
 
@@ -369,6 +377,11 @@ public final class Config {
         return downloadEnabled;
     }
 
+    /** true 表示下载本地高质量压缩副本；此选项不会影响远端原图。 */
+    public boolean isDownloadHighQuality() {
+        return downloadHighQuality;
+    }
+
     @Override
     public String toString() {
         return "Config{mode=" + replaceMode
@@ -381,7 +394,8 @@ public final class Config {
                 + ", skipRemote=" + skipExistingRemote
                 + ", flagMode=" + localFlagMode
                 + ", maxUpload=" + describeBytes(maxUploadBytes)
-                + ", download=" + downloadEnabled + "}";
+                + ", download=" + downloadEnabled
+                + ", downloadHighQuality=" + downloadHighQuality + "}";
     }
 
     /** 日志里用的体积文案，0 表示不限。别在这里引入本地化 —— 日志只给排查看 */

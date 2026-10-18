@@ -68,6 +68,9 @@ class SettingsModel : CoroutineScope {
     /** 打开后把远端有、本地没有的文件下载回本地 */
     var downloadEnabled by mutableStateOf(Config.DEFAULT_DOWNLOAD_ENABLED)
         private set
+    /** 自动下载中的可选高质量压缩副本；父开关关闭时仍保留该设置 */
+    var downloadHighQuality by mutableStateOf(Config.DEFAULT_DOWNLOAD_HIGH_QUALITY)
+        private set
     /** 并行路数，取值下标 = 路数 - 1，对应 [CONCURRENCY_ITEMS] */
     var concurrencyIndex by mutableStateOf(Config.DEFAULT_UPLOAD_CONCURRENCY - 1)
         private set
@@ -173,6 +176,11 @@ class SettingsModel : CoroutineScope {
     fun onDownloadEnabledChange(checked: Boolean) {
         downloadEnabled = checked
         writeNow(Config.KEY_DOWNLOAD_ENABLED, checked)
+    }
+
+    fun onDownloadHighQualityChange(checked: Boolean) {
+        downloadHighQuality = checked
+        writeNow(Config.KEY_DOWNLOAD_HIGH_QUALITY, checked)
     }
 
     /** 下拉给的是下标，落盘的是真实的并行路数（1..MAX），落盘值与界面顺序必须一致 */
@@ -379,6 +387,9 @@ class SettingsModel : CoroutineScope {
         downloadEnabled = source.getBoolean(
             Config.KEY_DOWNLOAD_ENABLED, Config.DEFAULT_DOWNLOAD_ENABLED
         )
+        downloadHighQuality = source.getBoolean(
+            Config.KEY_DOWNLOAD_HIGH_QUALITY, Config.DEFAULT_DOWNLOAD_HIGH_QUALITY
+        )
         concurrencyIndex = concurrencyIndexOf(
             source.getInt(Config.KEY_UPLOAD_CONCURRENCY, Config.DEFAULT_UPLOAD_CONCURRENCY)
         )
@@ -418,6 +429,9 @@ class SettingsModel : CoroutineScope {
 
             Config.KEY_DOWNLOAD_ENABLED -> downloadEnabled =
                 source.getBoolean(key, Config.DEFAULT_DOWNLOAD_ENABLED)
+
+            Config.KEY_DOWNLOAD_HIGH_QUALITY -> downloadHighQuality =
+                source.getBoolean(key, Config.DEFAULT_DOWNLOAD_HIGH_QUALITY)
 
             Config.KEY_UPLOAD_CONCURRENCY -> concurrencyIndex = concurrencyIndexOf(
                 source.getInt(key, Config.DEFAULT_UPLOAD_CONCURRENCY)

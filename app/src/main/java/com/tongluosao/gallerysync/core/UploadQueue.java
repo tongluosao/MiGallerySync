@@ -212,6 +212,7 @@ public final class UploadQueue {
     private static volatile UploadQueue sInstance;
 
     private final Context mContext;
+    private final OriginalStore mOriginalStore;
     private final Object mLock = new Object();
     private final LinkedHashMap<String, Task> mPending = new LinkedHashMap<>();
     private final LinkedHashMap<String, Long> mDone = new LinkedHashMap<>();
@@ -386,6 +387,7 @@ public final class UploadQueue {
     private UploadQueue(Context context, Config config) {
         mContext = context.getApplicationContext();
         mConfig = config;
+        mOriginalStore = OriginalStore.get(mContext);
         load();
         mPublisher = UploadProgressPublisher.start(mContext);
         mPublisher.addQueueView(new UploadProgressPublisher.QueueView() {
@@ -858,6 +860,12 @@ public final class UploadQueue {
                     skipped++;
                     continue;
                 }
+                if (mOriginalStore.isProtectedUpload(file, item.rowId, item.sha1)) {
+                    skipped++;
+                    Logger.i("event=upload_skip_protected path=" + item.path
+                            + " row=" + item.rowId + " sha1=" + item.sha1);
+                    continue;
+                }
                 long size = file.length();
                 if (cap > 0 && size > cap) {
                     tooLarge++;
@@ -876,7 +884,7 @@ public final class UploadQueue {
                     continue;
                 }
                 mPending.put(key, new Task(item.path, size, file.lastModified(),
-                        item.video, item.date, item.rowId));
+                        item.video, item.date, item.rowId, item.sha1));
                 added++;
             }
             if (added > 0) {
@@ -1063,6 +1071,7 @@ public final class UploadQueue {
 
     private void upload(Task task, Config config, int index) {
         final String taskKey = task.key();
+        OriginalStore.PathLease uploadLease = null;
         // 与 upload_ok 配对，用来核对"同一项只被一个 worker 领走"（verbose 才输出）
         Logger.d("event=upload_begin worker=" + index + " path=" + task.path
                 + " size=" + task.size);
@@ -1070,6 +1079,26 @@ public final class UploadQueue {
             File file = new File(task.path);
             if (!file.isFile() || file.length() == 0) {
                 Logger.w("event=upload_skip reason=local_file_missing path=" + task.path);
+                synchronized (mLock) {
+                    mPending.remove(taskKey);
+                    mPendingVersion++;
+                    saveThrottledLocked();
+                }
+                return;
+            }
+            try {
+                // This read lease shares a per-path lock with quality optimization. It remains
+                // held until putSendResolved has finished reading the source file.
+                uploadLease = mOriginalStore.lockForUpload(file);
+            } catch (IOException e) {
+                finalizeFail(task, config, e);
+                return;
+            }
+            final long uploadedLength = file.length();
+            final long uploadedMtime = file.lastModified();
+            if (mOriginalStore.isProtectedUpload(file, task.rowId, task.sha1)) {
+                Logger.w("event=upload_skip_protected_before_send path=" + task.path
+                        + " row=" + task.rowId + " sha1=" + task.sha1);
                 synchronized (mLock) {
                     mPending.remove(taskKey);
                     mPendingVersion++;
@@ -1089,6 +1118,7 @@ public final class UploadQueue {
             WebDavClient client = null;
             // 也提到 try 外面：catch 里要用它做"迟到落盘"的兜底判定（见 lateLanding）
             String remotePath = null;
+            String uploadedSha256 = null;
             // 请求体**是不是已经全部发出去了**。这条只有进度回调知道，而它决定了失败之后
             // 要不要回头问一句"远端是不是已经收全了"（见 lateLanding）：
             // 字节发完了还报错，多半是服务器那一侧的收尾问题（真机 423 Locked 就是这种），
@@ -1098,6 +1128,9 @@ public final class UploadQueue {
             // 真正知道结果之后记（见 verifyLoop），否则会出现"还没确认就告诉宿主传完了"
             boolean handedOff = false;
             try {
+                // Capture the upload source fingerprint while the shared read lease is held.
+                // Async verification may run after the local file has changed.
+                uploadedSha256 = OriginalStore.sha256(file);
                 client = clientFor(config, index);
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
                 String requestedRemoteDir = remoteDirFor(config, task);
@@ -1107,24 +1140,30 @@ public final class UploadQueue {
                             + requestedRemoteDir);
                 }
                 remotePath = WebDavClient.joinPath(remoteDir, file.getName());
-                // 远端已经有同名文件就当作"这一份备份过了"，直接跳过，一个字节都不发。
-                // 判据是**名字 + 大小**：名字相同但大小不同不能算备份完成（大小在列目录时
-                // 就带回来了，多这一条不花代价）。这是**上传前**的分支，与下面那条
-                // "必须先发字节再复核"的约束不冲突：它根本不产生"复核通过"这个结论，
-                // 而是"这一份早在远端了"。
+                // A name and size match only identifies a candidate. GET and SHA-256 must confirm
+                // byte identity before this shortcut can register or mark the item complete.
                 if (config.isSkipExistingRemote()
-                        && remoteExists(config, index, remoteDir, file.getName(), file.length())) {
-                    Logger.i("event=upload_skip_remote_exists path=" + task.path
-                            + " remote=" + remotePath + " size=" + task.size);
-                    // 账要把字节数补齐再收尾。项目里有一条诊断口径：`progress_task_end ok=true`
-                    // 必须带 `sent=size`，`sent=0` 就意味着"没传就算成功"（硬性约束 11 那类
-                    // 错记的指纹）。跳过这条路径恰恰**是合法的**没传字节 —— 远端那一份与本地
-                    // 等长，字节确实在那儿。所以这里如实把进度填成本项大小，而不是把口径改成
-                    // "允许 sent=0"，否则以后真出现错记就再也认不出来了。
-                    mPublisher.taskBytes(taskKey, task.size);
-                    ok = true;
-                    finalizeOk(task, config, remotePath, "remote_exists");
-                    return;
+                        && remoteExists(config, index, remoteDir, file.getName(), uploadedLength)) {
+                    boolean sameBytes = false;
+                    try {
+                        sameBytes = mOriginalStore.backfillFromRemote(config, remotePath, file,
+                                task.rowId, task.sha1);
+                    } catch (IOException e) {
+                        Logger.d("event=remote_exists_verify_failed remote=" + remotePath
+                                + " reason=" + e);
+                    }
+                    if (sameBytes) {
+                        Logger.i("event=upload_skip_remote_exists path=" + task.path
+                                + " remote=" + remotePath + " size=" + uploadedLength
+                                + " verified=sha256");
+                        // Keep the success progress accounting consistent with a completed PUT.
+                        mPublisher.taskBytes(taskKey, uploadedLength);
+                        ok = finalizeOk(task, config, remotePath, "remote_exists",
+                                uploadedSha256, uploadedLength, uploadedMtime, true);
+                        return;
+                    }
+                    Logger.i("event=remote_exists_mismatch remote=" + remotePath
+                            + " action=upload");
                 }
                 // 发字节之前先花几百字节问一句"这条路径被锁着吗"。
                 //
@@ -1150,6 +1189,18 @@ public final class UploadQueue {
                     throw new PathLockedException("PUT " + remotePath
                             + " failed code=423 server=Locked (zero-byte probe)");
                 }
+                // Recheck after directory and lock probes. A quality hook persists its derived-path
+                // marker before publishing the replacement, so this catches work already queued.
+                if (!file.isFile() || mOriginalStore.isProtectedUpload(file, task.rowId, task.sha1)) {
+                    Logger.w("event=upload_skip_protected_before_put path=" + task.path
+                            + " row=" + task.rowId + " sha1=" + task.sha1);
+                    synchronized (mLock) {
+                        mPending.remove(taskKey);
+                        mPendingVersion++;
+                        saveThrottledLocked();
+                    }
+                    return;
+                }
                 // 每 64KB 一块回调，下游按 500ms 节流后才发广播 —— lambda 每任务只建一次，
                 // 不在那个循环里分配对象。
                 // 顺带在这里当"急停闸"：热重载换代时 shutdown() 已经把 mRunning 置假并关连接，
@@ -1162,7 +1213,7 @@ public final class UploadQueue {
                     if (!mRunning) {
                         throw new IOException("upload aborted: queue is shutting down");
                     }
-                    if (sent >= task.size) {
+                    if (sent >= uploadedLength) {
                         bodySent.set(true);
                     }
                 });
@@ -1183,25 +1234,26 @@ public final class UploadQueue {
                 if (remoteSlash >= 0) {
                     remoteDir = remotePath.substring(0, remoteSlash);
                 }
-                rememberRemoteName(remoteDir, file.getName(), file.length());
+                rememberRemoteName(remoteDir, file.getName(), uploadedLength);
                 if (config.isVerifyAsync()
-                        && enqueueVerify(taskKey, task, config, remotePath, file.length())) {
+                        && enqueueVerify(taskKey, task, config, remotePath, uploadedLength,
+                                uploadedSha256, uploadedMtime)) {
                     handedOff = true;
                 } else {
                     // 同步路径：复核没过会抛 IOException（与"服务器直接回错误码"同一句话），
                     // 于是走同一套重试逻辑
-                    client.requireStoredAs(remotePath, file.length());
-                    ok = true;
-                    finalizeOk(task, config, remotePath, String.valueOf(index));
+                    client.requireStoredAs(remotePath, uploadedLength);
+                    ok = finalizeOk(task, config, remotePath, String.valueOf(index),
+                            uploadedSha256, uploadedLength, uploadedMtime, false);
                 }
             } catch (WebDavClient.TransportFailure e) {
                 // 链路层失败里有一种**不是失败**：请求体已经全部发出去了，只是服务器迟迟不给
                 // 响应（真机 2026-10-06 实测：1.35GB 的 PUT 在 1800 秒里一个字节没回，
                 // 而对象其实已经**完整落盘**，长度分毫不差）。重发一遍要再烧整份上行，
                 // 所以这里回头问一句"远端那一份是不是已经跟我一样大"，是就按成功收尾
-                if (lateLanding(client, config, remotePath, file.length(), bodySent.get())) {
-                    ok = true;
-                    finalizeOk(task, config, remotePath, String.valueOf(index));
+                if (lateLanding(config, remotePath, task, file, bodySent.get())) {
+                    ok = finalizeOk(task, config, remotePath, "late_landing", uploadedSha256,
+                            uploadedLength, uploadedMtime, true);
                 } else {
                     finalizeFail(task, config, e);
                 }
@@ -1210,9 +1262,9 @@ public final class UploadQueue {
                 // 那个 1.35GB 的视频 13:16:57 开始传，**sent=1416598318（一个字节不差）** 之后
                 // 才回 423，而远端那一份早就完整了。字节都发完了还判"失败重传"，
                 // 等于每次同步都再烧一份 1.35GB 上行去换同一个 423
-                if (lateLanding(client, config, remotePath, file.length(), bodySent.get())) {
-                    ok = true;
-                    finalizeOk(task, config, remotePath, String.valueOf(index));
+                if (lateLanding(config, remotePath, task, file, bodySent.get())) {
+                    ok = finalizeOk(task, config, remotePath, "late_landing", uploadedSha256,
+                            uploadedLength, uploadedMtime, true);
                 } else {
                     finalizeFail(task, config, e);
                 }
@@ -1233,6 +1285,9 @@ public final class UploadQueue {
                 }
             }
         } finally {
+            if (uploadLease != null) {
+                uploadLease.close();
+            }
             // 任何返回路径都必须把这一项从"在传"里摘掉：漏了的话它既不会被重试也不会被跳过，
             // 永远占着位置 —— 少一路就是永久少一部分吞吐。
             // 交出去的项此时已经在 mVerifying 里（enqueueVerify 在锁内登记的），
@@ -1277,32 +1332,31 @@ public final class UploadQueue {
      * <p>再加两条：
      * <ol start="2">
      *   <li>远端必须有这个名字；</li>
-     *   <li>而且它的大小必须**等于**本地这一份（不是"不小于"）。</li>
+     *   <li>GET 的长度和 SHA-256 必须都与本地上传源一致。</li>
      * </ol>
-     * 比本地小 = 那份是半截的（可能是这次传到一半），必须继续重试；
-     * 比本地大 = 不是同一个对象。问不出来（服务器不支持 HEAD/PROPFIND）就返回 false，
-     * 老老实实走原来的重试逻辑。
+     * 比对失败或 GET 问不出来，就继续原来的重试逻辑。
      *
      * <p>与"先发字节再复核"那条硬性约束的关系：这里**已经发过字节了**（异常正是在发送/
      * 读响应阶段抛的），确认的是"刚发出去的那一份"。它不是 putSend 的替代品，
      * 也不改变"上传前绝不产生成功结论"这条原则。
      *
-     * @return true 表示远端已经有一份与本地等长的对象，这一项可以按成功收尾
+     * @return true 表示 GET 确认远端字节与本地上传源相同，且已登记该原件
      */
-    private boolean lateLanding(WebDavClient client, Config config, String remotePath, long size,
+    private boolean lateLanding(Config config, String remotePath, Task task, File localOriginal,
                                 boolean bodySent) {
-        if (client == null || remotePath == null || size <= 0 || !bodySent) {
+        if (remotePath == null || task == null || localOriginal == null || !bodySent) {
             return false;
         }
         try {
-            long remoteSize = client.remoteSize(remotePath);
-            if (remoteSize == size) {
-                Logger.w("event=upload_late_landing path=" + remotePath + " size=" + size
+            if (mOriginalStore.backfillFromRemote(config, remotePath, localOriginal,
+                    task.rowId, task.sha1)) {
+                Logger.w("event=upload_late_landing path=" + remotePath
+                        + " size=" + localOriginal.length() + " verified=sha256"
                         + " action=count_as_done");
                 return true;
             }
-            Logger.i("event=upload_late_missing path=" + remotePath + " local=" + size
-                    + " remote=" + remoteSize + " action=retry");
+            Logger.i("event=upload_late_mismatch path=" + remotePath
+                    + " local=" + localOriginal.length() + " action=retry");
         } catch (Throwable t) {
             // 问不出来就照旧重试 —— 这里绝不能因为"问不到"就判成功
             Logger.d("event=upload_late_probe_failed path=" + remotePath + " reason=" + t);
@@ -1315,7 +1369,8 @@ public final class UploadQueue {
      *
      * @return false 表示没交出去（队列在停、或复核积压到上限），调用方必须自己同步复核
      */
-    private boolean enqueueVerify(String key, Task task, Config config, String remotePath, long size) {
+    private boolean enqueueVerify(String key, Task task, Config config, String remotePath, long size,
+                                  String uploadedSha256, long uploadedMtime) {
         synchronized (mLock) {
             if (!mRunning) {
                 return false;
@@ -1325,7 +1380,8 @@ public final class UploadQueue {
                 Logger.w("event=verify_async_fallback reason=backlog path=" + task.path);
                 return false;
             }
-            mVerifyQueue.addLast(new Verify(key, task, config, remotePath, size));
+            mVerifyQueue.addLast(new Verify(key, task, config, remotePath, size,
+                    uploadedSha256, uploadedMtime));
             // 就在这把锁内登记 mVerifying：等到 worker 的 finally 才登记的话，
             // 复核线程可能已经抢先做完并把 mVerifying 里的它删掉（删了个不存在的），
             // 随后 worker 再加回来 —— 这一项就永远卡在 mVerifying 里没人碰了。
@@ -1374,10 +1430,10 @@ public final class UploadQueue {
                 // 那句话只有一处定义，日志里同一个故障不会出现两种写法。
                 // 复核不过绝不能记成功 —— 一写标记这项就再也不会重传了
                 client.requireStoredAs(job.remotePath, job.size);
-                ok = true;
-                Logger.i("event=verify_async_done ok=true path=" + job.task.path
+                ok = finalizeOk(job.task, job.config, job.remotePath, "verify-" + index,
+                        job.uploadedSha256, job.size, job.uploadedMtime, false);
+                Logger.i("event=verify_async_done ok=" + ok + " path=" + job.task.path
                         + " remote=" + job.remotePath);
-                finalizeOk(job.task, job.config, job.remotePath, "verify-" + index);
             } catch (WebDavClient.TransportFailure e) {
                 finalizeFail(job.task, job.config, e);
             } catch (IOException e) {
@@ -1405,8 +1461,21 @@ public final class UploadQueue {
      *
      * <p>上传线程与复核线程都走这里，保证"什么才算真的传成功"只有一处定义。
      */
-    private void finalizeOk(Task task, Config config, String remotePath, String worker) {
+    private boolean finalizeOk(Task task, Config config, String remotePath, String worker,
+            String uploadedSha256, long uploadedLength, long uploadedMtime,
+            boolean alreadyRegistered) {
         final String taskKey = task.key();
+        if (!alreadyRegistered) {
+            try {
+                mOriginalStore.registerUploadedOriginal(config, remotePath,
+                        new File(task.path), task.rowId, task.sha1, uploadedSha256,
+                        uploadedLength, uploadedMtime);
+            } catch (IOException e) {
+                Logger.e("event=original_registration_failed path=" + task.path, e);
+                finalizeFail(task, config, e);
+                return false;
+            }
+        }
         synchronized (mLock) {
             mPending.remove(taskKey);
             mPendingVersion++;
@@ -1440,6 +1509,7 @@ public final class UploadQueue {
             // 标记写下去之后界面上的"待备份 N"才会减一，所以刷新放在标记之后
             progress.refresh();
         }
+        return true;
     }
 
     /**
@@ -1793,6 +1863,15 @@ public final class UploadQueue {
         return WebDavClient.joinPath(remoteRoot, yearMonthOf(task));
     }
 
+    /** Build the same remote path as the uploader for a gallery item that predates the registry. */
+    public static String remotePathFor(Config config, String localPath, boolean video, long date) {
+        if (config == null || localPath == null || localPath.isEmpty()) {
+            return null;
+        }
+        Task task = new Task(localPath, 0L, 0L, video, date, null, null);
+        return WebDavClient.joinPath(remoteDirFor(config, task), new File(localPath).getName());
+    }
+
     private static String yearMonthOf(Task task) {
         long time = task.date > 0 ? task.date : task.mtime;
         if (time <= 0) {
@@ -1802,10 +1881,11 @@ public final class UploadQueue {
     }
 
     /**
-     * 远端那个目录里已经有**同一个**文件了吗。
+     * 远端那个目录里有没有名字与大小都匹配的候选对象。
      *
      * <p>用 {@code PROPFIND Depth 1} 一次拿回整个目录的名字与大小（见 {@link #mRemoteNames}），
-     * 而不是对这一个文件发 HEAD：同一相册目录下的几十项只会付一次往返。
+     * 而不是对这一个文件发 HEAD：同一相册目录下的几十项只会付一次往返。这个结果只用来
+     * 选候选对象；调用方还会 GET 并比较 SHA-256，才会跳过上传或登记原件。
      *
      * <p>判据从"**名字**相同"改成"**名字与大小都**相同"（2026-10-06）：大小在列目录时就
      * 顺手带回来了，多这一条不花任何代价，却把"同名但内容不全/不同"的情况挡在外面 ——
@@ -1998,6 +2078,7 @@ public final class UploadQueue {
                 obj.put("m", task.mtime);
                 obj.put("v", task.video);
                 obj.put("d", task.date);
+                obj.put("h", task.sha1 == null ? "" : task.sha1);
                 if (task.rowId != null) {
                     obj.put("r", task.rowId);
                 }
@@ -2062,7 +2143,8 @@ public final class UploadQueue {
                             obj.optLong("m", 0L),
                             obj.optBoolean("v", false),
                             obj.optLong("d", 0L),
-                            rowId.isEmpty() ? null : rowId);
+                            rowId.isEmpty() ? null : rowId,
+                            obj.optString("h", ""));
                     task.attempts = obj.optInt("a", 0);
                     task.nextAttemptAt = obj.optLong("n", 0L);
                     if (!task.path.isEmpty()) {
@@ -2193,13 +2275,18 @@ public final class UploadQueue {
         final Config config;
         final String remotePath;
         final long size;
+        final String uploadedSha256;
+        final long uploadedMtime;
 
-        Verify(String key, Task task, Config config, String remotePath, long size) {
+        Verify(String key, Task task, Config config, String remotePath, long size,
+                String uploadedSha256, long uploadedMtime) {
             this.key = key;
             this.task = task;
             this.config = config;
             this.remotePath = remotePath;
             this.size = size;
+            this.uploadedSha256 = uploadedSha256;
+            this.uploadedMtime = uploadedMtime;
         }
     }
 
@@ -2251,18 +2338,21 @@ public final class UploadQueue {
         final long date;
         /** cloud 表行号，跨进程重启也要留着：上传成功的标记靠它 */
         final String rowId;
+        final String sha1;
         int attempts;
         long nextAttemptAt;
         /** 领取时登记的远端路径（同路径串行用），释放时按它删 */
         String inflightPath;
 
-        Task(String path, long size, long mtime, boolean video, long date, String rowId) {
+        Task(String path, long size, long mtime, boolean video, long date, String rowId,
+                String sha1) {
             this.path = path;
             this.size = size;
             this.mtime = mtime;
             this.video = video;
             this.date = date;
             this.rowId = rowId;
+            this.sha1 = sha1;
         }
 
         String key() {

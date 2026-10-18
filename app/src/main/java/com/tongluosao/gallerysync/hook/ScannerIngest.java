@@ -1,10 +1,18 @@
 package com.tongluosao.gallerysync.hook;
 
-import com.tongluosao.gallerysync.core.Logger;
+import android.content.Context;
+import android.database.Cursor;
+import android.net.Uri;
 
+import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.core.OriginalStore;
+
+import java.io.File;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * 把刚落地的文件告诉相册，让它进媒体库。
@@ -21,6 +29,14 @@ import java.util.List;
  * 不能让下载本身失败。
  */
 public final class ScannerIngest {
+
+    private static final Uri CLOUD_URI =
+            Uri.parse("content://com.miui.gallery.cloud.provider/cloud");
+    private static final ExecutorService IDENTITY_BINDER = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "gallery-scanned-alias");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     /**
      * 扫描场景码。宿主 {@code ScanTaskConfigFactory.get(int)} 的 13 = "可信来源"、
@@ -46,13 +62,62 @@ public final class ScannerIngest {
             return;
         }
         if (scanPaths(absolutePath)) {
+            bindIdentityAfterScan(absolutePath);
             return;
         }
         if (scanFile(absolutePath)) {
+            bindIdentityAfterScan(absolutePath);
             return;
         }
         Logger.w("event=download_scan_failed path=" + absolutePath
                 + " reason=no_usable_scanner_api");
+    }
+
+    /**
+     * ScannerEngine is asynchronous. Resolve the cloud row on a worker after its scan request;
+     * the registry alias keeps the new preview sha1/row id connected to its verified original.
+     */
+    private void bindIdentityAfterScan(String path) {
+        try {
+            IDENTITY_BINDER.execute(() -> {
+                Context context = HostContext.get(mLoader);
+                if (context == null) {
+                    Logger.w("event=scan_alias_skipped reason=no_host_context path=" + path);
+                    return;
+                }
+                OriginalStore store = OriginalStore.get(context.getApplicationContext());
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    try (Cursor cursor = context.getContentResolver().query(CLOUD_URI,
+                            new String[]{"_id", "sha1"}, "localFile = ?",
+                            new String[]{path}, null)) {
+                        if (cursor != null && cursor.moveToFirst()) {
+                            int idColumn = cursor.getColumnIndex("_id");
+                            int shaColumn = cursor.getColumnIndex("sha1");
+                            String rowId = idColumn < 0 ? null : cursor.getString(idColumn);
+                            String sha1 = shaColumn < 0 ? null : cursor.getString(shaColumn);
+                            if (store.registerScannedAlias(new File(path), rowId, sha1)) {
+                                Logger.i("event=scan_alias_registered row=" + rowId
+                                        + " sha1=" + (sha1 == null ? "" : sha1));
+                            } else {
+                                Logger.d("event=scan_alias_no_original_mapping row=" + rowId);
+                            }
+                            return;
+                        }
+                    } catch (Throwable t) {
+                        Logger.d("event=scan_alias_query_retry attempt=" + attempt + " detail=" + t);
+                    }
+                    try {
+                        Thread.sleep(500L);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                Logger.w("event=scan_alias_timeout path=" + path);
+            });
+        } catch (Throwable t) {
+            Logger.w("event=scan_alias_schedule_failed path=" + path, t);
+        }
     }
 
     private boolean scanPaths(String absolutePath) {
