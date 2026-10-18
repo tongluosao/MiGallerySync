@@ -266,7 +266,7 @@ public final class WebDavClient {
         int port = url.getPort() < 0 ? url.getDefaultPort() : url.getPort();
         String target = url.getFile().isEmpty() ? "/" : url.getFile();
         try {
-            Socket socket = connect(host, port);
+            Socket socket = connect(host, port, call);
             socket.setSoTimeout(READ_TIMEOUT_MAX);
             String range = "bytes=" + start + "-" + endInclusive;
             mOut.write(requestHead("GET", host, port, target, null, null, 0L,
@@ -1952,17 +1952,31 @@ public final class WebDavClient {
     }
 
     private Socket connect(String host, int port) throws IOException {
+        return connect(host, port, null);
+    }
+
+    /** Range-only connection path checks cancellation as its pending socket is registered. */
+    private Socket connect(String host, int port, RangeCall rangeCall) throws IOException {
+        ensureRangeActive(rangeCall, null);
         if (mSocket != null && mSocket.isConnected() && !mSocket.isClosed()) {
             return mSocket;
         }
-        Socket socket = mSecure ? tlsSocket(host, port) : plainSocket(host, port);
+        Socket socket = mSecure
+                ? tlsSocket(host, port, rangeCall) : plainSocket(host, port, rangeCall);
+        ensureRangeActive(rangeCall, socket);
         mSocket = socket;
         mPendingSocket = null;
-        mOut = new BufferedOutputStream(socket.getOutputStream(), 32 * 1024);
-        // 缓冲层必须跟着连接一起复用：它是读超前的，每次新建就会丢掉上一次多读进来的字节
-        mReader = new BufferedReader(new InputStreamReader(
-                new BufferedInputStream(socket.getInputStream(), 32 * 1024),
-                StandardCharsets.ISO_8859_1), 8192);
+        try {
+            mOut = new BufferedOutputStream(socket.getOutputStream(), 32 * 1024);
+            // 缓冲层必须跟着连接一起复用：它是读超前的，每次新建就会丢掉上一次多读进来的字节
+            mReader = new BufferedReader(new InputStreamReader(
+                    new BufferedInputStream(socket.getInputStream(), 32 * 1024),
+                    StandardCharsets.ISO_8859_1), 8192);
+            ensureRangeActive(rangeCall, socket);
+        } catch (IOException | RuntimeException e) {
+            if (rangeCall != null) close();
+            throw e;
+        }
         return socket;
     }
 
@@ -2800,14 +2814,23 @@ public final class WebDavClient {
     }
 
     private Socket plainSocket(String host, int port) throws IOException {
+        return plainSocket(host, port, null);
+    }
+
+    private Socket plainSocket(String host, int port, RangeCall rangeCall) throws IOException {
         Socket socket = new Socket();
         mPendingSocket = socket;
+        // A close can win between the range entry check and this registration. Publish the
+        // socket first, then check the handle so either side closes it without reconnecting.
+        ensureRangeActive(rangeCall, socket);
         InetAddress address = addressFor(host);
+        ensureRangeActive(rangeCall, socket);
         // 关键：把**建连**也绑到那个能出网的网络上。
         // 只解析对是不够的 —— 解析出来的 IP 若仍按线程默认的 UID 路由发出去，
         // 一样会掉进那条没有默认路由的 VPN 表（见 addressFor 的说明）。
         // Network.bindSocket 在 minSdk 28 上可用，且是标准做法（平台 HTTP 栈就是这么干的）。
         bindSocketToUsableNetwork(socket);
+        ensureRangeActive(rangeCall, socket);
         try {
             socket.connect(new InetSocketAddress(address, port), CONNECT_TIMEOUT);
             // 握手阶段也得有上限，否则卡在对端不回应时会一直等下去。
@@ -2818,6 +2841,15 @@ public final class WebDavClient {
             closeQuietly(socket);
             if (mPendingSocket == socket) mPendingSocket = null;
             throw e;
+        }
+    }
+
+    private void ensureRangeActive(RangeCall rangeCall, Socket pending)
+            throws IOException {
+        if (rangeCall != null && rangeCall.isClosed()) {
+            closeQuietly(pending);
+            if (mPendingSocket == pending) mPendingSocket = null;
+            throw new IOException("range request was cancelled");
         }
     }
 
@@ -2836,9 +2868,13 @@ public final class WebDavClient {
     }
 
     private SSLSocket tlsSocket(String host, int port) throws IOException {
+        return tlsSocket(host, port, null);
+    }
+
+    private SSLSocket tlsSocket(String host, int port, RangeCall rangeCall) throws IOException {
         // 平台默认信任库（Android 上是系统 CA 那套），与 HttpsURLConnection 同源
         SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
-        Socket raw = plainSocket(host, port);
+        Socket raw = plainSocket(host, port, rangeCall);
         SSLSocket socket;
         try {
             // 这里必须传**主机名**，不能传解析出来的 IP 字面量。两条理由：
@@ -2860,6 +2896,7 @@ public final class WebDavClient {
             socket = (SSLSocket) factory.createSocket(raw, host, port, true);
             // Keep the raw socket cancellable through TLS handshake.
             mPendingSocket = raw;
+            ensureRangeActive(rangeCall, raw);
             // SNI 必须补上：某些服务器（含本机这台 OpenList）按 SNI 选证书/走哪套配置
             javax.net.ssl.SSLParameters params = socket.getSSLParameters();
             params.setEndpointIdentificationAlgorithm("HTTPS");
@@ -2871,6 +2908,7 @@ public final class WebDavClient {
             }
             socket.setSSLParameters(params);
             socket.startHandshake();
+            ensureRangeActive(rangeCall, raw);
             return socket;
         } catch (IOException | RuntimeException e) {
             closeQuietly(raw);

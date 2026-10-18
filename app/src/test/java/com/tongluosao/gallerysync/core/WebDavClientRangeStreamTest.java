@@ -3,14 +3,19 @@ package com.tongluosao.gallerysync.core;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -191,6 +196,48 @@ public class WebDavClientRangeStreamTest {
             call.close();
             opening.join(2_000L);
             assertFalse("closing a pending call should cancel header reads", opening.isAlive());
+        }
+    }
+
+    @Test(timeout = 10_000L)
+    public void cancelledRangeHandleRejectsSocketRegisteredAfterClose() throws Exception {
+        WebDavClient client = new WebDavClient("http://127.0.0.1:9", null, null);
+        WebDavClient.RangeCall call = client.newRangeCall("movie.mp4", 0, 1);
+        Field firstClientField = WebDavClient.RangeCall.class.getDeclaredField("firstClient");
+        firstClientField.setAccessible(true);
+        WebDavClient isolated = (WebDavClient) firstClientField.get(call);
+        TestNetworkContext context = new TestNetworkContext();
+        WebDavClient.setHostContext(context);
+        try {
+            call.close();
+            Method plainSocket = WebDavClient.class.getDeclaredMethod("plainSocket",
+                    String.class, int.class, WebDavClient.RangeCall.class);
+            plainSocket.setAccessible(true);
+            try {
+                plainSocket.invoke(isolated, "127.0.0.1", 9, call);
+                fail("a cancelled range must not create a connection");
+            } catch (InvocationTargetException expected) {
+                assertTrue(expected.getCause() instanceof IOException);
+            }
+
+            assertEquals("cancelled setup must stop before network resolution", 0,
+                    context.getSystemServiceCalls);
+            Field pendingSocket = WebDavClient.class.getDeclaredField("mPendingSocket");
+            pendingSocket.setAccessible(true);
+            assertNull(pendingSocket.get(isolated));
+        } finally {
+            WebDavClient.setHostContext(null);
+            call.close();
+        }
+    }
+
+    /** Exposes accidental resolver entry without needing Android Context implementations. */
+    public static final class TestNetworkContext {
+        volatile int getSystemServiceCalls;
+
+        public Object getSystemService(String name) {
+            getSystemServiceCalls++;
+            return null;
         }
     }
 
