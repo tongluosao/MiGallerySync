@@ -8,6 +8,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -29,6 +30,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -169,7 +171,9 @@ public final class WebDavClient {
     private final Map<String, CachedDirectory> mDirectoryCache = new HashMap<>();
 
     /** 复用中的连接三件套，同一个客户端连发多个请求时它们一直在；断了就一起置空 */
-    private Socket mSocket;
+    private volatile Socket mSocket;
+    /** Socket under connect/TLS handshake, visible so a range handle can cancel setup too. */
+    private volatile Socket mPendingSocket;
     private OutputStream mOut;
     private BufferedReader mReader;
 
@@ -213,11 +217,402 @@ public final class WebDavClient {
         this(baseUrl, buildAuthHeader(username, password));
     }
 
-    private WebDavClient(String baseUrl, String authorization) {
+    WebDavClient(String baseUrl, String authorization) {
         mBaseUrl = trimTrailingSlash(baseUrl);
         mAuthHeader = authorization;
         mPlainHttp = mBaseUrl.regionMatches(true, 0, "http://", 0, 7);
         mSecure = mBaseUrl.regionMatches(true, 0, "https://", 0, 8);
+    }
+
+    /**
+     * Open one independently connected HTTP byte range for video playback or seeking.
+     * Closing the returned response closes its socket, including while a read is blocked.
+     * This path never writes a local file and is deliberately separate from full-file download
+     * and hash verification.
+     */
+    public RangeResponse streamRange(String remotePath, long start, long endInclusive)
+            throws IOException {
+        return newRangeCall(remotePath, start, endInclusive).open();
+    }
+
+    /**
+     * Create a cancellable range operation. Register the returned handle before calling open()
+     * when an owner must be able to cancel connection setup as well as an active body read.
+     */
+    public RangeCall newRangeCall(String remotePath, long start, long endInclusive)
+            throws IOException {
+        if (remotePath == null || remotePath.isEmpty()) {
+            throw new IllegalArgumentException("remotePath must not be empty");
+        }
+        if (start < 0L || endInclusive < start) {
+            throw new IllegalArgumentException("invalid byte range");
+        }
+        WebDavClient isolated = new WebDavClient(mBaseUrl, mAuthHeader);
+        URL url = new URL(isolated.mBaseUrl + encodePath(remotePath));
+        String protocol = url.getProtocol();
+        if (!("http".equalsIgnoreCase(protocol) || "https".equalsIgnoreCase(protocol))) {
+            throw new IOException("unsupported WebDAV URL scheme");
+        }
+        return new RangeCall(isolated, url, start, endInclusive);
+    }
+
+    private RangeResponse streamRange(URL url, String authorization, long start,
+            long endInclusive, int redirectsLeft, RangeCall call) throws IOException {
+        call.setActiveClient(this);
+        if (call.isClosed()) {
+            throw new IOException("range request was cancelled");
+        }
+        String host = url.getHost();
+        int port = url.getPort() < 0 ? url.getDefaultPort() : url.getPort();
+        String target = url.getFile().isEmpty() ? "/" : url.getFile();
+        try {
+            Socket socket = connect(host, port);
+            socket.setSoTimeout(READ_TIMEOUT_MAX);
+            String range = "bytes=" + start + "-" + endInclusive;
+            mOut.write(requestHead("GET", host, port, target, null, null, 0L,
+                    -1, null, null, range));
+            mOut.flush();
+
+            Head head = readHead();
+            if (head.code == 301 || head.code == 302 || head.code == 303
+                    || head.code == 307 || head.code == 308) {
+                if (redirectsLeft <= 0) {
+                    throw new IOException("range redirect limit exceeded");
+                }
+                URL next = downloadRedirect(url, head.location);
+                String nextAuthorization = sameOrigin(url, next) ? authorization : null;
+                close(); // The redirect body is intentionally discarded.
+                String origin = next.getProtocol() + "://" + next.getAuthority();
+                WebDavClient redirected = new WebDavClient(origin, nextAuthorization);
+                return redirected.streamRange(next, nextAuthorization, start, endInclusive,
+                        redirectsLeft - 1, call);
+            }
+            if (head.code != 206) {
+                throw new IOException("range request failed code=" + head.code);
+            }
+            ContentRange parsed = null;
+            if (head.code == 206) {
+                parsed = parseContentRange(head.contentRange);
+                if (parsed == null || parsed.start != start || parsed.end > endInclusive
+                        || (head.contentLength >= 0L
+                            && head.contentLength != parsed.end - parsed.start + 1L)) {
+                    throw new IOException("invalid range response");
+                }
+            }
+            if (call.isClosed()) {
+                throw new IOException("range request was cancelled");
+            }
+            return new RangeResponse(this, head.code, head.contentLength, head.contentType,
+                    head.contentRange, parsed == null ? -1L : parsed.start,
+                    parsed == null ? -1L : parsed.end, parsed == null ? -1L : parsed.total,
+                    mReader, head.chunked, call);
+        } catch (IOException | RuntimeException e) {
+            close();
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw e;
+        }
+    }
+
+    private static ContentRange parseContentRange(String value) {
+        if (value == null) {
+            return null;
+        }
+        Matcher matcher = Pattern.compile("(?i)^bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)$")
+                .matcher(value.trim());
+        if (!matcher.matches()) {
+            return null;
+        }
+        long start = parseLong(matcher.group(1));
+        long end = parseLong(matcher.group(2));
+        long total = "*".equals(matcher.group(3)) ? -1L : parseLong(matcher.group(3));
+        if (start < 0L || end < start || (total >= 0L && end >= total)) {
+            return null;
+        }
+        return new ContentRange(start, end, total);
+    }
+
+    private static final class ContentRange {
+        final long start;
+        final long end;
+        final long total;
+
+        ContentRange(long start, long end, long total) {
+            this.start = start;
+            this.end = end;
+            this.total = total;
+        }
+    }
+
+    /** One-shot cancellable operation, including DNS/connect/TLS/header wait and body streaming. */
+    public static final class RangeCall implements AutoCloseable {
+        private final WebDavClient firstClient;
+        private final URL firstUrl;
+        private final long start;
+        private final long endInclusive;
+        private volatile WebDavClient activeClient;
+        private volatile RangeResponse response;
+        private volatile boolean closed;
+        private boolean opened;
+
+        private RangeCall(WebDavClient firstClient, URL firstUrl, long start, long endInclusive) {
+            this.firstClient = firstClient;
+            this.firstUrl = firstUrl;
+            this.start = start;
+            this.endInclusive = endInclusive;
+            this.activeClient = firstClient;
+        }
+
+        public RangeResponse open() throws IOException {
+            synchronized (this) {
+                if (closed) throw new IOException("range request was cancelled");
+                if (opened) throw new IOException("range request can only be opened once");
+                opened = true;
+            }
+            RangeResponse openedResponse = firstClient.streamRange(firstUrl,
+                    firstClient.mAuthHeader, start, endInclusive, 5, this);
+            synchronized (this) {
+                if (closed) {
+                    openedResponse.close();
+                    throw new IOException("range request was cancelled");
+                }
+                response = openedResponse;
+            }
+            return openedResponse;
+        }
+
+        private void setActiveClient(WebDavClient client) {
+            activeClient = client;
+            if (closed) client.close();
+        }
+
+        private boolean isClosed() {
+            return closed;
+        }
+
+        private synchronized void responseClosed(RangeResponse closedResponse) {
+            if (response == closedResponse) response = null;
+            closed = true;
+        }
+
+        @Override
+        public void close() {
+            RangeResponse currentResponse;
+            WebDavClient currentClient;
+            synchronized (this) {
+                if (closed) return;
+                closed = true;
+                currentResponse = response;
+                currentClient = activeClient;
+                response = null;
+            }
+            if (currentResponse != null) currentResponse.closeFromCall();
+            else if (currentClient != null) currentClient.close();
+        }
+    }
+
+    /** One range response and the connection which owns it. Always close after use. */
+    public static final class RangeResponse implements AutoCloseable {
+        public final int statusCode;
+        /** -1 when the server did not send Content-Length. */
+        public final long contentLength;
+        public final String contentType;
+        public final String contentRange;
+        /** Parsed values from Content-Range; all are -1 for a non-range response. */
+        public final long rangeStart;
+        public final long rangeEnd;
+        public final long resourceLength;
+        private final WebDavClient owner;
+        private final RangeCall call;
+        private final InputStream body;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        private RangeResponse(WebDavClient owner, int statusCode, long contentLength,
+                String contentType, String contentRange, long rangeStart, long rangeEnd,
+                long resourceLength, BufferedReader reader, boolean chunked, RangeCall call) {
+            this.owner = owner;
+            this.statusCode = statusCode;
+            this.contentLength = contentLength;
+            this.contentType = contentType;
+            this.contentRange = contentRange;
+            this.rangeStart = rangeStart;
+            this.rangeEnd = rangeEnd;
+            this.resourceLength = resourceLength;
+            this.call = call;
+            this.body = chunked
+                    ? new ChunkedReaderInputStream(reader, this)
+                    : new ReaderInputStream(reader, contentLength, this);
+        }
+
+        public InputStream body() {
+            return body;
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true)) return;
+            owner.close();
+            call.responseClosed(this);
+        }
+
+        private void closeFromCall() {
+            if (closed.compareAndSet(false, true)) owner.close();
+        }
+    }
+
+    /** Converts the existing ISO-8859-1 response reader back to its original bytes. */
+    private static class ReaderInputStream extends InputStream {
+        final BufferedReader reader;
+        final RangeResponse response;
+        long remaining;
+        boolean closed;
+
+        ReaderInputStream(BufferedReader reader, long contentLength, RangeResponse response) {
+            this.reader = reader;
+            this.remaining = contentLength;
+            this.response = response;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int count = read(one, 0, 1);
+            return count < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] target, int offset, int length) throws IOException {
+            if (closed) {
+                throw new IOException("range stream is closed");
+            }
+            if (target == null) {
+                throw new NullPointerException("target");
+            }
+            if (offset < 0 || length < 0 || length > target.length - offset) {
+                throw new IndexOutOfBoundsException();
+            }
+            if (length == 0) {
+                return 0;
+            }
+            if (remaining == 0L) {
+                return -1;
+            }
+            int wanted = remaining < 0L ? length : (int) Math.min(length, remaining);
+            char[] chars = new char[Math.min(wanted, 16 * 1024)];
+            int count = reader.read(chars, 0, chars.length);
+            if (count < 0) {
+                if (remaining > 0L) {
+                    throw new EOFException("range response ended early");
+                }
+                return -1;
+            }
+            for (int i = 0; i < count; i++) {
+                target[offset + i] = (byte) chars[i];
+            }
+            if (remaining > 0L) {
+                remaining -= count;
+            }
+            return count;
+        }
+
+        @Override
+        public void close() {
+            if (!closed) {
+                closed = true;
+                response.close();
+            }
+        }
+    }
+
+    private static final class ChunkedReaderInputStream extends InputStream {
+        private final BufferedReader reader;
+        private final RangeResponse response;
+        private long chunkRemaining;
+        private boolean needChunkTerminator;
+        private boolean done;
+        private boolean closed;
+
+        ChunkedReaderInputStream(BufferedReader reader, RangeResponse response) {
+            this.reader = reader;
+            this.response = response;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            int count = read(one, 0, 1);
+            return count < 0 ? -1 : one[0] & 0xff;
+        }
+
+        @Override
+        public int read(byte[] target, int offset, int length) throws IOException {
+            if (closed) {
+                throw new IOException("range stream is closed");
+            }
+            if (length == 0) {
+                return 0;
+            }
+            if (done) {
+                return -1;
+            }
+            if (needChunkTerminator) {
+                String terminator = reader.readLine();
+                if (terminator == null || !terminator.isEmpty()) {
+                    throw new IOException("invalid chunk terminator");
+                }
+                needChunkTerminator = false;
+            }
+            if (chunkRemaining == 0L) {
+                String sizeLine = reader.readLine();
+                if (sizeLine == null) {
+                    throw new EOFException("chunked range ended early");
+                }
+                int semicolon = sizeLine.indexOf(';');
+                String size = (semicolon < 0 ? sizeLine : sizeLine.substring(0, semicolon)).trim();
+                try {
+                    chunkRemaining = Long.parseLong(size, 16);
+                } catch (RuntimeException e) {
+                    throw new IOException("invalid chunk size");
+                }
+                if (chunkRemaining < 0L) {
+                    throw new IOException("invalid chunk size");
+                }
+                if (chunkRemaining == 0L) {
+                    String trailer;
+                    while ((trailer = reader.readLine()) != null && !trailer.isEmpty()) {
+                        // Trailers are intentionally ignored.
+                    }
+                    if (trailer == null) {
+                        throw new EOFException("chunked range trailers ended early");
+                    }
+                    done = true;
+                    return -1;
+                }
+            }
+            int wanted = (int) Math.min(Math.min((long) length, chunkRemaining), 16 * 1024L);
+            char[] chars = new char[wanted];
+            int count = reader.read(chars, 0, wanted);
+            if (count < 0) {
+                throw new EOFException("chunked range data ended early");
+            }
+            for (int i = 0; i < count; i++) {
+                target[offset + i] = (byte) chars[i];
+            }
+            chunkRemaining -= count;
+            if (chunkRemaining == 0L) {
+                needChunkTerminator = true;
+            }
+            return count;
+        }
+
+        @Override
+        public void close() {
+            if (!closed) {
+                closed = true;
+                response.close();
+            }
+        }
     }
 
     /** 只读探测：判断服务器可达性与认证，绝不写入任何东西 */
@@ -1479,8 +1874,12 @@ public final class WebDavClient {
     }
 
     private void dropConnection() {
-        closeQuietly(mSocket);
+        Socket connected = mSocket;
+        Socket pending = mPendingSocket;
+        closeQuietly(connected);
+        if (pending != connected) closeQuietly(pending);
         mSocket = null;
+        mPendingSocket = null;
         mOut = null;
         mReader = null;
         // 连接断了就把解析结果一起丢掉：IP 漂移（CDN/负载均衡换节点）只有重新解析才跟得上
@@ -1558,6 +1957,7 @@ public final class WebDavClient {
         }
         Socket socket = mSecure ? tlsSocket(host, port) : plainSocket(host, port);
         mSocket = socket;
+        mPendingSocket = null;
         mOut = new BufferedOutputStream(socket.getOutputStream(), 32 * 1024);
         // 缓冲层必须跟着连接一起复用：它是读超前的，每次新建就会丢掉上一次多读进来的字节
         mReader = new BufferedReader(new InputStreamReader(
@@ -1618,15 +2018,19 @@ public final class WebDavClient {
         /** 服务器显式说的连接是否留存；没写就是 null */
         final Boolean keepAlive;
         final String location;
+        final String contentRange;
+        final String contentType;
 
         Head(int code, long contentLength, boolean chunked, boolean http10, Boolean keepAlive,
-                String location) {
+                String location, String contentRange, String contentType) {
             this.code = code;
             this.contentLength = contentLength;
             this.chunked = chunked;
             this.http10 = http10;
             this.keepAlive = keepAlive;
             this.location = location;
+            this.contentRange = contentRange;
+            this.contentType = contentType;
         }
     }
 
@@ -1642,6 +2046,8 @@ public final class WebDavClient {
         boolean chunked = false;
         Boolean headerKeepAlive = null;
         String location = null;
+        String contentRange = null;
+        String contentType = null;
         String line;
         StringBuilder rawHeaders = new StringBuilder(128);
         while ((line = reader.readLine()) != null && !line.isEmpty()) {
@@ -1670,11 +2076,16 @@ public final class WebDavClient {
                         !value.toLowerCase(Locale.US).contains("close"));
             } else if (name.equalsIgnoreCase("Location")) {
                 location = value;
+            } else if (name.equalsIgnoreCase("Content-Range")) {
+                contentRange = value;
+            } else if (name.equalsIgnoreCase("Content-Type")) {
+                contentType = value;
             }
         }
         mLastStatusLine = statusLine;
         mLastHeaders = rawHeaders.toString();
-        return new Head(code, contentLength, chunked, http10, headerKeepAlive, location);
+        return new Head(code, contentLength, chunked, http10, headerKeepAlive, location,
+                contentRange, contentType);
     }
 
     /** 最近一条响应的状态行与响应头，仅用于诊断日志（见 verify_failed 的 raw=） */
@@ -2390,17 +2801,24 @@ public final class WebDavClient {
 
     private Socket plainSocket(String host, int port) throws IOException {
         Socket socket = new Socket();
+        mPendingSocket = socket;
         InetAddress address = addressFor(host);
         // 关键：把**建连**也绑到那个能出网的网络上。
         // 只解析对是不够的 —— 解析出来的 IP 若仍按线程默认的 UID 路由发出去，
         // 一样会掉进那条没有默认路由的 VPN 表（见 addressFor 的说明）。
         // Network.bindSocket 在 minSdk 28 上可用，且是标准做法（平台 HTTP 栈就是这么干的）。
         bindSocketToUsableNetwork(socket);
-        socket.connect(new InetSocketAddress(address, port), CONNECT_TIMEOUT);
-        // 握手阶段也得有上限，否则卡在对端不回应时会一直等下去。
-        // exchange() 随后会按请求体大小把它换成真正的读超时
-        socket.setSoTimeout(CONNECT_TIMEOUT * 2);
-        return socket;
+        try {
+            socket.connect(new InetSocketAddress(address, port), CONNECT_TIMEOUT);
+            // 握手阶段也得有上限，否则卡在对端不回应时会一直等下去。
+            // exchange() 随后会按请求体大小把它换成真正的读超时
+            socket.setSoTimeout(CONNECT_TIMEOUT * 2);
+            return socket;
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(socket);
+            if (mPendingSocket == socket) mPendingSocket = null;
+            throw e;
+        }
     }
 
     /** 把这条 socket 绑到 {@link #pickUsableNetwork()} 挑出来的网络上；挑不出来就不绑 */
@@ -2440,6 +2858,8 @@ public final class WebDavClient {
             //    PC 回归那条负向用例正是这么抓出来的：先连 localhost（成功），紧接着连 127.0.0.1
             //    也通过了 —— 而单独连 127.0.0.1 是失败的。传主机名各是各的键，绕不过去。
             socket = (SSLSocket) factory.createSocket(raw, host, port, true);
+            // Keep the raw socket cancellable through TLS handshake.
+            mPendingSocket = raw;
             // SNI 必须补上：某些服务器（含本机这台 OpenList）按 SNI 选证书/走哪套配置
             javax.net.ssl.SSLParameters params = socket.getSSLParameters();
             params.setEndpointIdentificationAlgorithm("HTTPS");
@@ -2454,6 +2874,7 @@ public final class WebDavClient {
             return socket;
         } catch (IOException | RuntimeException e) {
             closeQuietly(raw);
+            if (mPendingSocket == raw) mPendingSocket = null;
             throw e;
         }
     }
@@ -2461,13 +2882,24 @@ public final class WebDavClient {
     private byte[] requestHead(String method, String host, int port, String target,
             File file, byte[] body, long length, int depth, String destination,
             String overwrite) {
+        return requestHead(method, host, port, target, file, body, length, depth,
+                destination, overwrite, null);
+    }
+
+    private byte[] requestHead(String method, String host, int port, String target,
+            File file, byte[] body, long length, int depth, String destination,
+            String overwrite, String range) {
         StringBuilder sb = new StringBuilder(256);
         sb.append(method).append(' ').append(target).append(" HTTP/1.1\r\n")
                 .append("Host: ").append(hostHeader(host, port)).append("\r\n")
-                .append("Connection: keep-alive\r\n")
+                .append("Connection: ").append(range == null ? "keep-alive" : "close")
+                .append("\r\n")
                 .append("Accept-Encoding: identity\r\n");
         if (mAuthHeader != null) {
             sb.append("Authorization: ").append(mAuthHeader).append("\r\n");
+        }
+        if (range != null) {
+            sb.append("Range: ").append(range).append("\r\n");
         }
         if ("PROPFIND".equals(method)) {
             if (depth >= 0) {

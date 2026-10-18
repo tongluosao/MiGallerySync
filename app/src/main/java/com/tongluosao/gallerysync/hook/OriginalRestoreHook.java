@@ -13,10 +13,13 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
+import com.tongluosao.gallerysync.core.WebDavVideoSource;
 
 import io.github.libxposed.api.XposedInterface;
 
@@ -40,12 +43,25 @@ final class OriginalRestoreHook {
         thread.setDaemon(true);
         return thread;
     });
+    private final ExecutorService mVideoSourceWorker = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "gallery-webdav-video-source");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final Handler mMain = new Handler(Looper.getMainLooper());
+    private final Object mVideoSourceLock = new Object();
+    private final AtomicLong mVideoPlaybackGeneration = new AtomicLong();
+    private volatile VideoPlaybackRequest mActiveVideoPlayback;
     private volatile Config mConfig;
     private volatile OriginalStore mStore;
+    private volatile WebDavVideoSource mVideoSource;
+    private volatile Method mDownloadOriginMethod;
+    private volatile Object mOriginDownloadType;
+    private volatile Method mPlayDifferentVideoMethod;
     private volatile boolean mOriginHookReady;
     private volatile boolean mImageLoaderHookReady;
     private volatile boolean mVideoPlaybackHookReady;
+    private volatile boolean mVideoErrorHookReady;
     private volatile boolean mMenuHookReady;
 
     OriginalRestoreHook(XposedInterface xposed, ClassLoader loader) {
@@ -53,11 +69,22 @@ final class OriginalRestoreHook {
         mLoader = loader;
     }
 
-    void setConfig(Config config) { mConfig = config; }
+    void setConfig(Config config) {
+        synchronized (mVideoSourceLock) {
+            Config previous = mConfig;
+            mConfig = config;
+            if (!sameVideoSourceConfig(previous, config)) {
+                mVideoPlaybackGeneration.incrementAndGet();
+                mActiveVideoPlayback = null;
+                closeVideoSourceLocked();
+            }
+        }
+    }
 
     boolean canRestoreVideos() {
         Config config = mConfig;
         return mOriginHookReady && mImageLoaderHookReady && mVideoPlaybackHookReady
+                && mVideoErrorHookReady
                 && config != null && config.isReady();
     }
 
@@ -122,6 +149,8 @@ final class OriginalRestoreHook {
                         if (request == null || !isOrigin(downloadType)) return chain.proceed();
                         Uri uri = chain.getArg(0) instanceof Uri ? (Uri) chain.getArg(0) : null;
                         if (request.uri != null && uri != null && !request.uri.equals(uri)) {
+                            Logger.w("event=managed_original_restore_uri_mismatch row="
+                                    + request.record.rowId);
                             return chain.proceed();
                         }
                         // The request is a managed WebDAV item. Never let Gallery fall back to its
@@ -140,12 +169,33 @@ final class OriginalRestoreHook {
     private void installVideoPlaybackRestoreHook() {
         try {
             Class<?> videoItem = mLoader.loadClass("com.miui.gallery.ui.PhotoPageVideoItem");
+            Class<?> pageItem = mLoader.loadClass(PAGE_ITEM);
             Class<?> downloadType = mLoader.loadClass(DOWNLOAD_TYPE);
             Class<?> managerType = mLoader.loadClass(DOWNLOAD_MANAGER);
             Method handleOnlineRequest = videoItem.getDeclaredMethod("handleOnlineRequest");
+            Method onUnSelected = pageItem.getDeclaredMethod("onUnSelected",
+                    boolean.class, int.class);
             Method downloadOrigin = managerType.getDeclaredMethod("downloadOrigin", downloadType);
             Object origin = downloadType.getField("ORIGIN").get(null);
+            mDownloadOriginMethod = downloadOrigin;
+            mOriginDownloadType = origin;
+            try {
+                Class<?> playManager = mLoader.loadClass("com.miui.gallery.video.VideoPlayManager");
+                Class<?> baseDataItem = mLoader.loadClass("com.miui.gallery.model.BaseDataItem");
+                Method playDifferentVideo = playManager.getDeclaredMethod("doPlayDifferentVideo",
+                        baseDataItem, String.class, String.class, byte[].class, byte[].class,
+                        String.class);
+                playDifferentVideo.setAccessible(true);
+                mPlayDifferentVideoMethod = playDifferentVideo;
+                Logger.i("event=hook_video_player_entry_ready method=VideoPlayManager.doPlayDifferentVideo(BaseDataItem,String,String,byte[],byte[],String)");
+            } catch (Throwable t) {
+                // The full original restore remains available if this Gallery build changes its
+                // native player entry point.
+                mPlayDifferentVideoMethod = null;
+                Logger.w("event=managed_video_player_entry_missing method=VideoPlayManager.doPlayDifferentVideo/6", t);
+            }
             handleOnlineRequest.setAccessible(true);
+            onUnSelected.setAccessible(true);
             downloadOrigin.setAccessible(true);
             mXposed.hook(handleOnlineRequest).setId("gallery_managed_video_playback_restore")
                     .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
@@ -154,10 +204,11 @@ final class OriginalRestoreHook {
                         Object video = chain.getThisObject();
                         Object item;
                         OriginalStore.Record record;
+                        Config config;
                         try {
                             item = field(video, "mDataItem");
                             if (item == null) return chain.proceed();
-                            Config config = mConfig;
+                            config = mConfig;
                             if (config == null || !config.isReady()) return chain.proceed();
                             OriginalStore originalStore = store();
                             if (originalStore == null) return chain.proceed();
@@ -179,6 +230,7 @@ final class OriginalRestoreHook {
                         }
 
                         Object manager;
+                        Object playManager;
                         try {
                             manager = field(video, "mDownloadManager");
                             if (manager == null) {
@@ -189,25 +241,249 @@ final class OriginalRestoreHook {
                                 Logger.d("event=managed_video_playback_restore_already_active");
                                 return Boolean.TRUE;
                             }
-                            // VideoDownloadManager inherits this typed overload. Its native
-                            // completion callback updates the item's original path and resumes
-                            // playback after the video view is added.
-                            downloadOrigin.invoke(manager, origin);
-                            Logger.i("event=managed_video_playback_restore_started row="
-                                    + record.rowId);
+                            // DEX declares PhotoPageVideoItem.mPlayManager as VideoPlayManager.
+                            // Its doPlayDifferentVideo(BaseDataItem,String,String,byte[],byte[],
+                            // String) entry accepts the localhost relay URL without changing
+                            // the BaseDataItem's original path.
+                            playManager = field(video, "mPlayManager");
                         } catch (Throwable t) {
-                            Logger.e("event=managed_video_playback_restore_start_failed row="
+                            Logger.w("event=managed_video_playback_manager_lookup_failed row="
                                     + record.rowId, t);
+                            return Boolean.TRUE;
                         }
+                        VideoPlaybackRequest playback = new VideoPlaybackRequest(video, item,
+                                manager, playManager, record, config,
+                                mVideoPlaybackGeneration.incrementAndGet());
+                        mActiveVideoPlayback = playback;
+                        if (playManager == null || mPlayDifferentVideoMethod == null
+                                || !mVideoErrorHookReady) {
+                            startFullVideoRestore(playback, null);
+                            return Boolean.TRUE;
+                        }
+                        prepareVideoStream(playback);
                         // Do not fall through to Gallery's Xiaomi OnlineVideo URL request for
                         // a managed item whose registered local original is absent.
                         return Boolean.TRUE;
                     });
             mVideoPlaybackHookReady = true;
             Logger.i("event=hook_registered method=PhotoPageVideoItem.handleOnlineRequest()");
+            mXposed.hook(onUnSelected).setId("gallery_managed_video_stream_page_exit_cleanup")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        Object page = chain.getThisObject();
+                        Object pausedValue = chain.getArg(0);
+                        boolean paused = pausedValue instanceof Boolean
+                                && (Boolean) pausedValue;
+                        if (!paused && videoItem.isInstance(page)) {
+                            releaseVideoSourceForVideo(page);
+                        }
+                        return result;
+                    });
+            Logger.i("event=hook_registered method=PhotoPageItem.onUnSelected(boolean,int)");
+            try {
+                Method handleError = videoItem.getDeclaredMethod("handleError", String.class);
+                handleError.setAccessible(true);
+                mXposed.hook(handleError).setId("gallery_managed_video_stream_error_fallback")
+                        .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                        .intercept(chain -> {
+                            VideoPlaybackRequest playback = mActiveVideoPlayback;
+                            WebDavVideoSource source = playback == null
+                                    ? null : playback.streamSource;
+                            if (playback == null || playback.video != chain.getThisObject()
+                                    || source == null || playback.fallbackStarted.get()) {
+                                return chain.proceed();
+                            }
+                            Object result = chain.proceed();
+                            if (!mMain.post(() -> {
+                                if (mActiveVideoPlayback != playback
+                                        || playback.streamSource != source
+                                        || mVideoSource != source) return;
+                                Logger.w("event=managed_video_stream_async_error row="
+                                        + playback.record.rowId);
+                                startFullVideoRestore(playback,
+                                        new IllegalStateException("Gallery video playback failed"));
+                            })) {
+                                Logger.w("event=managed_video_stream_error_callback_rejected row="
+                                        + playback.record.rowId);
+                            }
+                            return result;
+                        });
+                mVideoErrorHookReady = true;
+                Logger.i("event=hook_registered method=PhotoPageVideoItem.handleError(String)");
+            } catch (Throwable t) {
+                mVideoErrorHookReady = false;
+                Logger.w("event=managed_video_stream_error_hook_missing method=PhotoPageVideoItem.handleError(String)", t);
+            }
         } catch (Throwable t) {
             Logger.e("event=managed_video_playback_restore_hook_missing method=PhotoPageVideoItem.handleOnlineRequest()", t);
         }
+    }
+
+    private void prepareVideoStream(VideoPlaybackRequest playback) {
+        try {
+            mVideoSourceWorker.execute(() -> {
+                WebDavVideoSource source = new WebDavVideoSource();
+                String url;
+                try {
+                    synchronized (mVideoSourceLock) {
+                        if (!isPlaybackConfigCurrent(playback)) return;
+                        WebDavVideoSource previous = mVideoSource;
+                        mVideoSource = source;
+                        playback.relaySource = source;
+                        if (previous != null) previous.close();
+                        url = source.open(playback.config, playback.record);
+                        if (mVideoSource != source || !isPlaybackConfigCurrent(playback)) {
+                            if (mVideoSource == source) mVideoSource = null;
+                            source.close();
+                            return;
+                        }
+                    }
+                } catch (Throwable t) {
+                    closeVideoSource(source);
+                    Logger.w("event=managed_video_stream_open_failed row="
+                            + playback.record.rowId, t);
+                    if (!mMain.post(() -> startFullVideoRestore(playback, t))) {
+                        Logger.w("event=managed_video_stream_fallback_callback_rejected row="
+                                + playback.record.rowId);
+                    }
+                    return;
+                }
+                if (!mMain.post(() -> playVideoStream(playback, source, url))) {
+                    closeVideoSource(source);
+                    Logger.w("event=managed_video_stream_callback_rejected row="
+                            + playback.record.rowId);
+                }
+            });
+        } catch (Throwable t) {
+            Logger.w("event=managed_video_stream_worker_unavailable row="
+                    + playback.record.rowId, t);
+            startFullVideoRestore(playback, t);
+        }
+    }
+
+    private void playVideoStream(VideoPlaybackRequest playback, WebDavVideoSource source,
+            String url) {
+        if (!isVideoPlaybackCurrent(playback) || mVideoSource != source) {
+            closeVideoSource(source);
+            return;
+        }
+        try {
+            Method play = mPlayDifferentVideoMethod;
+            if (play == null) throw new NoSuchMethodException("native video player entry missing");
+            playback.streamSource = source;
+            play.invoke(playback.playManager, playback.item, url, null, null, null, null);
+            Logger.i("event=managed_video_stream_started row=" + playback.record.rowId);
+        } catch (Throwable t) {
+            closeVideoSource(source);
+            Logger.w("event=managed_video_stream_start_failed row="
+                    + playback.record.rowId, t);
+            startFullVideoRestore(playback, t);
+        }
+    }
+
+    /** Fallback uses Gallery's existing ORIGIN download callback, preserving its path semantics. */
+    private void startFullVideoRestore(VideoPlaybackRequest playback, Throwable streamFailure) {
+        if (!playback.fallbackStarted.compareAndSet(false, true)) return;
+        if (streamFailure != null) {
+            Logger.w("event=managed_video_stream_fallback_to_restore row="
+                    + playback.record.rowId, streamFailure);
+        }
+        WebDavVideoSource source = playback.relaySource;
+        playback.relaySource = null;
+        playback.streamSource = null;
+        if (source != null) closeVideoSource(source);
+        if (!isVideoPlaybackCurrent(playback)) return;
+        try {
+            Object manager = playback.downloadManager;
+            if (manager == null) return;
+            if (isOrigin(call(manager, "getCurDownloadType"))) {
+                Logger.d("event=managed_video_playback_restore_already_active");
+                return;
+            }
+            Method downloadOrigin = mDownloadOriginMethod;
+            Object origin = mOriginDownloadType;
+            if (downloadOrigin == null || origin == null) {
+                Logger.w("event=managed_video_playback_restore_entry_missing");
+                return;
+            }
+            Object downloadUriValue = call(playback.item, "getDownloadUri");
+            Uri downloadUri = downloadUriValue instanceof Uri ? (Uri) downloadUriValue : null;
+            Request request = new Request(manager, playback.item, playback.record,
+                    playback.config, playback.record.originalLocalPath, downloadUri,
+                    OriginalStore.targetKey(playback.config).equals(playback.record.target));
+            Request previousRequest = ACTIVE_REQUEST.get();
+            ACTIVE_REQUEST.set(request);
+            try {
+                downloadOrigin.invoke(manager, origin);
+            } finally {
+                if (previousRequest == null) ACTIVE_REQUEST.remove();
+                else ACTIVE_REQUEST.set(previousRequest);
+            }
+            Logger.i("event=managed_video_playback_restore_started row="
+                    + playback.record.rowId);
+        } catch (Throwable t) {
+            Logger.e("event=managed_video_playback_restore_start_failed row="
+                    + playback.record.rowId, t);
+        }
+    }
+
+    private boolean isVideoPlaybackCurrent(VideoPlaybackRequest playback) {
+        if (!isPlaybackConfigCurrent(playback)) return false;
+        try {
+            if (playback.playManager != null) {
+                Object currentVideo = call(playback.playManager, "getCurrentItem");
+                if (currentVideo != playback.video) return false;
+                Object currentItem = optionalCall(currentVideo, "getDataItem");
+                return currentItem == null || currentItem == playback.item;
+            }
+            return playback.item == call(playback.downloadManager, "getCurPageItem");
+        } catch (Throwable t) {
+            Logger.d("event=managed_video_current_item_check_failed detail=" + t);
+            return false;
+        }
+    }
+
+    private boolean isPlaybackConfigCurrent(VideoPlaybackRequest playback) {
+        return playback.generation == mVideoPlaybackGeneration.get()
+                && sameVideoSourceConfig(playback.config, mConfig);
+    }
+
+    private static boolean sameVideoSourceConfig(Config left, Config right) {
+        if (left == right) return true;
+        if (left == null || right == null || !left.isReady() || !right.isReady()) return false;
+        return OriginalStore.targetKey(left).equals(OriginalStore.targetKey(right))
+                && safeConfigValue(left.getPassword()).equals(safeConfigValue(right.getPassword()));
+    }
+
+    private static String safeConfigValue(String value) { return value == null ? "" : value; }
+
+    private void closeVideoSource(WebDavVideoSource source) {
+        if (source == null) return;
+        synchronized (mVideoSourceLock) {
+            if (mVideoSource == source) mVideoSource = null;
+            source.close();
+        }
+    }
+
+    private void closeVideoSourceLocked() {
+        WebDavVideoSource source = mVideoSource;
+        mVideoSource = null;
+        if (source != null) source.close();
+    }
+
+    private void releaseVideoSourceForVideo(Object video) {
+        VideoPlaybackRequest playback = mActiveVideoPlayback;
+        if (playback == null || playback.video != video
+                || mActiveVideoPlayback != playback) return;
+        mActiveVideoPlayback = null;
+        mVideoPlaybackGeneration.incrementAndGet();
+        WebDavVideoSource source = playback.relaySource;
+        playback.relaySource = null;
+        playback.streamSource = null;
+        if (source != null) closeVideoSource(source);
+        Logger.d("event=managed_video_stream_closed_page_unselected row="
+                + playback.record.rowId);
     }
 
     private void installMenuHook() {
@@ -448,6 +724,8 @@ final class OriginalRestoreHook {
             mWorker.execute(() -> {
                 File restored = null;
                 Throwable failure = null;
+                Logger.i("event=managed_original_restore_worker_started row="
+                        + request.record.rowId);
                 try {
                     if (!request.targetMatches || request.config == null || !request.config.isReady()) {
                         throw new IllegalStateException("WebDAV target is not active for this managed item");
@@ -461,13 +739,20 @@ final class OriginalRestoreHook {
                     }
                     restored = store.restoreOriginal(request.config, request.record.rowId,
                             request.record.sha1, new File(request.destination));
+                    Logger.i("event=managed_original_restore_file_ready row="
+                            + request.record.rowId + " bytes=" + restored.length());
                 } catch (Throwable t) {
                     failure = t;
                 }
                 File finalRestored = restored;
                 Throwable finalFailure = failure;
-                mMain.post(() -> deliver(request, uri, type, view, listener,
-                        finalRestored, finalFailure));
+                boolean callbackQueued = mMain.post(() -> deliver(request, uri, type, view,
+                        listener, finalRestored, finalFailure));
+                if (!callbackQueued) {
+                    Logger.e("event=managed_original_restore_callback_rejected row="
+                            + request.record.rowId);
+                    clearUserDownloadState(request);
+                }
             });
         } catch (Throwable t) {
             deliver(request, uri, type, view, listener, null, t);
@@ -481,6 +766,9 @@ final class OriginalRestoreHook {
             return;
         }
         if (listener == null || type == null) {
+            Logger.e("event=managed_original_restore_callback_unavailable row="
+                    + request.record.rowId + " listener=" + (listener != null)
+                    + " type=" + (type != null));
             clearUserDownloadState(request);
             return;
         }
@@ -586,11 +874,42 @@ final class OriginalRestoreHook {
     }
 
     void shutdown() {
+        synchronized (mVideoSourceLock) {
+            mVideoPlaybackGeneration.incrementAndGet();
+            closeVideoSourceLocked();
+            mConfig = null;
+        }
         mVideoPlaybackHookReady = false;
+        mVideoErrorHookReady = false;
+        mActiveVideoPlayback = null;
         mOriginHookReady = false;
         mImageLoaderHookReady = false;
-        mConfig = null;
         mWorker.shutdownNow();
+        mVideoSourceWorker.shutdownNow();
+    }
+
+    private static final class VideoPlaybackRequest {
+        final Object video;
+        final Object item;
+        final Object downloadManager;
+        final Object playManager;
+        final OriginalStore.Record record;
+        final Config config;
+        final long generation;
+        final AtomicBoolean fallbackStarted = new AtomicBoolean();
+        volatile WebDavVideoSource relaySource;
+        volatile WebDavVideoSource streamSource;
+
+        VideoPlaybackRequest(Object video, Object item, Object downloadManager,
+                Object playManager, OriginalStore.Record record, Config config, long generation) {
+            this.video = video;
+            this.item = item;
+            this.downloadManager = downloadManager;
+            this.playManager = playManager;
+            this.record = record;
+            this.config = config;
+            this.generation = generation;
+        }
     }
 
     private static final class Request {
