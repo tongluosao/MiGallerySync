@@ -376,6 +376,29 @@ public final class OriginalStore {
         return null;
     }
 
+    /** Find a local alias belonging to one exact target and remote object. */
+    public Record findByRemotePath(Config config, String remotePath, File localPath) {
+        if (config == null || remotePath == null || remotePath.isEmpty() || localPath == null) {
+            return null;
+        }
+        String path;
+        try {
+            path = canonical(localPath);
+        } catch (IOException e) {
+            return null;
+        }
+        String target = targetKey(config);
+        synchronized (mLock) {
+            for (Record record : mRecords.values()) {
+                if (target.equals(record.target) && remotePath.equals(record.remotePath)
+                        && containsLocalPath(record, path)) {
+                    return record;
+                }
+            }
+        }
+        return null;
+    }
+
     /** Find by gallery identity under the currently configured remote target. */
     public Record find(Config config, String rowId, String sha1) {
         String target = targetKey(config);
@@ -427,18 +450,38 @@ public final class OriginalStore {
      */
     public File restoreOriginal(Config config, String rowId, String sha1, File destination)
             throws IOException {
-        if (destination == null) {
-            throw new IOException("restore destination is missing");
-        }
         Record record = find(config, rowId, sha1);
         if (record == null) {
             throw new IOException("no registered remote original for gallery item");
+        }
+        return restoreOriginal(config, record, destination);
+    }
+
+    /**
+     * Restore a registered original when a download mapping has not yet received a gallery row
+     * identity. The immutable record must still belong to this target and remain in the registry.
+     */
+    public File restoreOriginal(Config config, Record requested, File destination)
+            throws IOException {
+        if (destination == null) {
+            throw new IOException("restore destination is missing");
+        }
+        if (requested == null || !targetKey(config).equals(requested.target)) {
+            throw new IOException("no registered remote original for gallery item");
+        }
+        Record record;
+        synchronized (mLock) {
+            requireHealthyLocked();
+            record = mRecords.get(recordKey(requested));
+        }
+        if (record == null || !targetKey(config).equals(record.target)) {
+            throw new IOException("registered remote original is no longer available");
         }
         PathLease restoreLease = lockPath(destination, true);
         try {
         if (destination.isFile() && destination.length() == record.originalLength
                 && record.sha256.equals(sha256(destination))) {
-            saveRestoredLocal(config, rowId, sha1, destination);
+            saveRestoredLocal(config, record, destination);
             return destination;
         }
         if (destination.exists()) {
@@ -475,7 +518,7 @@ public final class OriginalStore {
                     throw moveFailure;
                 }
             }
-            saveRestoredLocal(config, rowId, sha1, destination);
+            saveRestoredLocal(config, record, destination);
             return destination;
         } finally {
             client.close();
@@ -488,10 +531,10 @@ public final class OriginalStore {
         }
     }
 
-    private void saveRestoredLocal(Config config, String rowId, String sha1, File destination)
+    private void saveRestoredLocal(Config config, Record record, File destination)
             throws IOException {
         synchronized (mLock) {
-            Record latest = findLocked(targetKey(config), rowId, sha1);
+            Record latest = mRecords.get(recordKey(record));
             if (latest != null) {
                 Record restored = latest.withRestoredLocal(destination);
                 mRecords.put(recordKey(restored), restored);

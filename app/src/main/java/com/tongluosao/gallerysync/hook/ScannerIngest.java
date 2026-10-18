@@ -61,11 +61,11 @@ public final class ScannerIngest {
         if (absolutePath == null || absolutePath.isEmpty()) {
             return;
         }
-        if (scanPaths(absolutePath)) {
+        if (scanFile(absolutePath)) {
             bindIdentityAfterScan(absolutePath);
             return;
         }
-        if (scanFile(absolutePath)) {
+        if (scanPaths(absolutePath)) {
             bindIdentityAfterScan(absolutePath);
             return;
         }
@@ -88,8 +88,8 @@ public final class ScannerIngest {
                 OriginalStore store = OriginalStore.get(context.getApplicationContext());
                 for (int attempt = 0; attempt < 20; attempt++) {
                     try (Cursor cursor = context.getContentResolver().query(CLOUD_URI,
-                            new String[]{"_id", "sha1"}, "localFile = ?",
-                            new String[]{path}, null)) {
+                            new String[]{"_id", "sha1"}, "localFile = ? OR thumbnailFile = ?",
+                            new String[]{path, path}, null)) {
                         if (cursor != null && cursor.moveToFirst()) {
                             int idColumn = cursor.getColumnIndex("_id");
                             int shaColumn = cursor.getColumnIndex("sha1");
@@ -155,12 +155,37 @@ public final class ScannerIngest {
             }
             Method method = engine.getMethod("scanFile",
                     android.content.Context.class, String.class, int.class);
-            method.invoke(instance, context, absolutePath, SCENE_CODE);
+            Object scanResult = method.invoke(instance, context, absolutePath, SCENE_CODE);
+            String result = scanResultValue(scanResult, "getResult");
+            String reason = scanResultValue(scanResult, "getReasonCode");
+            Logger.i("event=download_scan_result api=scanFile path=" + absolutePath
+                    + " result=" + result + " reason=" + reason);
+            boolean rejected = "FAILED".equals(result) || "RETRY".equals(result);
+            if (scanResult == null
+                    || rejected && !"ALREADY_EXISTS".equals(reason)) {
+                Logger.w("event=download_scan_fallback api=scanFile path=" + absolutePath
+                        + " result=" + result + " reason=" + reason);
+                return false;
+            }
             Logger.d("event=download_scan_requested path=" + absolutePath + " api=scanFile");
             return true;
         } catch (Throwable t) {
             Logger.d("event=download_scan_fallback api=scanFile detail=" + t);
             return false;
+        }
+    }
+
+    /** Read the outcome exposed by Gallery versions whose scanFile API returns ScanResult. */
+    private static String scanResultValue(Object scanResult, String accessor) {
+        if (scanResult == null) {
+            return "null";
+        }
+        try {
+            Object value = scanResult.getClass().getMethod(accessor).invoke(scanResult);
+            return value == null ? "null" : value.toString();
+        } catch (Throwable ignored) {
+            // Keep older Gallery builds usable when the result accessors are absent.
+            return "unavailable";
         }
     }
 }

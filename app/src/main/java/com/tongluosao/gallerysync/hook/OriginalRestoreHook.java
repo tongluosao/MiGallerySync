@@ -4,6 +4,7 @@ import android.content.Context;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.MenuItem;
 import android.view.View;
 
 import java.io.File;
@@ -28,6 +29,8 @@ final class OriginalRestoreHook {
     private static final String LISTENER = "com.miui.gallery.util.cloudimageloader.CloudImageLoadingListener";
     private static final String ERROR_CODE = "com.miui.gallery.error.core.ErrorCode";
     private static final String DOWNLOAD_MENU = "com.miui.gallery.ui.photoPage.bars.menuitem.DownloadOriginal";
+    private static final String MENU_HOLDER = "com.miui.gallery.ui.photoPage.bars.PhotoPageMenuManager$MenuItemHolder";
+    private static final String MENU_ITEM_TYPE = "com.miui.gallery.ui.photoPage.bars.PhotoPageMenuManager$MenuItemType";
     private static final ThreadLocal<Request> ACTIVE_REQUEST = new ThreadLocal<>();
 
     private final XposedInterface mXposed;
@@ -42,6 +45,7 @@ final class OriginalRestoreHook {
     private volatile OriginalStore mStore;
     private volatile boolean mOriginHookReady;
     private volatile boolean mImageLoaderHookReady;
+    private volatile boolean mVideoPlaybackHookReady;
     private volatile boolean mMenuHookReady;
 
     OriginalRestoreHook(XposedInterface xposed, ClassLoader loader) {
@@ -50,6 +54,12 @@ final class OriginalRestoreHook {
     }
 
     void setConfig(Config config) { mConfig = config; }
+
+    boolean canRestoreVideos() {
+        Config config = mConfig;
+        return mOriginHookReady && mImageLoaderHookReady && mVideoPlaybackHookReady
+                && config != null && config.isReady();
+    }
 
     void onAppStart() {
         Context context = HostContext.get(mLoader);
@@ -65,6 +75,7 @@ final class OriginalRestoreHook {
     void install() {
         installDownloadContextHook();
         installCloudLoaderHook();
+        installVideoPlaybackRestoreHook();
         installMenuHook();
     }
 
@@ -126,10 +137,110 @@ final class OriginalRestoreHook {
         }
     }
 
+    private void installVideoPlaybackRestoreHook() {
+        try {
+            Class<?> videoItem = mLoader.loadClass("com.miui.gallery.ui.PhotoPageVideoItem");
+            Class<?> downloadType = mLoader.loadClass(DOWNLOAD_TYPE);
+            Class<?> managerType = mLoader.loadClass(DOWNLOAD_MANAGER);
+            Method handleOnlineRequest = videoItem.getDeclaredMethod("handleOnlineRequest");
+            Method downloadOrigin = managerType.getDeclaredMethod("downloadOrigin", downloadType);
+            Object origin = downloadType.getField("ORIGIN").get(null);
+            handleOnlineRequest.setAccessible(true);
+            downloadOrigin.setAccessible(true);
+            mXposed.hook(handleOnlineRequest).setId("gallery_managed_video_playback_restore")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        if (!mOriginHookReady || !mImageLoaderHookReady) return chain.proceed();
+                        Object video = chain.getThisObject();
+                        Object item;
+                        OriginalStore.Record record;
+                        try {
+                            item = field(video, "mDataItem");
+                            if (item == null) return chain.proceed();
+                            Config config = mConfig;
+                            if (config == null || !config.isReady()) return chain.proceed();
+                            OriginalStore originalStore = store();
+                            if (originalStore == null) return chain.proceed();
+                            record = recordForItem(item, originalStore, config);
+                        } catch (Throwable t) {
+                            Logger.w("event=managed_video_playback_lookup_failed", t);
+                            return chain.proceed();
+                        }
+                        if (record == null) return chain.proceed();
+
+                        // A verified original can already exist at the registered destination
+                        // while this page item still has no original path (for example, when
+                        // Gallery was launched with VIEW on an HQ file). Only trust the path
+                        // Gallery itself will play.
+                        String itemOriginalPath = stringCall(item, "getOriginalPath");
+                        if (itemOriginalPath != null && !itemOriginalPath.isEmpty()
+                                && new File(itemOriginalPath).isFile()) {
+                            return chain.proceed();
+                        }
+
+                        Object manager;
+                        try {
+                            manager = field(video, "mDownloadManager");
+                            if (manager == null) {
+                                Logger.w("event=managed_video_playback_restore_missing_manager");
+                                return Boolean.TRUE;
+                            }
+                            if (isOrigin(call(manager, "getCurDownloadType"))) {
+                                Logger.d("event=managed_video_playback_restore_already_active");
+                                return Boolean.TRUE;
+                            }
+                            // VideoDownloadManager inherits this typed overload. Its native
+                            // completion callback updates the item's original path and resumes
+                            // playback after the video view is added.
+                            downloadOrigin.invoke(manager, origin);
+                            Logger.i("event=managed_video_playback_restore_started row="
+                                    + record.rowId);
+                        } catch (Throwable t) {
+                            Logger.e("event=managed_video_playback_restore_start_failed row="
+                                    + record.rowId, t);
+                        }
+                        // Do not fall through to Gallery's Xiaomi OnlineVideo URL request for
+                        // a managed item whose registered local original is absent.
+                        return Boolean.TRUE;
+                    });
+            mVideoPlaybackHookReady = true;
+            Logger.i("event=hook_registered method=PhotoPageVideoItem.handleOnlineRequest()");
+        } catch (Throwable t) {
+            Logger.e("event=managed_video_playback_restore_hook_missing method=PhotoPageVideoItem.handleOnlineRequest()", t);
+        }
+    }
+
     private void installMenuHook() {
         try {
             Class<?> menu = mLoader.loadClass(DOWNLOAD_MENU);
             Class<?> item = mLoader.loadClass("com.miui.gallery.model.BaseDataItem");
+            Method originTitle = menu.getDeclaredMethod("getDownloadOriginTitle", item);
+            originTitle.setAccessible(true);
+            mXposed.hook(originTitle).setId("gallery_managed_original_size_title")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        Object dataItem = chain.getArg(0);
+                        if (!menuRestoreReady() || dataItem == null) return chain.proceed();
+                        try {
+                            OriginalStore.Record record = recordForItem(dataItem, store(), mConfig);
+                            if (record == null || record.originalLength <= 0
+                                    || Boolean.TRUE.equals(optionalCall(dataItem, "isBurstItem"))) {
+                                return chain.proceed();
+                            }
+                            Context context = HostContext.get(mLoader);
+                            if (context == null) return chain.proceed();
+                            Class<?> formatter = mLoader.loadClass("com.miui.gallery.util.FormatUtil");
+                            String size = (String) formatter.getMethod("formatFileSize",
+                                    Context.class, long.class).invoke(null, context, record.originalLength);
+                            int resource = context.getResources().getIdentifier(
+                                    "photo_download_origin", "string", context.getPackageName());
+                            if (resource == 0) return "下载原图 (" + size + ")";
+                            return context.getString(resource, size);
+                        } catch (Throwable t) {
+                            Logger.w("event=managed_original_size_title_failed", t);
+                            return chain.proceed();
+                        }
+                    });
             Method filter = menu.getDeclaredMethod("onFilterFinished", item, LinkedHashMap.class);
             Method refreshItem = menu.getDeclaredMethod("refreshDownloadItem", item,
                     boolean.class, boolean.class);
@@ -137,19 +248,80 @@ final class OriginalRestoreHook {
                     boolean.class, boolean.class);
             Class<?> baseDelegate = mLoader.loadClass(
                     "com.miui.gallery.ui.photoPage.bars.menuitem.BaseMenuItemDelegate");
+            Class<?> menuHolder = mLoader.loadClass(MENU_HOLDER);
+            Class<?> menuItemType = mLoader.loadClass(MENU_ITEM_TYPE);
+            Class<?> galleryMenuItem = mLoader.loadClass("com.miui.gallery.view.menu.IMenuItem");
             Method isSupport = baseDelegate.getDeclaredMethod("isSupport");
+            Method isVisible = baseDelegate.getDeclaredMethod("isVisible");
+            Method getItem = menuHolder.getDeclaredMethod("getItem", menuItemType);
+            Method isBottomVisible = menuHolder.getDeclaredMethod("isBottomMenuItemVisible",
+                    galleryMenuItem);
+            Object downloadType = menuItemType.getField("DOWNLOAD_ORIGINAL").get(null);
             filter.setAccessible(true);
             refreshItem.setAccessible(true);
             refreshState.setAccessible(true);
             isSupport.setAccessible(true);
+            isVisible.setAccessible(true);
+            getItem.setAccessible(true);
+            isBottomVisible.setAccessible(true);
             mXposed.hook(isSupport).setId("gallery_managed_original_support")
                     .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
                     .intercept(chain -> {
                         Object delegate = chain.getThisObject();
                         if (delegate != null && DOWNLOAD_MENU.equals(delegate.getClass().getName())
-                                && mOriginHookReady && mImageLoaderHookReady
-                                && managedItem(currentItemFromMenu(delegate))) {
+                                && menuRestoreReady()) {
+                            // Gallery can ask before its provider exposes the current item.
+                            // Keep the delegate in its menu pipeline; onFilterFinished applies
+                            // the per-item managed check before making it visible.
+                            Logger.d("event=managed_original_menu_support_forced");
                             return true;
+                        }
+                        return chain.proceed();
+                    });
+            mXposed.hook(isVisible).setId("gallery_managed_original_visibility")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        Object delegate = chain.getThisObject();
+                        if (delegate != null && DOWNLOAD_MENU.equals(delegate.getClass().getName())
+                                && menuRestoreReady()) {
+                            Object currentDataItem = currentItemFromMenu(delegate);
+                            if (managedItem(currentDataItem)) {
+                                // MenuItemHolder.lambda$refreshUI$11 checks visibility before
+                                // dispatching onFilterFinished, so managed items must pass this
+                                // gate once the provider exposes the current BaseDataItem.
+                                Logger.d("event=managed_original_menu_visibility_forced");
+                                return true;
+                            }
+                        }
+                        return chain.proceed();
+                    });
+            mXposed.hook(isBottomVisible).setId("gallery_managed_original_bottom_visibility")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        // Arguments exclude the receiver: getArg(0) is the IMenuItem passed
+                        // to MenuItemHolder.isBottomMenuItemVisible(IMenuItem).
+                        Object menuItem = chain.getArg(0);
+                        if (!(menuItem instanceof MenuItem) || !menuRestoreReady()) {
+                            return chain.proceed();
+                        }
+                        try {
+                            // Gallery bypasses the delegate's isSupport() here: it reads
+                            // IMenuItem.isSupport() directly from the native menu object.
+                            // Resolve the matching delegate and apply the registry check at
+                            // this final visibility gate only.
+                            Object delegate = getItem.invoke(chain.getThisObject(), downloadType);
+                            Object delegateItem = call(delegate, "getItemDataState");
+                            if (!(delegateItem instanceof MenuItem)
+                                    || ((MenuItem) delegateItem).getItemId()
+                                    != ((MenuItem) menuItem).getItemId()) {
+                                return chain.proceed();
+                            }
+                            if (managedItem(currentItemFromMenu(delegate))) {
+                                Logger.d("event=managed_original_bottom_visibility_forced");
+                                return true;
+                            }
+                        } catch (Throwable t) {
+                            Logger.w("event=managed_original_bottom_visibility_check_failed", t);
                         }
                         return chain.proceed();
                     });
@@ -163,8 +335,8 @@ final class OriginalRestoreHook {
                                 // Keep Gallery's per-item title when initialized, then force the
                                 // visible/enabled state through the overload without its
                                 // isFunctionInit early return.
-                                refreshState.invoke(chain.getThisObject(), true, true);
                                 refreshItem.invoke(chain.getThisObject(), dataItem, true, true);
+                                refreshState.invoke(chain.getThisObject(), true, true);
                                 mMenuHookReady = true;
                                 Logger.d("event=managed_original_menu_enabled");
                             } catch (Throwable t) {
@@ -174,7 +346,7 @@ final class OriginalRestoreHook {
                         return result;
                     });
             mMenuHookReady = true;
-            Logger.i("event=hook_registered method=BaseMenuItemDelegate.isSupport + DownloadOriginal.onFilterFinished(BaseDataItem,LinkedHashMap)");
+            Logger.i("event=hook_registered method=MenuItemHolder.isBottomMenuItemVisible + BaseMenuItemDelegate.isSupport + DownloadOriginal.onFilterFinished(BaseDataItem,LinkedHashMap)");
         } catch (Throwable t) {
             Logger.e("event=original_restore_menu_hook_missing method=DownloadOriginal.onFilterFinished/2", t);
         }
@@ -192,7 +364,6 @@ final class OriginalRestoreHook {
             Object uriValue = call(item, "getDownloadUri");
             Uri uri = uriValue instanceof Uri ? (Uri) uriValue : null;
             String destination = record.originalLocalPath;
-            if (destination == null || destination.isEmpty()) return null;
             boolean targetMatches = config != null
                     && OriginalStore.targetKey(config).equals(record.target);
             return new Request(manager, item, record, config, destination, uri, targetMatches);
@@ -219,23 +390,44 @@ final class OriginalRestoreHook {
         if (store == null || config == null || item == null) return null;
         String target = OriginalStore.targetKey(config);
         for (String getter : new String[]{"getOriginalPath", "getThumnailPath", "getMicroPath"}) {
-            String path = stringCall(item, getter);
+            String path = optionalStringCall(item, getter);
             if (path == null || path.isEmpty()) continue;
-            OriginalStore.Record record = store.findByLocalPath(new File(path));
+            File localFile = localFileFromPath(path);
+            if (localFile == null) continue;
+            OriginalStore.Record record = store.findByLocalPath(localFile);
             if (record != null && target.equals(record.target)) {
                 // Bind lazily too: a scanner may finish after the bounded background lookup.
-                Object key = call(item, "getKey");
+                Object key = optionalCall(item, "getKey");
                 String id = key == null ? null : String.valueOf(key);
-                String sha1 = stringCall(item, "getSha1");
-                if (store.find(config, id, sha1) == null) {
-                    store.bindIdentity(new File(path), id, sha1);
+                String sha1 = optionalStringCall(item, "getSha1");
+                if ((id != null || sha1 != null) && store.find(config, id, sha1) == null) {
+                    store.bindIdentity(localFile, id, sha1);
                 }
-                return store.findByLocalPath(new File(path));
+                return store.findByLocalPath(localFile);
             }
         }
-        Object key = call(item, "getKey");
-        return store.find(config, key == null ? null : String.valueOf(key),
-                stringCall(item, "getSha1"));
+        Object key = optionalCall(item, "getKey");
+        String id = key == null ? null : String.valueOf(key);
+        String sha1 = optionalStringCall(item, "getSha1");
+        return id == null && sha1 == null ? null : store.find(config, id, sha1);
+    }
+
+    private static File localFileFromPath(String path) {
+        if (path == null || path.isEmpty()) return null;
+        Uri uri = Uri.parse(path);
+        String scheme = uri.getScheme();
+        if (scheme == null || scheme.isEmpty()) return new File(path);
+        if ("file".equalsIgnoreCase(scheme)) {
+            String filePath = uri.getPath();
+            return filePath == null || filePath.isEmpty() ? null : new File(filePath);
+        }
+        return null;
+    }
+
+    private boolean menuRestoreReady() {
+        Config config = mConfig;
+        return mOriginHookReady && mImageLoaderHookReady
+                && config != null && config.isReady();
     }
 
     private Object currentItemFromMenu(Object delegate) {
@@ -243,10 +435,10 @@ final class OriginalRestoreHook {
             Object provider = field(delegate, "mDataProvider");
             Object data = call(provider, "getFieldData");
             Object current = field(data, "mCurrent");
-            Object itemView = field(current, "itemView");
-            return field(itemView, "mDataItem");
+            // DEX: DataProvider$FieldData$Current.getDataItem() returns BaseDataItem.
+            return call(current, "getDataItem");
         } catch (Throwable t) {
-            Logger.d("event=managed_original_support_lookup_failed detail=" + t);
+            Logger.d("event=managed_original_visibility_lookup_failed detail=" + t);
             return null;
         }
     }
@@ -259,6 +451,9 @@ final class OriginalRestoreHook {
                 try {
                     if (!request.targetMatches || request.config == null || !request.config.isReady()) {
                         throw new IllegalStateException("WebDAV target is not active for this managed item");
+                    }
+                    if (request.destination == null || request.destination.isEmpty()) {
+                        throw new IllegalStateException("verified original destination is unavailable");
                     }
                     OriginalStore store = store();
                     if (store == null || request.record.rowId == null && request.record.sha1 == null) {
@@ -377,7 +572,26 @@ final class OriginalRestoreHook {
         return value == null ? null : String.valueOf(value);
     }
 
-    void shutdown() { mWorker.shutdownNow(); }
+    private static Object optionalCall(Object target, String name) throws Exception {
+        try {
+            return call(target, name);
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        }
+    }
+
+    private static String optionalStringCall(Object target, String name) throws Exception {
+        Object value = optionalCall(target, name);
+        return value == null ? null : String.valueOf(value);
+    }
+
+    void shutdown() {
+        mVideoPlaybackHookReady = false;
+        mOriginHookReady = false;
+        mImageLoaderHookReady = false;
+        mConfig = null;
+        mWorker.shutdownNow();
+    }
 
     private static final class Request {
         final Object manager;

@@ -211,6 +211,17 @@ public final class UploadQueue {
 
     private static volatile UploadQueue sInstance;
 
+    /** Candidate hint only: destructive operations must still verify remote bytes. */
+    public static boolean wasVerifiedUploadCurrentTarget(String canonicalPath, long size, long mtime) {
+        UploadQueue queue = sInstance;
+        if (queue == null || canonicalPath == null) return false;
+        synchronized (queue.mLock) {
+            String current = targetSignature(queue.mConfig);
+            return !current.isEmpty() && current.equals(queue.mDoneSignature)
+                    && queue.mDone.containsKey(key(canonicalPath, size, mtime));
+        }
+    }
+
     private final Context mContext;
     private final OriginalStore mOriginalStore;
     private final Object mLock = new Object();
