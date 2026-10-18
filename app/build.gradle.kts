@@ -17,7 +17,7 @@ android {
         targetSdk = 36
         // 发布必须升 versionCode：框架按目标进程里的 loadedVersionCode 判断那一代代码旧不旧。
         // 注意它不是"热重载失败"的原因（那是 onPackageReady 里的 detach()），号涨了也照样会被跳过
-        versionCode = 52
+        versionCode = 55
         versionName = "1.1"
     }
 
@@ -46,6 +46,7 @@ kotlin {
 }
 
 dependencies {
+    testImplementation(libs.junit)
     // Hook 侧依赖：由 LSPosed 框架在运行时提供，只参与编译，不能打进 APK
     compileOnly(libs.libxposed.api)
     // 模块 App 侧依赖：与框架通信，用于 RemotePreferences 配置下发

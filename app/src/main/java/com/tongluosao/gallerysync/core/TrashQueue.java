@@ -228,10 +228,21 @@ public final class TrashQueue {
         String dest = relative.isEmpty() ? trash + "/" + leaf(remote) : trash + "/" + relative;
         try {
             WebDavClient client = clientFor(config);
+            String canonicalSource = client.resolveExistingFilePath(remote);
+            if (canonicalSource == null) {
+                Logger.w("event=trash_source_dir_unresolved remote=" + remote);
+                return false;
+            }
+            remote = canonicalSource;
             // MOVE 的父目录必须已经存在，否则服务器回 409
             String destDir = dest.contains("/") ? dest.substring(0, dest.lastIndexOf('/')) : "";
             if (!destDir.isEmpty()) {
-                client.ensureCollection(destDir);
+                String canonicalDestDir = client.resolveCollectionPath(destDir);
+                if (canonicalDestDir == null) {
+                    Logger.w("event=trash_dest_dir_unresolved dir=" + destDir);
+                    return false;
+                }
+                dest = WebDavClient.joinPath(canonicalDestDir, leaf(dest));
             }
             String attempt = dest;
             boolean ok = client.move(remote, attempt);

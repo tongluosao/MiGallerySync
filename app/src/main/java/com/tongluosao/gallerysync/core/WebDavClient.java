@@ -21,9 +21,11 @@ import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -123,6 +125,8 @@ public final class WebDavClient {
      * 也不拿半份名单当全部。
      */
     private static final int LIST_BODY_LIMIT = 8 * 1024 * 1024;
+    /** 列目录分块响应中断时，换新连接重试一次。 */
+    private static final int LIST_INCOMPLETE_RETRIES = 1;
     private static final String PROPFIND_BODY =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
                     + "<propfind xmlns=\"DAV:\"><prop><getcontentlength/><resourcetype/>"
@@ -146,6 +150,9 @@ public final class WebDavClient {
     private static final Pattern RESPONSE = Pattern.compile(
             "<[A-Za-z0-9]*:?response[^>]*>(.*?)</[A-Za-z0-9]*:?response>",
             Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    /** 多状态根节点必须完整闭合；断流的 XML 不能当作完整目录名单。 */
+    private static final Pattern MULTISTATUS_END = Pattern.compile(
+            "</[A-Za-z0-9]*:?multistatus\\s*>", Pattern.CASE_INSENSITIVE);
     /** 最后修改时间；下载侧用它跟本地文件的 mtime 比对 */
     private static final Pattern LAST_MODIFIED = Pattern.compile(
             "<[A-Za-z0-9]*:?getlastmodified[^>]*>([^<]+)",
@@ -155,6 +162,11 @@ public final class WebDavClient {
     private final String mAuthHeader;
     private final boolean mPlainHttp;
     private final boolean mSecure;
+
+    /** Positive directory resolutions live briefly so a busy album is listed only once. */
+    private static final long DIRECTORY_CACHE_TTL_MS = 60_000L;
+    private static final int DIRECTORY_CACHE_MAX = 128;
+    private final Map<String, CachedDirectory> mDirectoryCache = new HashMap<>();
 
     /** 复用中的连接三件套，同一个客户端连发多个请求时它们一直在；断了就一起置空 */
     private Socket mSocket;
@@ -261,11 +273,49 @@ public final class WebDavClient {
                 return true;
             }
         }
+        // 最后一着：问**父目录**（PROPFIND Depth 1）。
+        //
+        // 这台 OpenList 上有一个已被真机 + PC 双侧钉死的怪现象：**对象级**的 HEAD 与
+        // PROPFIND Depth 0 会对**确实存在**的对象回 nginx 的 404 页（Content-Length: 9），
+        // 而同一时刻、同一目录的 Depth 1 列目录里那个名字与大小分毫不差。
+        // 证据（2026-10-06）：`IMG_20250421_132122.jpg` 的 getlastmodified 是 18:20:57，
+        // 客户端 18:22:12 仍收到 404；PC 侧用**完全相同的请求形状**（同一份 PROPFIND body、
+        // Depth 0、同样一条长连接的复用/老化都试过）稳定回 207 且长度相等。
+        // 一天里这类误判 121 次、39 个不同路径，每一项都被判失败后**永久放弃**
+        // （attempts=6 → upload_give_up delay=3600000），而远端其实躺着逐字节正确的对象。
+        //
+        // 为什么敢用列目录当仲裁：它本来就是模块信任的读路径 —— "远端已有同名就跳过"
+        // （upload_skip_remote_exists）走的就是同一次 list()，那个 1.3GB 的视频正是被它收下的。
+        // 判据仍然严格：名字相等**且**大小相等才认账；列不出来（null/截断/异常）一律不认。
+        // 这不会放宽"必须先发字节再复核"那条硬约束 —— 调用方仍是先发完 body 才进来。
+        long listed = listedSize(remotePath);
+        if (listed > 0L && (expectedSize <= 0L || listed == expectedSize)) {
+            Logger.i("event=verify_via_parent_listing expected=" + expectedSize + " listed=" + listed
+                    + " note=absent_to_head_and_propfind_but_present_in_listing");
+            return true;
+        }
+        if (listed == LIST_UNKNOWN) {
+            // 三种问法都问不出来（连父目录都列不了）：**没有成功的证据，就不能认账**。
+            // 这里刻意不学"不支持 PROPFIND 就按通过"那条松动 —— HEAD 与 PROPFIND 都给出了
+            // 明确的 404，说明这台服务器是答话的、而且答的是"没有"，只是我们放不了心；
+            // 而放宽成 true 会让"回 201 却不落盘"的服务器直接骗过复核（PC 回归里
+            // `假写应该失败却成功` 就是被这一条放跑的）。问不出来时照实判失败、交给重试，
+            // 代价只是这一项多传一遍，而错判成功的代价是"相册显示已备份、云端其实没有"。
+            Logger.w("event=verify_inconclusive expected=" + expectedSize
+                    + " note=listing_unavailable_not_counted");
+            return false;
+        }
+
         // 三次都问不到：把证据一起记下来，否则下次只能看到"没有这个文件"，
-        // 分不清是服务器真没写、还是复核方式对它不适用
-        Logger.w("event=verify_failed path=" + remotePath + " expected=" + expectedSize
+        // 分不清是服务器真没写、还是复核方式对它不适用。
+        // raw= 里是**最后那一次 PROPFIND 收到的原始状态行与响应头**：OpenList 挂网盘时
+        // 同一路径上 HEAD 会 302 到存储直链、PROPFIND 会 207，所以 404 到底是谁回的、
+        // 回的是哪个 URL，只有这一串能定界。
+        Logger.w("event=verify_failed expected=" + expectedSize
                 + " head=" + headCode + "/" + headLength
-                + " prop=" + propCode + "/" + propSize);
+                + " prop=" + propCode + "/" + propSize
+                + " listed=" + listed
+                + " raw=" + lastExchange());
         return false;
     }
 
@@ -274,23 +324,64 @@ public final class WebDavClient {
      * 探测与上传必须走同一条：否则年/月目录还没建起来时，界面报"这个目录收不了文件"
      * 而真实上传其实能成。
      */
-    private Res putWithDirFallback(String remotePath, File file, byte[] body)
+    private static final class PutResult {
+        final Res response;
+        final String path;
+
+        PutResult(Res response, String path) {
+            this.response = response;
+            this.path = path;
+        }
+    }
+
+    private PutResult putWithDirFallback(String remotePath, File file, byte[] body)
             throws IOException {
-        Res res = send("PUT", remotePath, file, body, false);
+        String target = resolveFilePath(remotePath, true, false);
+        Res res = send("PUT", target, file, body, false);
         if (res.code == 404 || res.code == 409) {
-            String parent = parentOf(remotePath);
+            String parent = parentOf(target);
             if (!parent.isEmpty()) {
-                ensureCollection(parent);
-                res = send("PUT", remotePath, file, body, false);
+                // A failed PUT can mean a stale cached directory name. Re-list from the root;
+                // create only a component whose parent listing confirms it is absent.
+                String canonicalParent = resolveCollectionPath(parent, true, true);
+                if (canonicalParent != null) {
+                    target = joinPath(canonicalParent, leafName(target));
+                    res = send("PUT", target, file, body, false);
+                }
             }
         }
-        return res;
+        return new PutResult(res, target);
+    }
+
+    private String resolveFilePath(String remotePath, boolean createParent, boolean refresh)
+            throws IOException {
+        String normalized = normalize(remotePath);
+        int slash = normalized.lastIndexOf('/');
+        if (slash <= 0) {
+            return remotePath;
+        }
+        String parent = normalized.substring(1, slash);
+        String canonicalParent = resolveCollectionPath(parent, createParent, refresh);
+        if (canonicalParent == null) {
+            throw new IOException("cannot resolve remote directory path=" + parent);
+        }
+        return joinPath(canonicalParent, normalized.substring(slash + 1));
+    }
+
+    /** Resolve a file's parent while keeping its basename byte-for-byte/case exact. */
+    public String resolveExistingFilePath(String remotePath) throws IOException {
+        return resolveFilePath(remotePath, false, false);
+    }
+
+    private static String leafName(String path) {
+        int slash = path.lastIndexOf('/');
+        return slash >= 0 ? path.substring(slash + 1) : path;
     }
 
     /** 上传文件；父目录不存在时补建目录并重试一次 */
     public boolean put(String remotePath, File localFile) throws IOException {
-        putSend(remotePath, localFile);
-        requireStoredAs(remotePath, localFile.length());
+        String actualPath = putSendResolved(remotePath, localFile);
+        requireStoredAs(actualPath, localFile.length());
         return true;
     }
 
@@ -311,8 +402,15 @@ public final class WebDavClient {
      * 于是"这次没传"被记成"传成功了"。所以这一条只负责发，判落盘一律交给下面那个方法。
      */
     public void putSend(String remotePath, File localFile) throws IOException {
-        Res res = putWithDirFallback(remotePath, localFile, null);
-        requireSuccess(res, "PUT", remotePath);
+        putSendResolved(remotePath, localFile);
+    }
+
+    /** Send a file and return the server's canonical parent path for subsequent verification. */
+    public String putSendResolved(String remotePath, File localFile) throws IOException {
+        PutResult result = putWithDirFallback(remotePath, localFile, null);
+        Logger.d("event=put_response code=" + result.response.code + " bytes=" + localFile.length());
+        requireSuccess(result.response, "PUT", result.path);
+        return result.path;
     }
 
     /**
@@ -330,12 +428,12 @@ public final class WebDavClient {
 
     /** 写入一小段内容；失败、以及"回了 2xx 却没落盘"都抛异常。界面用它做真实可写探测 */
     public void putBytes(String remotePath, byte[] body) throws IOException {
-        Res res = putWithDirFallback(remotePath, null, body);
-        requireSuccess(res, "PUT", remotePath);
-        if (!storedAs(remotePath, body.length)) {
-            throw new IOException("PUT returned " + res.code
+        PutResult result = putWithDirFallback(remotePath, null, body);
+        requireSuccess(result.response, "PUT", result.path);
+        if (!storedAs(result.path, body.length)) {
+            throw new IOException("PUT returned " + result.response.code
                     + " but the server has no such file (this storage fakes writes)"
-                    + " path=" + remotePath);
+                    + " path=" + result.path);
         }
     }
 
@@ -374,14 +472,14 @@ public final class WebDavClient {
             Logger.d("event=probe_skipped_existing path=" + remotePath + " remote=" + existing);
             return false;
         }
-        Res res = putWithDirFallback(remotePath, null, new byte[0]);
-        if (res.code == 423) {
+        PutResult result = putWithDirFallback(remotePath, null, new byte[0]);
+        if (result.response.code == 423) {
             return true;
         }
-        requireSuccess(res, "PUT", remotePath);
+        requireSuccess(result.response, "PUT", result.path);
         // 探针对象用完就收拾掉；删不掉不影响结论（0 字节，且复核比大小，不会造成误判）
         try {
-            send("DELETE", remotePath, null, null, false);
+            send("DELETE", result.path, null, null, false);
         } catch (Throwable t) {
             Logger.d("event=probe_cleanup_failed path=" + remotePath + " detail=" + t);
         }
@@ -693,42 +791,175 @@ public final class WebDavClient {
      * 第三态（{@link #COLL_UNKNOWN}）不拦：问不出来的服务器不该被这两条挡住。
      */
     public boolean ensureCollection(String relativeDir) throws IOException {
-        String[] segments = split(relativeDir);
-        StringBuilder current = new StringBuilder();
-        boolean created = true;
-        for (String segment : segments) {
-            if (segment.isEmpty()) {
-                continue;
-            }
-            current.append('/').append(segment);
-            if (collectionState(current.toString()) == COLL_EXISTS) {
-                continue;
-            }
-            Res res;
-            try {
-                res = send("MKCOL", current.toString(), null, null, false);
-            } catch (IOException e) {
-                Logger.d("event=mkdir_failed dir=" + current + " reason=" + e.getMessage());
-                return false;
-            }
-            if (res.code == 401 || res.code == 403) {
-                throw new IOException("auth failed code=" + res.code + res.detail);
-            }
-            // 2xx=建好了；405/409/301/501 多半是"目录已存在"或"本就不允许显式建目录"
-            if (!isSuccess(res.code) && res.code != 405 && res.code != 409
-                    && res.code != 301 && res.code != 501) {
-                created = false;
-                continue;
-            }
-            if (collectionState(current.toString()) == COLL_MISSING) {
-                // 回了成功码却没有这个东西：再建下一级只会在父目录里多留一个改名目录，
-                // 直接认输，把证据打全（上传随后仍会 PUT 一次，由它给出最终结论）
-                Logger.w("event=mkdir_ineffective dir=" + current + " code=" + res.code
-                        + " detail=" + res.detail);
-                return false;
+        return resolveCollectionPath(relativeDir) != null;
+    }
+
+    /** Resolve each directory component against its parent's complete Depth 1 listing. */
+    public String resolveCollectionPath(String relativeDir) throws IOException {
+        return resolveCollectionPath(relativeDir, true, false);
+    }
+
+    /** Resolve an existing directory for MOVE sources without ever creating it. */
+    public String resolveExistingCollectionPath(String relativeDir) throws IOException {
+        return resolveCollectionPath(relativeDir, false, false);
+    }
+
+    private String resolveCollectionPath(String relativeDir, boolean createMissing,
+                                         boolean refresh) throws IOException {
+        List<String> segments = new ArrayList<>();
+        for (String segment : split(relativeDir == null ? "" : relativeDir)) {
+            if (!segment.isEmpty() && !".".equals(segment)) {
+                segments.add(segment);
             }
         }
-        return created;
+        if (segments.isEmpty()) {
+            return "";
+        }
+        String requestedKey = joinSegments(segments, segments.size());
+        if (!refresh) {
+            String cached = cachedDirectory(requestedKey);
+            if (cached != null) {
+                return cached;
+            }
+        }
+
+        StringBuilder current = new StringBuilder();
+        StringBuilder requestedPrefix = new StringBuilder();
+        for (String segment : segments) {
+            if (requestedPrefix.length() > 0) {
+                requestedPrefix.append('/');
+            }
+            requestedPrefix.append(segment);
+            String key = requestedPrefix.toString();
+            if (!refresh) {
+                String cached = cachedDirectory(key);
+                if (cached != null) {
+                    current.setLength(0);
+                    current.append(cached);
+                    continue;
+                }
+            }
+
+            String parent = current.toString();
+            List<RemoteEntry> entries = list(parent);
+            if (entries == null) {
+                return null;
+            }
+            DirectoryMatch match = matchDirectory(entries, segment);
+            String actual = match.name;
+            if (actual == null && match.missing && createMissing) {
+                String candidate = joinPath(parent, segment);
+                Res result;
+                try {
+                    result = send("MKCOL", candidate, null, null, false);
+                } catch (IOException e) {
+                    Logger.d("event=mkdir_failed dir=" + candidate + " reason=" + e.getMessage());
+                    return null;
+                }
+                if (result.code == 401 || result.code == 403) {
+                    throw new IOException("auth failed code=" + result.code + result.detail);
+                }
+                // Never trust MKCOL's status alone. Re-list the same parent and verify the name.
+                entries = list(parent);
+                if (entries == null) {
+                    return null;
+                }
+                match = matchDirectory(entries, segment);
+                actual = match.name;
+                if (actual == null) {
+                    Logger.w("event=mkdir_unverified dir=" + candidate + " code=" + result.code);
+                    return null;
+                }
+            }
+            if (actual == null) {
+                return null;
+            }
+            if (current.length() > 0) {
+                current.append('/');
+            }
+            current.append(actual);
+            cacheDirectory(key, current.toString());
+        }
+        cacheDirectory(requestedKey, current.toString());
+        return current.toString();
+    }
+
+    /** Exact directory wins; otherwise only one ignore-case directory is safe to reuse. */
+    static DirectoryMatch matchDirectory(List<RemoteEntry> entries, String requested) {
+        if (entries == null || requested == null) {
+            return new DirectoryMatch(null, false);
+        }
+        for (RemoteEntry entry : entries) {
+            if (entry.name.equals(requested)) {
+                return entry.dir ? new DirectoryMatch(entry.name, false)
+                        : new DirectoryMatch(null, false);
+            }
+        }
+        String folded = null;
+        int matches = 0;
+        for (RemoteEntry entry : entries) {
+            if (entry.name.equalsIgnoreCase(requested)) {
+                if (!entry.dir) {
+                    return new DirectoryMatch(null, false);
+                }
+                folded = entry.name;
+                matches++;
+            }
+        }
+        if (matches == 1) {
+            return new DirectoryMatch(folded, false);
+        }
+        return new DirectoryMatch(null, matches == 0);
+    }
+
+    static final class DirectoryMatch {
+        final String name;
+        final boolean missing;
+
+        DirectoryMatch(String name, boolean missing) {
+            this.name = name;
+            this.missing = missing;
+        }
+    }
+
+    private static final class CachedDirectory {
+        final String path;
+        final long at;
+
+        CachedDirectory(String path, long at) {
+            this.path = path;
+            this.at = at;
+        }
+    }
+
+    private synchronized String cachedDirectory(String key) {
+        CachedDirectory cached = mDirectoryCache.get(key);
+        if (cached == null) {
+            return null;
+        }
+        if (System.currentTimeMillis() - cached.at >= DIRECTORY_CACHE_TTL_MS) {
+            mDirectoryCache.remove(key);
+            return null;
+        }
+        return cached.path;
+    }
+
+    private synchronized void cacheDirectory(String key, String path) {
+        mDirectoryCache.put(key, new CachedDirectory(path, System.currentTimeMillis()));
+        while (mDirectoryCache.size() > DIRECTORY_CACHE_MAX) {
+            mDirectoryCache.remove(mDirectoryCache.keySet().iterator().next());
+        }
+    }
+
+    private static String joinSegments(List<String> segments, int count) {
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            if (out.length() > 0) {
+                out.append('/');
+            }
+            out.append(segments.get(i));
+        }
+        return out.toString();
     }
 
     private Res propfind(String remotePath, int depth) {
@@ -776,7 +1007,7 @@ public final class WebDavClient {
             throw new IOException("auth failed code=" + head.code + head.detail);
         }
         if (head.code == 404) {
-            return -1L;
+            return notFoundUnlessListed(remotePath);
         }
         // 2xx：给了长度就是答案；没给长度（有些服务器 HEAD 不带 Content-Length）再问一次
         if (isSuccess(head.code) && head.length >= 0L) {
@@ -787,18 +1018,126 @@ public final class WebDavClient {
             // 不支持 PROPFIND：只有当 HEAD 明确说"有"时才认为它存在，否则判"不知道"。
             // 判"不知道"返回 -1（= 当作不存在，照传一次覆盖写）比判"存在"安全：
             // 后者会直接把这一项记成已备份，而远端可能真的没有
-            return isSuccess(head.code) ? 0L : -1L;
+            return isSuccess(head.code) ? 0L : notFoundUnlessListed(remotePath);
         }
         if (prop.code == 404
                 || (prop.body != null && NOT_FOUND_STATUS.matcher(prop.body).find())) {
-            return -1L;
+            return notFoundUnlessListed(remotePath);
         }
         if (prop.code != 207) {
-            return isSuccess(head.code) ? 0L : -1L;
+            return isSuccess(head.code) ? 0L : notFoundUnlessListed(remotePath);
         }
         long size = contentLengthOf(prop);
         // PROPFIND 只说"有"、没说多大：用 0 表示"存在但大小未知"
         return size < 0L ? 0L : size;
+    }
+
+    /**
+     * Read the size from object-level metadata only; unlike {@link #remoteSize}, do not fall back
+     * to a potentially huge parent directory listing. A positive size is usable as a strict
+     * pre-upload skip check; 0 means unknown and -1 means both direct methods said not found.
+     */
+    public long directRemoteSize(String remotePath) throws IOException {
+        Res head = send("HEAD", remotePath, null, null, false);
+        if (head.code == 401 || head.code == 403) {
+            throw new IOException("auth failed code=" + head.code + head.detail);
+        }
+        if (isSuccess(head.code) && head.length >= 0L) {
+            return head.length;
+        }
+
+        Res prop = propfind(remotePath, 0);
+        if (prop == null) {
+            return 0L;
+        }
+        if (prop.code == 207 && prop.bodyComplete && hasCompleteMultistatus(prop.body)) {
+            long size = contentLengthOf(prop);
+            return size < 0L ? 0L : size;
+        }
+        return prop.code == 404 ? -1L : 0L;
+    }
+
+    /** Unknown/404 sizes never authorize a skip; only a positive exact size does. */
+    static boolean hasExactSize(long remoteSize, long expectedSize) {
+        return expectedSize > 0L && remoteSize == expectedSize;
+    }
+
+    /**
+     * 在**父目录的列目录结果**里找这个名字的大小（复核的最后一着）。
+     *
+     * <p>用来绕开"对象级 HEAD/PROPFIND 对已存在的对象回 404"这个怪现象
+     * （见 {@link #storedAs} 里的长注释）。
+     *
+     * <p><b>三态，不能合并</b>：{@link #LIST_UNKNOWN}（列不出来：不支持 PROPFIND、响应被截断、
+     * 目录不存在、或抛异常）与 {@code -1}（确实列出了、但里面没有这个名字）是**完全不同**的结论。
+     * 合并的后果很重：把"列不出来"当成"没有"，会让 {@link #remoteSize} 报"不存在"，
+     * 而那是零字节锁探针的放行闸 —— 探针会 PUT 一个 0 字节对象再 DELETE，
+     * 等于**删掉用户已经备份好的照片**。所以这里必须把两者分开。
+     *
+     * @return 字节数（可为 0，表示"有但服务器没给长度"）；名字不在列表里为 {@code -1}；
+     *         列不出来为 {@link #LIST_UNKNOWN}
+     */
+    private long listedSize(String remotePath) {
+        int slash = remotePath.lastIndexOf('/');
+        if (slash <= 0 || slash == remotePath.length() - 1) {
+            return LIST_UNKNOWN;
+        }
+        String dir = remotePath.substring(0, slash);
+        String name = remotePath.substring(slash + 1);
+        List<RemoteEntry> entries;
+        try {
+            entries = list(dir);
+        } catch (IOException e) {
+            // 列目录自己失败（网络抖动等）不能推断"远端没有"：留痕后返回"不知道"
+            Logger.d("event=verify_list_failed reason=" + e.getClass().getSimpleName());
+            return LIST_UNKNOWN;
+        }
+        if (entries == null) {
+            // 列不出来。但"父目录本身就不在"是一条**独立的、确凿的**证据：
+            // 目录不存在，里面的文件当然不存在 —— 这时可以放心报 -1（否则
+            // `MiGallerySync/<不存在的目录>/x.jpg` 这种路径永远问不出"没有"，
+            // 队列会一直重试一个不可能成功的目标）。
+            if (collectionState(dir) == COLL_MISSING) {
+                Logger.d("event=verify_parent_missing");
+                return -1L;
+            }
+            return LIST_UNKNOWN;
+        }
+        for (RemoteEntry entry : entries) {
+            if (!entry.dir && entry.name.equals(name)) {
+                return entry.size < 0L ? 0L : entry.size;
+            }
+        }
+        return -1L;
+    }
+
+    /** {@link #listedSize} 的三态之一：父目录列不出来（≠"里面没有这个名字"）。 */
+    private static final long LIST_UNKNOWN = -2L;
+
+    /**
+     * HEAD/PROPFIND 都说"没有"时，再用**父目录的列目录**复核一次，然后才敢说"确实没有"。
+     *
+     * <p>为什么必须复核（这条是安全闸，漏了会毁数据）：调用方只在**明确得到 -1** 时才敢认为
+     * "这个路径上没有东西"。零字节锁探针 {@link #probeLocked} 正是以此为闸 —— 判 -1 就
+     * <b>PUT 一个 0 字节对象、再 DELETE</b>。而这台 OpenList 会对**确实存在**的对象回 404
+     * （对象级 HEAD/PROPFIND 的怪现象，详见 {@link #storedAs}），于是旧写法会把用户的备份
+     * 判成"不存在"，接着一个 0 字节 PUT 覆盖掉它、再把它删掉 —— 那不是"少传一次"，是**毁掉
+     * 已经备份好的照片**。
+     *
+     * <p>所以"不存在"这个结论现在必须三方一致：HEAD 否 + PROPFIND 否 + 父目录列表里也没有。
+     * 列目录问不出来（{@link #LIST_UNKNOWN}）时**不能**降级成"不存在"，
+     * 而是返回 {@code 0}（"存在但大小未知"）—— 这个状态同样能拦住探测（它的判据是
+     * {@code != -1L}），宁可不探，也不冒毁掉备份的险。
+     *
+     * @return 列目录里查到的大小；列表里也没有才是 {@code -1}；问不出来为 {@code 0}
+     */
+    private long notFoundUnlessListed(String remotePath) {
+        long listed = listedSize(remotePath);
+        if (listed == LIST_UNKNOWN) {
+            // 问不出来 → 说"有，但不知道多大"，把"不存在"这个结论留待下次
+            return 0L;
+        }
+        return listed;
     }
 
     /**
@@ -853,24 +1192,38 @@ public final class WebDavClient {
      * 调用方必须把它与"目录是空的"分开：{@code null} 时退回逐文件判断。
      */
     public List<RemoteEntry> list(String remoteDir) throws IOException {
-        Res res = propfind(remoteDir, 1, LIST_BODY_LIMIT);
-        if (res == null || res.code == 404 || res.body == null) {
-            return null;
-        }
-        if (res.code != 207) {
-            return null;
-        }
-        if (res.body.length() >= LIST_BODY_LIMIT) {
-            // 顶到额度说明这一条响应被截断了，缺的名字会被当成"远端没有"而重传一遍。
-            // 宁可退回逐文件判断，也不要拿半份名单当全部
-            Logger.d("event=list_truncated dir=" + remoteDir + " bytes=" + res.body.length());
-            return null;
+        Res res = null;
+        for (int attempt = 0; attempt <= LIST_INCOMPLETE_RETRIES; attempt++) {
+            res = propfind(remoteDir, 1, LIST_BODY_LIMIT);
+            if (res == null || res.code == 404 || res.body == null || res.code != 207) {
+                return null;
+            }
+            if (res.body.length() >= LIST_BODY_LIMIT) {
+                // 顶到额度说明这一条响应被截断了，缺的名字会被当成"远端没有"而重传一遍。
+                // 宁可退回逐文件判断，也不要拿半份名单当全部
+                Logger.d("event=list_truncated bytes=" + res.body.length());
+                return null;
+            }
+            if (res.bodyComplete && hasCompleteMultistatus(res.body)) {
+                break;
+            }
+            Logger.d("event=list_incomplete code=" + res.code
+                    + " complete=" + res.bodyComplete
+                    + " bytes=" + res.body.length()
+                    + " attempt=" + (attempt + 1));
+            if (attempt == LIST_INCOMPLETE_RETRIES) {
+                return null;
+            }
+            // readResponse 会关闭未完整读取的连接，下一轮自然使用新连接。
+            sleepQuietly(250L);
         }
         String self = stripLeading(normalize(remoteDir));
         String basePath = stripLeading(normalize(pathOfUrl(mBaseUrl)));
         List<RemoteEntry> out = new ArrayList<>();
         Matcher response = RESPONSE.matcher(res.body);
+        int responseCount = 0;
         while (response.find()) {
+            responseCount++;
             String block = response.group(1);
             Matcher href = HREF.matcher(block);
             if (!href.find()) {
@@ -896,7 +1249,19 @@ public final class WebDavClient {
             }
             out.add(new RemoteEntry(name, dir, size, modified));
         }
+        if (responseCount == 0) {
+            // 207 但没有可识别的 response：协议体形状未知，不能把它当作空目录。
+            Logger.d("event=list_unrecognized bytes=" + res.body.length());
+            return null;
+        }
         return out;
+    }
+
+    /** 必须是闭合的 DAV multistatus，且至少有一个可识别 response。 */
+    static boolean hasCompleteMultistatus(String body) {
+        return body != null
+                && RESPONSE.matcher(body).find()
+                && MULTISTATUS_END.matcher(body).find();
     }
 
     /** 解析 HTTP 日期（RFC 1123）；解不开返回 0 —— 下载侧只把它当"要不要重下"的参考 */
@@ -1034,13 +1399,17 @@ public final class WebDavClient {
         final String detail;
         final String body;
         final boolean keepAlive;
+        /** 响应体完整读到边界；与连接是否可复用分开记录。 */
+        final boolean bodyComplete;
 
-        Res(int code, long length, String detail, String body, boolean keepAlive) {
+        Res(int code, long length, String detail, String body, boolean keepAlive,
+                boolean bodyComplete) {
             this.code = code;
             this.length = length;
             this.detail = detail == null ? "" : detail;
             this.body = body;
             this.keepAlive = keepAlive;
+            this.bodyComplete = bodyComplete;
         }
     }
 
@@ -1145,8 +1514,11 @@ public final class WebDavClient {
         socket.setSoTimeout(readTimeoutFor(length));
         try {
             OutputStream out = mOut;
-            out.write(requestHead(method, host, port, target, file, body, length, depth,
-                    destination, overwrite));
+            byte[] headBytes = requestHead(method, host, port, target, file, body, length,
+                    depth, destination, overwrite);
+            // 留一份"这次到底请求了哪个 URL、用哪个方法"的证据，供 verify_failed 打印
+            mLastRequestLine = method + " len=" + length + " depth=" + depth;
+            out.write(headBytes);
             writeBody(out, file, body, length);
             out.flush();
 
@@ -1207,6 +1579,7 @@ public final class WebDavClient {
         boolean chunked = false;
         Boolean headerKeepAlive = null;
         String line;
+        StringBuilder rawHeaders = new StringBuilder(128);
         while ((line = reader.readLine()) != null && !line.isEmpty()) {
             int colon = line.indexOf(':');
             if (colon <= 0) {
@@ -1214,6 +1587,15 @@ public final class WebDavClient {
             }
             String name = line.substring(0, colon).trim();
             String value = line.substring(colon + 1).trim();
+            // 只留不会包含路径、签名URL或凭据的头；Location/Set-Cookie 等不记录。
+            boolean safeDiagnosticHeader = name.equalsIgnoreCase("Content-Length")
+                    || name.equalsIgnoreCase("Transfer-Encoding")
+                    || name.equalsIgnoreCase("Content-Type")
+                    || name.equalsIgnoreCase("Connection");
+            if (safeDiagnosticHeader && rawHeaders.length() < 200) {
+                rawHeaders.append(rawHeaders.length() == 0 ? "" : " | ")
+                        .append(name).append('=').append(value);
+            }
             if (name.equalsIgnoreCase("Content-Length")) {
                 contentLength = parseLong(value);
             } else if (name.equalsIgnoreCase("Transfer-Encoding")
@@ -1224,8 +1606,22 @@ public final class WebDavClient {
                         !value.toLowerCase(Locale.US).contains("close"));
             }
         }
+        mLastStatusLine = statusLine;
+        mLastHeaders = rawHeaders.toString();
         return new Head(code, contentLength, chunked, http10, headerKeepAlive);
     }
+
+    /** 最近一条响应的状态行与响应头，仅用于诊断日志（见 verify_failed 的 raw=） */
+    private String mLastStatusLine = "";
+    private String mLastHeaders = "";
+
+    /** 最近一次请求的完整诊断串：状态行 + 响应头 + 实际发的请求行 */
+    String lastExchange() {
+        return "status=[" + mLastStatusLine + "] hdrs=[" + mLastHeaders
+                + "] req=" + mLastRequestLine;
+    }
+
+    private String mLastRequestLine = "";
 
     /**
      * @param bodyCap 响应体留存上限；{@code 0} 用默认额度。列目录必须显式调大
@@ -1279,7 +1675,8 @@ public final class WebDavClient {
         return new Res(code, contentLength,
                 code >= 400 || code == 0 ? oneLine(snippet) : "",
                 readBody ? snippet : null,
-                keepAlive);
+                keepAlive,
+                drainable);
     }
 
 
@@ -2214,7 +2611,7 @@ public final class WebDavClient {
      * PROPFIND 列表）。一天里这类被迫重开有 **251 次**，每一次都白费一条连接和一次请求。
      * 所以排空必须自己作证：只有真正读到了终点才算干净，否则把这个连接丢掉重来。
      */
-    private static final class Drain {
+    static final class Drain {
         final String text;
         final boolean clean;
 
@@ -2255,7 +2652,7 @@ public final class WebDavClient {
     }
 
     /** 分块排空并如实报告是否读到终止块 */
-    private static Drain readChunkedChecked(BufferedReader reader, int cap) {
+    static Drain readChunkedChecked(BufferedReader reader, int cap) {
         StringBuilder log = new StringBuilder();
         try {
             while (true) {

@@ -1100,7 +1100,12 @@ public final class UploadQueue {
             try {
                 client = clientFor(config, index);
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
-                String remoteDir = remoteDirFor(config, task);
+                String requestedRemoteDir = remoteDirFor(config, task);
+                String remoteDir = client.resolveCollectionPath(requestedRemoteDir);
+                if (remoteDir == null) {
+                    throw new IOException("cannot resolve remote directory path="
+                            + requestedRemoteDir);
+                }
                 remotePath = WebDavClient.joinPath(remoteDir, file.getName());
                 // 远端已经有同名文件就当作"这一份备份过了"，直接跳过，一个字节都不发。
                 // 判据是**名字 + 大小**：名字相同但大小不同不能算备份完成（大小在列目录时
@@ -1173,7 +1178,11 @@ public final class UploadQueue {
                 // 接着 markSynced 把相册那行记成已上传 —— 相册显示已传、WebDAV 里却没有，
                 // 两边数量再也对不上。所以 putSend 必须在 enqueueVerify 之前，
                 // 且 putSend 抛异常时这一项绝不会进入复核队列。
-                client.putSend(remotePath, file);
+                remotePath = client.putSendResolved(remotePath, file);
+                int remoteSlash = remotePath.lastIndexOf('/');
+                if (remoteSlash >= 0) {
+                    remoteDir = remotePath.substring(0, remoteSlash);
+                }
                 rememberRemoteName(remoteDir, file.getName(), file.length());
                 if (config.isVerifyAsync()
                         && enqueueVerify(taskKey, task, config, remotePath, file.length())) {
@@ -1820,8 +1829,14 @@ public final class UploadQueue {
             WebDavClient client = clientFor(config, index);
             List<WebDavClient.RemoteEntry> entries = client.list(remoteDir);
             if (entries == null) {
-                // 服务器不支持 PROPFIND / 响应被截断：判不了，只能照传
-                return false;
+                // 目录名单不可用时，单独问目标对象。只有HEAD/Depth 0 PROPFIND给出与本地
+                // 完全相同的正字节数才跳过；404、未知、或长度不一致都继续正常上传。
+                // 这可避免大目录列举超时后，把已落盘的对象盲目重传一遍。
+                long directSize = client.directRemoteSize(WebDavClient.joinPath(remoteDir, name));
+                boolean exact = WebDavClient.hasExactSize(directSize, size);
+                Logger.d("event=remote_object_fallback size=" + directSize
+                        + " expected=" + size + " exact=" + exact);
+                return exact;
             }
             Map<String, Long> sizes = new HashMap<>();
             for (WebDavClient.RemoteEntry entry : entries) {
