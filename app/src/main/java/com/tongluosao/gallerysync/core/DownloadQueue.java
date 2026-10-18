@@ -9,6 +9,7 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.media.ExifInterface;
 import android.os.StatFs;
+import android.os.SystemClock;
 
 import org.json.JSONObject;
 
@@ -18,7 +19,6 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.file.StandardCopyOption;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
@@ -32,6 +32,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 
 /**
  * WebDAV **下载**队列：把远端有、本地没有的文件取回本地。
@@ -45,12 +46,9 @@ import java.util.UUID;
  * 这是刻意的边界 —— 双向一致性（远端删了本地也删）需要一个持久化的同步基线，
  * 而相册里的文件是用户的东西，模块替它删错的代价无法挽回。所以这里只有"多了就取回来"。
  *
- * <p><b>省电省性能的取舍</b>：一条"计划线程"按间隔走一遍远端目录树（最多
- * {@link #MAX_DIRS_PER_ROUND} 个目录、每轮最多认下 {@link #MAX_DOWNLOADS_PER_ROUND} 个文件），
- * 两条 worker 线程只负责把认出队列里的文件下载下来。一轮什么也没找到就把间隔翻倍
- * （{@link #ROUND_BASE} 起、{@link #ROUND_MAX} 封顶），上传一有活动就重置回最短 ——
- * 用户在传照片时才是"在用这个 App"，那时补下载最不容易打扰；半夜没人用的时候退到几小时一轮，
- * 几乎不耗电。
+ * <p>计划线程只响应相册自己的批量下载检查事件。每个事件最多连续枚举
+ * {@link #MAX_BATCH_ROUNDS} 轮，每轮最多认下 {@link #MAX_DOWNLOADS_PER_ROUND} 个文件；
+ * 没有相册事件时不会自行扫描远端。
  *
  * <p>运行在相册进程，全部 IO 在自有后台线程，绝不阻塞相册的同步线程。
  */
@@ -78,20 +76,14 @@ public final class DownloadQueue {
     private static final int MAX_DEPTH = 4;
     /** 同一个远端路径连续失败几次就不再重试（下一轮还会遇到，只是不再计入本轮） */
     private static final int MAX_FAIL_PER_PATH = 3;
+    private static final long FAILURE_COOLDOWN_MS = 60_000L;
     /** 本地剩余空间的下限：低于它就整轮不下载，免得把手机写满 */
     private static final long MIN_FREE_BYTES = 512L * 1024 * 1024;
     /** 记住"哪些远端路径已经下过了"的上限，与上传的 done 表同一量级 */
     private static final int MAX_DONE_RECORDS = 20000;
 
-    /** 轮次间隔：空手而归时从 30 分钟起每次翻倍，到 6 小时封顶 */
-    private static final long ROUND_BASE = 30 * 60_000L;
-    private static final long ROUND_MAX = 6 * 60 * 60_000L;
-    /** 上一轮有收获时的下一轮间隔：还有得下就接着下，不必等半小时 */
-    private static final long ROUND_ACTIVE = 2 * 60_000L;
-    /** 刚启动时的第一轮延迟 —— 开机那几分钟先把带宽和电留给上传 */
-    private static final long START_DELAY = 3 * 60_000L;
-    /** 被唤醒（上传有活动）之后至少隔这么久才允许提前开始新一轮 */
-    private static final long MIN_ROUND_GAP = 60_000L;
+    /** One native event may continue through a bounded number of productive listing rounds. */
+    private static final int MAX_BATCH_ROUNDS = 8;
 
     /** 下载 worker 的路数：下载的瓶颈几乎总在远端带宽，两路足够叠起等待 */
     private static final int THREADS = 2;
@@ -111,15 +103,22 @@ public final class DownloadQueue {
     private final LinkedHashMap<String, Long> mDone = new LinkedHashMap<>();
     /** 失败次数，用来把反复失败的项排除掉 */
     private final LinkedHashMap<String, Integer> mFailures = new LinkedHashMap<>();
+    private final LinkedHashMap<String, Long> mFailureTimes = new LinkedHashMap<>();
     /** 正在下载的远端路径，受 mLock 保护 */
     private final Set<String> mInflight = new HashSet<>();
 
     private volatile Config mConfig;
+    /** Native Gallery auto-download gate. No host wiring means downloads stay disabled. */
+    private volatile BooleanSupplier mDownloadPolicy = () -> false;
     /** Download completion paths only apply to this WebDAV target. */
     private String mDownloadTarget;
     private volatile boolean mRunning = true;
-    private long mNextRoundAt;
-    private long mRoundDelay = ROUND_BASE;
+    private boolean mNativeRequestPending;
+    private boolean mPlannerBusy;
+    /** At most one ordinary trailing scan per busy scan chain. */
+    private boolean mTrailingRequestUsed;
+    private boolean mPolicySuspended = true;
+    private int mWorkGeneration;
     private int mPendingVersion;
 
     private final Thread[] mWorkers = new Thread[THREADS];
@@ -152,13 +151,18 @@ public final class DownloadQueue {
         }
     }
 
+    private static final class DownloadCancelledException extends IOException {
+        DownloadCancelledException() {
+            super("native Gallery download gate is closed");
+        }
+    }
+
     private DownloadQueue(Context context, Config config) {
         mContext = context.getApplicationContext();
         mConfig = config;
         mOriginalStore = OriginalStore.get(mContext);
         mDownloadTarget = OriginalStore.targetKey(config);
         load();
-        mNextRoundAt = System.currentTimeMillis() + START_DELAY;
         mPlanner = new Thread(this::plannerLoop, "MiGallerySync-download-plan");
         mPlanner.setDaemon(true);
         mPlanner.start();
@@ -183,16 +187,97 @@ public final class DownloadQueue {
 
     public void setConfig(Config config) {
         String nextTarget = OriginalStore.targetKey(config);
+        boolean targetChanged;
         synchronized (mLock) {
-            if (!nextTarget.equals(mDownloadTarget)) {
+            targetChanged = !nextTarget.equals(mDownloadTarget);
+            if (targetChanged) {
                 mDownloadTarget = nextTarget;
                 mPending.clear();
                 mDone.clear();
                 mFailures.clear();
+                mFailureTimes.clear();
+                mWorkGeneration++;
                 mPendingVersion++;
                 saveLocked();
             }
             mConfig = config;
+            mLock.notifyAll();
+        }
+        if (targetChanged) {
+            closeClients();
+        }
+    }
+
+    private volatile BooleanSupplier mHighQualityPolicy = () -> false;
+    /** Last observed mode; the prior supplier reads the same live native preference. */
+    private boolean mHighQualityMode;
+
+    /** Gallery's native thumbnail/original selection, supplied by the host hook. */
+    public void setHighQualityPolicy(BooleanSupplier policy) {
+        BooleanSupplier next = policy == null ? () -> false : policy;
+        boolean changed;
+        synchronized (mLock) {
+            mHighQualityPolicy = next;
+            boolean nextMode = readHighQuality(next);
+            changed = mHighQualityMode != nextMode;
+            mHighQualityMode = nextMode;
+            if (changed) {
+                if (mRunning) {
+                    // Invalidate active planner/download work chosen under the old mode.
+                    mWorkGeneration++;
+                    // The mode change itself must be scanned even if an ordinary trailing
+                    // request was already consumed while the planner was busy.
+                    mNativeRequestPending = true;
+                    mTrailingRequestUsed = true;
+                }
+                mFailures.clear();
+                mFailureTimes.clear();
+                mLock.notifyAll();
+            }
+        }
+        if (changed) {
+            closeClients();
+        }
+    }
+
+    private boolean isHighQualityRequested() {
+        return readHighQuality(mHighQualityPolicy);
+    }
+
+    private static boolean readHighQuality(BooleanSupplier policy) {
+        try { return policy != null && policy.getAsBoolean(); }
+        catch (Throwable failure) { return false; }
+    }
+
+    /** Install Gallery's live predicate; missing or failing policies keep downloads stopped. */
+    public void setDownloadPolicy(BooleanSupplier policy) {
+        mDownloadPolicy = policy == null ? () -> false : policy;
+        refreshPolicyState();
+        synchronized (mLock) {
+            mLock.notifyAll();
+        }
+    }
+
+    /**
+     * Request a scan in response to Gallery's own batch-download check.
+     * Busy callbacks keep one trailing scan; further condition checks collapse until it ends.
+     */
+    public void requestFromNative() {
+        if (!refreshPolicyState()) {
+            return;
+        }
+        synchronized (mLock) {
+            if (!mPlannerBusy) {
+                if (!mNativeRequestPending) {
+                    mTrailingRequestUsed = false;
+                }
+                mNativeRequestPending = true;
+            } else if (!mTrailingRequestUsed) {
+                // Preserve one request that arrived too late for the in-progress scan. Further
+                // condition checks coalesce until that trailing scan completes.
+                mNativeRequestPending = true;
+                mTrailingRequestUsed = true;
+            }
             mLock.notifyAll();
         }
     }
@@ -203,6 +288,136 @@ public final class DownloadQueue {
 
     public void setPublisher(UploadProgressPublisher publisher) {
         mPublisher = publisher;
+    }
+
+    /** Refresh the native gate and invalidate unpublished work when Gallery disables downloads. */
+    private boolean refreshPolicyState() {
+        BooleanSupplier policy = mDownloadPolicy;
+        boolean enabled;
+        try {
+            enabled = policy != null && policy.getAsBoolean();
+        } catch (Throwable t) {
+            Logger.w("event=download_policy_failed detail=" + t);
+            enabled = false;
+        }
+        if (enabled) {
+            synchronized (mLock) {
+                if (mPolicySuspended) {
+                    mPolicySuspended = false;
+                    mLock.notifyAll();
+                }
+            }
+            return true;
+        }
+
+        boolean close = false;
+        synchronized (mLock) {
+            if (!mPolicySuspended) {
+                mWorkGeneration++;
+                close = true;
+            }
+            mPolicySuspended = true;
+            mNativeRequestPending = false;
+            if (!mPending.isEmpty()) {
+                mPending.clear();
+                mPendingVersion++;
+            }
+            mFailures.clear();
+            mFailureTimes.clear();
+            mLock.notifyAll();
+        }
+        if (close) {
+            closeClients();
+        }
+        return false;
+    }
+
+    private boolean isWorkCurrent(Config config, int generation) {
+        if (!isPolicyCurrent(generation)) {
+            return false;
+        }
+        return config != null && config.isReady()
+                && NetGuard.canUpload(mContext, config.isWifiOnly());
+    }
+
+    private boolean isPolicyCurrent(int generation) {
+        return isGenerationCurrent(generation) && refreshPolicyState()
+                && isGenerationCurrent(generation);
+    }
+
+    private void ensureWorkCurrent(Config config, int generation)
+            throws DownloadCancelledException {
+        if (!isWorkCurrent(config, generation)) {
+            throw new DownloadCancelledException();
+        }
+    }
+
+    private boolean isGenerationCurrent(int generation) {
+        synchronized (mLock) {
+            return mRunning && generation == mWorkGeneration;
+        }
+    }
+
+    private boolean isScheduledLocked(String remotePath) {
+        if (mInflight.contains(remotePath)) {
+            return true;
+        }
+        for (Pending pending : mPending) {
+            if (remotePath.equals(pending.remotePath)) {
+                return true;
+            }
+        }
+        Integer failures = mFailures.get(remotePath);
+        if (failures == null || failures < MAX_FAIL_PER_PATH) return false;
+        Long failedAt = mFailureTimes.get(remotePath);
+        if (failedAt != null && SystemClock.elapsedRealtime() - failedAt < FAILURE_COOLDOWN_MS) {
+            return true;
+        }
+        // A later native event can retry; no independent scan timer is introduced.
+        mFailures.remove(remotePath);
+        mFailureTimes.remove(remotePath);
+        return false;
+    }
+
+    private void removePendingLocked(String remotePath) {
+        Iterator<Pending> it = mPending.iterator();
+        while (it.hasNext()) {
+            if (remotePath.equals(it.next().remotePath)) {
+                it.remove();
+            }
+        }
+    }
+
+    private static boolean isMatchingAlbumFile(Config config, String relativePath,
+            long remoteSize) {
+        if (config == null || !Config.LAYOUT_ALBUM.equals(config.getRemoteLayout())
+                || relativePath == null || remoteSize < 0L) {
+            return false;
+        }
+        File local = new File("/storage/emulated/0", relativePath);
+        return local.isFile() && local.length() == remoteSize;
+    }
+
+    private void closeClients() {
+        for (WebDavClient client : mClients) {
+            if (client != null) {
+                client.close();
+            }
+        }
+    }
+
+    private void waitForSignal() {
+        synchronized (mLock) {
+            if (!mRunning) {
+                return;
+            }
+            try {
+                mLock.wait();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                mRunning = false;
+            }
+        }
     }
 
     public void addQueueView(UploadProgressPublisher publisher) {
@@ -263,21 +478,9 @@ public final class DownloadQueue {
         });
     }
 
-    /**
-     * 上传队列见底时叫醒下载计划线程。
-     *
-     * <p>这是整条下载通路的"节拍器"：上传在动说明用户正在用，把间隔拉回最短；
-     * 上传长时间不动，下载自己也按翻倍后的间隔慢慢来。
-     */
+    /** Compatibility hook for older host wiring; upload activity never schedules a scan. */
     public void onUploadIdle() {
         synchronized (mLock) {
-            if (mRoundDelay > ROUND_BASE) {
-                mRoundDelay = ROUND_BASE;
-            }
-            long earliest = System.currentTimeMillis() + MIN_ROUND_GAP;
-            if (mNextRoundAt > earliest) {
-                mNextRoundAt = earliest;
-            }
             mLock.notifyAll();
         }
     }
@@ -292,85 +495,89 @@ public final class DownloadQueue {
         }
         synchronized (mLock) {
             mRunning = false;
+            mNativeRequestPending = false;
+            mWorkGeneration++;
             mLock.notifyAll();
         }
-        for (WebDavClient client : mClients) {
-            if (client != null) {
-                client.close();
-            }
-        }
+        closeClients();
     }
 
     // ------------------------------------------------------------------ 计划侧
 
     /**
-     * 计划线程：按间隔走一遍远端树，把"本地还没有的文件"放进 {@link #mPending}。
+     * 计划线程：响应相册事件遍历远端树，把"本地还没有的文件"放进 {@link #mPending}。
      *
-     * <p>只有它做 PROPFIND。worker 线程只下载 —— 两边共用一棵目录树的结果就是
-     * 反复走同一条路径，那正是"省电省性能"要避免的。
+     * <p>只有它做 PROPFIND。worker 线程只下载；新扫描只由 native Gallery 事件触发。
      */
     private void plannerLoop() {
         while (mRunning) {
-            Config config = mConfig;
-            if (config == null || !config.isDownloadEnabled() || !config.isReady()) {
-                waitLocked(60_000L);
-                continue;
-            }
-            long wait;
+            Config config;
+            int generation;
             synchronized (mLock) {
-                wait = mNextRoundAt - System.currentTimeMillis();
-            }
-            if (wait > 0L) {
-                waitLocked(wait);
-                continue;
-            }
-            if (!NetGuard.canUpload(mContext, config.isWifiOnly())) {
-                Logger.d("event=download_skip reason=wifi_only");
-                backOff(false);
-                continue;
-            }
-            long free = freeBytes();
-            if (free < MIN_FREE_BYTES) {
-                Logger.w("event=download_skip reason=low_space free=" + free);
-                backOff(false);
-                continue;
-            }
-            int found;
-            try {
-                found = plan(config);
-            } catch (Throwable t) {
-                Logger.w("event=download_round_failed detail=" + t);
-                backOff(false);
-                continue;
-            }
-            backOff(found > 0);
-        }
-    }
-
-    /**
-     * 下一轮什么时候跑。
-     *
-     * @param productive 这一轮有没有认出新的文件。有就说明"还有得下"，隔 {@link #ROUND_ACTIVE}
-     *                   再来一趟；没有就把间隔翻倍 —— 远端没有新东西时最不该做的就是
-     *                   每半小时去走一遍整棵树
-     */
-    private void backOff(boolean productive) {
-        synchronized (mLock) {
-            if (productive) {
-                if (mRoundDelay > ROUND_BASE) {
-                    mRoundDelay = ROUND_BASE;
+                while (mRunning && !mNativeRequestPending) {
+                    try {
+                        mLock.wait();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        mRunning = false;
+                        return;
+                    }
                 }
-                mNextRoundAt = System.currentTimeMillis() + ROUND_ACTIVE;
-            } else {
-                mRoundDelay = Math.min(mRoundDelay * 2, ROUND_MAX);
-                mNextRoundAt = System.currentTimeMillis() + mRoundDelay;
+                if (!mRunning) {
+                    return;
+                }
+                mNativeRequestPending = false;
+                mPlannerBusy = true;
+                config = mConfig;
+                generation = mWorkGeneration;
             }
-            mLock.notifyAll();
+            try {
+                if (!refreshPolicyState() || config == null || !config.isReady()) {
+                    continue;
+                }
+                // A native start can discover a large remote tree. Continue only while each
+                // bounded listing round finds new work, and cap work for one native event.
+                for (int round = 0; round < MAX_BATCH_ROUNDS && mRunning; round++) {
+                    if (!isWorkCurrent(config, generation)) {
+                        break;
+                    }
+                    if (!NetGuard.canUpload(mContext, config.isWifiOnly())) {
+                        Logger.d("event=download_skip reason=wifi_only");
+                        break;
+                    }
+                    long free = freeBytes();
+                    if (free < MIN_FREE_BYTES) {
+                        Logger.w("event=download_skip reason=low_space free=" + free);
+                        break;
+                    }
+                    int added;
+                    try {
+                        added = plan(config, generation);
+                    } catch (Throwable t) {
+                        Logger.w("event=download_round_failed detail=" + t);
+                        break;
+                    }
+                    if (added <= 0) {
+                        break;
+                    }
+                    if (round == MAX_BATCH_ROUNDS - 1) {
+                        Logger.i("event=download_batch_limit rounds=" + MAX_BATCH_ROUNDS);
+                    }
+                }
+            } finally {
+                synchronized (mLock) {
+                    mPlannerBusy = false;
+                    if (!mNativeRequestPending) {
+                        mTrailingRequestUsed = false;
+                    }
+                    mLock.notifyAll();
+                }
+            }
         }
     }
 
     /** @return 这一轮认出多少个新文件 */
-    private int plan(Config config) {
+    private int plan(Config config, int generation) {
         List<Pending> found = new ArrayList<>();
         // The directory planner must not share worker 0's connection: listing and downloading
         // concurrently on one WebDAV client can interleave response bodies.
@@ -378,23 +585,22 @@ public final class DownloadQueue {
                 config.getPassword());
         try {
             walk(client, config.getRemoteRoot(), "", 0, found,
-                    OriginalStore.targetKey(config), config.isDownloadHighQuality());
+                    config, OriginalStore.targetKey(config), isHighQualityRequested(),
+                    generation);
         } finally {
             client.close();
         }
         if (found.isEmpty()) {
-            Logger.d("event=download_round_empty next_in=" + mRoundDelay);
+            Logger.d("event=download_round_empty");
             return 0;
         }
         int added = 0;
         synchronized (mLock) {
-            // 已经在队列里（上一轮还没下完）的不重复加入
-            Set<String> queued = new HashSet<>();
-            for (Pending pending : mPending) {
-                queued.add(pending.remotePath);
+            if (generation != mWorkGeneration || !mRunning) {
+                return 0;
             }
             for (Pending pending : found) {
-                if (queued.contains(pending.remotePath)) {
+                if (isScheduledLocked(pending.remotePath)) {
                     continue;
                 }
                 mPending.add(pending);
@@ -410,15 +616,12 @@ public final class DownloadQueue {
         return added;
     }
 
-    /**
-     * 走一遍远端目录树，挑出"本地还没有"的文件。
-     *
-     * <p>判断"本地有没有"用的是**文件名**（落到同一个目录里），与上传侧"远端有没有同名文件"
-     * 是同一套判定 —— 两边都只看名字，都不比对内容。
-     */
+    /** Walk one bounded round and collect remote files that have no local match. */
     private void walk(WebDavClient client, String remoteDir, String relativeDir, int depth,
-            List<Pending> out, String target, boolean highQuality) {
-        if (depth > MAX_DEPTH || out.size() >= MAX_DOWNLOADS_PER_ROUND) {
+            List<Pending> out, Config config, String target, boolean highQuality,
+            int generation) {
+        if (depth > MAX_DEPTH || out.size() >= MAX_DOWNLOADS_PER_ROUND
+                || !isPolicyCurrent(generation)) {
             return;
         }
         List<WebDavClient.RemoteEntry> entries;
@@ -433,7 +636,8 @@ public final class DownloadQueue {
         }
         int dirs = 0;
         for (WebDavClient.RemoteEntry entry : entries) {
-            if (out.size() >= MAX_DOWNLOADS_PER_ROUND || dirs >= MAX_DIRS_PER_ROUND) {
+            if (out.size() >= MAX_DOWNLOADS_PER_ROUND || dirs >= MAX_DIRS_PER_ROUND
+                    || !isPolicyCurrent(generation)) {
                 return;
             }
             String name = entry.name;
@@ -445,24 +649,50 @@ public final class DownloadQueue {
             if (entry.dir) {
                 dirs++;
                 walk(client, WebDavClient.joinPath(remoteDir, name), relative, depth + 1, out,
-                        target, highQuality);
+                        config, target, highQuality, generation);
                 continue;
             }
-            if (skipByExtension(name)) {
+            if (skipByExtension(name) || !isGalleryMedia(name)) {
                 continue;
             }
             String remotePath = WebDavClient.joinPath(remoteDir, name);
-            synchronized (mLock) {
-                if (mDone.containsKey(remotePath)) {
-                    continue;
-                }
-            }
             File normalLocal = new File(new File(DOWNLOAD_ROOT, relativeDir), name);
+            boolean done;
+            boolean scheduled;
+            synchronized (mLock) {
+                done = mDone.containsKey(remotePath);
+                scheduled = isScheduledLocked(remotePath);
+            }
+            boolean restoreMissingOriginal = !highQuality && done
+                    && isRegisteredPreviewMissingOriginal(remotePath, target, normalLocal);
+            if (scheduled || (done && !restoreMissingOriginal)) {
+                continue;
+            }
             if (normalLocal.exists() || (highQuality && isCompressibleExtension(name)
-                    && previewPathFor(normalLocal).exists())) {
+                    && previewPathFor(normalLocal).exists())
+                    || isMatchingAlbumFile(config, relative, entry.size)) {
                 continue;
             }
             out.add(new Pending(remotePath, relative, entry.size, target));
+        }
+    }
+
+    /** Let ORIGIN mode fetch raw bytes after this target previously completed an HQ sidecar. */
+    private boolean isRegisteredPreviewMissingOriginal(String remotePath, String target,
+            File originalPath) {
+        if (originalPath.exists()) {
+            return false;
+        }
+        OriginalStore.Record record = mOriginalStore.findByLocalPath(originalPath);
+        if (record == null || !target.equals(record.target)
+                || !remotePath.equals(record.remotePath) || record.previewLocalPath == null
+                || record.originalLocalPath == null) {
+            return false;
+        }
+        try {
+            return originalPath.getCanonicalPath().equals(record.originalLocalPath);
+        } catch (IOException ignored) {
+            return false;
         }
     }
 
@@ -471,25 +701,31 @@ public final class DownloadQueue {
     private void workerLoop() {
         while (mRunning) {
             Config config = mConfig;
+            if (!refreshPolicyState() || config == null || !config.isReady()
+                    || !NetGuard.canUpload(mContext, config.isWifiOnly())) {
+                waitForSignal();
+                continue;
+            }
             Pending next = null;
-            if (config != null && config.isDownloadEnabled() && config.isReady()) {
-                synchronized (mLock) {
+            int generation;
+            synchronized (mLock) {
+                while (mRunning && next == null) {
                     next = takeLocked();
                     if (next == null) {
                         try {
-                            mLock.wait(5_000L);
+                            mLock.wait();
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                             return;
                         }
-                        continue;
                     }
                 }
-            } else {
-                waitLocked(30_000L);
-                continue;
+                if (!mRunning) {
+                    return;
+                }
+                generation = mWorkGeneration;
             }
-            download(next, config);
+            download(next, config, generation);
         }
     }
 
@@ -515,7 +751,7 @@ public final class DownloadQueue {
         return null;
     }
 
-    private void download(Pending pending, Config config) {
+    private void download(Pending pending, Config config, int generation) {
         int index = workerIndex();
         UploadProgressPublisher publisher = mPublisher;
         long size = Math.max(pending.size, 0L);
@@ -531,10 +767,12 @@ public final class DownloadQueue {
         File staged = null;
         File compressed = null;
         try {
+            ensureWorkCurrent(config, generation);
             File possiblePreview = previewPathFor(normalDest);
-            boolean qualityRequested = config.isDownloadHighQuality()
+            boolean qualityRequested = isHighQualityRequested()
                     && isCompressibleExtension(normalDest.getName()) && pending.size > 0L;
-            if (normalDest.exists() || (qualityRequested && possiblePreview.exists())) {
+            if (normalDest.exists() || (qualityRequested && possiblePreview.exists())
+                    || isMatchingAlbumFile(config, pending.relativePath, pending.size)) {
                 // 本地已经有同名文件：一律不覆盖。用户可能自己改过它，也可能同名但是别的东西
                 Logger.i("event=download_skip_local_exists remote=" + pending.remotePath
                         + " local=" + (normalDest.exists() ? normalDest : possiblePreview));
@@ -545,6 +783,10 @@ public final class DownloadQueue {
             WebDavClient client = clientFor(config, index);
             client.setProgressListener((done, total) -> {
                 // 每 64KB 一次，这里只把数字塞给进度发布器（它自己按 2Hz 节流后发帧）
+                if (!isWorkCurrent(config, generation)) {
+                    client.close();
+                    return;
+                }
                 UploadProgressPublisher target = mPublisher;
                 if (target != null) {
                     target.taskBytes(key, done);
@@ -552,7 +794,7 @@ public final class DownloadQueue {
             });
             if (qualityRequested) {
                 File rawDir = new File(mContext.getFilesDir(), STATE_DIR + "/original_staging");
-                if (!rawDir.exists() && !rawDir.mkdirs()) {
+                if (!rawDir.isDirectory() && !rawDir.mkdirs() && !rawDir.isDirectory()) {
                     throw new IOException("cannot create original staging directory");
                 }
                 raw = File.createTempFile("original-", ".tmp", rawDir);
@@ -561,11 +803,12 @@ public final class DownloadQueue {
                 } finally {
                     client.setProgressListener(null);
                 }
+                ensureWorkCurrent(config, generation);
                 verifyDownloadedOriginal(pending, raw);
                 String digest = sha256(raw);
                 File previewDest = previewPathFor(normalDest);
                 File parent = previewDest.getAbsoluteFile().getParentFile();
-                if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+                if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
                     throw new IOException("cannot create download directory");
                 }
                 compressed = new File(parent, "." + previewDest.getName() + ".mgs-"
@@ -574,9 +817,14 @@ public final class DownloadQueue {
                         && compressed.length() > 0L && compressed.length() < raw.length();
                 if (compressedOk) {
                     // Persist the protected final path before it becomes visible to a media scanner.
+                    ensureWorkCurrent(config, generation);
                     mOriginalStore.registerDownloadedPreview(config, pending.remotePath,
                             raw.length(), digest, normalDest, previewDest, compressed);
                     dest = previewDest;
+                    ensureWorkCurrent(config, generation);
+                    if (!isHighQualityRequested()) {
+                        throw new DownloadCancelledException();
+                    }
                     publishStagedFile(compressed, dest);
                     compressed = null;
                     Logger.i("event=download_preview_ok remote=" + pending.remotePath
@@ -586,16 +834,18 @@ public final class DownloadQueue {
                     Logger.i("event=download_preview_skipped reason=unsupported_or_no_savings"
                             + " remote=" + pending.remotePath);
                     staged = stageBesideDestination(raw, normalDest);
+                    ensureWorkCurrent(config, generation);
                     mOriginalStore.registerDownloadedOriginal(config, pending.remotePath,
                             staged, normalDest, raw.length(), digest);
                     dest = normalDest;
+                    ensureWorkCurrent(config, generation);
                     publishStagedFile(staged, normalDest);
                     staged = null;
                 }
             } else {
                 // Keep raw bytes private until durable mirror protection is in place.
                 File rawDir = new File(mContext.getFilesDir(), STATE_DIR + "/original_staging");
-                if (!rawDir.exists() && !rawDir.mkdirs()) {
+                if (!rawDir.isDirectory() && !rawDir.mkdirs() && !rawDir.isDirectory()) {
                     throw new IOException("cannot create original staging directory");
                 }
                 raw = File.createTempFile("original-", ".tmp", rawDir);
@@ -604,12 +854,15 @@ public final class DownloadQueue {
                 } finally {
                     client.setProgressListener(null);
                 }
+                ensureWorkCurrent(config, generation);
                 verifyDownloadedOriginal(pending, raw);
                 String digest = sha256(raw);
                 staged = stageBesideDestination(raw, normalDest);
+                ensureWorkCurrent(config, generation);
                 mOriginalStore.registerDownloadedOriginal(config, pending.remotePath, staged,
                         normalDest, raw.length(), digest);
                 dest = normalDest;
+                ensureWorkCurrent(config, generation);
                 publishStagedFile(staged, normalDest);
                 staged = null;
             }
@@ -623,22 +876,43 @@ public final class DownloadQueue {
             Logger.i("event=download_ok remote=" + pending.remotePath
                     + " local=" + dest.getAbsolutePath() + " size=" + dest.length());
             ok = true;
+        } catch (DownloadCancelledException e) {
+            cleanupUnpublished(raw, staged, compressed);
+            Logger.d("event=download_cancelled remote=" + pending.remotePath);
         } catch (WebDavClient.TransportFailure e) {
             cleanupUnpublished(raw, staged, compressed);
-            fail(pending, e.getMessage());
+            if (isWorkCurrent(config, generation)) {
+                fail(pending, e.getMessage());
+            } else {
+                Logger.d("event=download_cancelled remote=" + pending.remotePath);
+            }
         } catch (IOException e) {
             cleanupUnpublished(raw, staged, compressed);
-            fail(pending, e.getMessage());
+            if (isWorkCurrent(config, generation)) {
+                fail(pending, e.getMessage());
+            } else {
+                Logger.d("event=download_cancelled remote=" + pending.remotePath);
+            }
         } catch (Throwable t) {
             cleanupUnpublished(raw, staged, compressed);
-            fail(pending, String.valueOf(t));
-            Logger.w("event=download_error remote=" + pending.remotePath, t);
+            if (isWorkCurrent(config, generation)) {
+                fail(pending, String.valueOf(t));
+                Logger.w("event=download_error remote=" + pending.remotePath, t);
+            } else {
+                Logger.d("event=download_cancelled remote=" + pending.remotePath);
+            }
         } finally {
             if (publisher != null) {
                 publisher.taskEnd(key, ok);
             }
             synchronized (mLock) {
                 mInflight.remove(pending.remotePath);
+                if (ok) {
+                    removePendingLocked(pending.remotePath);
+                    mFailures.remove(pending.remotePath);
+                    mFailureTimes.remove(pending.remotePath);
+                    mPendingVersion++;
+                }
                 mLock.notifyAll();
             }
         }
@@ -668,7 +942,7 @@ public final class DownloadQueue {
 
     private static File stageBesideDestination(File source, File dest) throws IOException {
         File parent = dest.getAbsoluteFile().getParentFile();
-        if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
             throw new IOException("cannot create download directory");
         }
         File stage = new File(parent, "." + dest.getName() + ".mgs-"
@@ -892,7 +1166,7 @@ public final class DownloadQueue {
                 return false;
             }
             File parent = output.getAbsoluteFile().getParentFile();
-            if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+            if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
                 return false;
             }
             return makePreview(original, output);
@@ -969,6 +1243,7 @@ public final class DownloadQueue {
             Integer previous = mFailures.get(pending.remotePath);
             count = (previous == null ? 0 : previous) + 1;
             mFailures.put(pending.remotePath, count);
+            mFailureTimes.put(pending.remotePath, SystemClock.elapsedRealtime());
         }
         Logger.w("event=download_retry remote=" + pending.remotePath + " attempts=" + count
                 + " reason=" + reason);
@@ -1013,6 +1288,20 @@ public final class DownloadQueue {
         return lower.endsWith(".tmp") || lower.endsWith(".part") || lower.endsWith(".log")
                 || lower.endsWith(".nomedia") || lower.endsWith(".db")
                 || lower.endsWith(".json") || lower.endsWith(".txt");
+    }
+
+    static boolean isGalleryMedia(String name) {
+        if (name == null) return false;
+        int dot = name.lastIndexOf('.');
+        if (dot < 0) return false;
+        switch (name.substring(dot + 1).toLowerCase(Locale.ROOT)) {
+            case "jpg": case "jpeg": case "png": case "gif": case "webp":
+            case "bmp": case "heic": case "heif": case "avif": case "dng":
+            case "mp4": case "m4v": case "mov": case "3gp": case "3gpp":
+            case "mkv": case "webm": case "avi": case "mpeg": case "mpg":
+                return true;
+            default: return false;
+        }
     }
 
     /**
@@ -1078,18 +1367,6 @@ public final class DownloadQueue {
             }
         }
         return 0;
-    }
-
-    private void waitLocked(long millis) {
-        long wait = Math.max(millis, 1_000L);
-        synchronized (mLock) {
-            try {
-                mLock.wait(Math.min(wait, 60_000L));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                mRunning = false;
-            }
-        }
     }
 
     private File stateFile() {

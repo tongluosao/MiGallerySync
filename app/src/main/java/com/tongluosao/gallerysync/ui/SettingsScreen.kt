@@ -286,20 +286,6 @@ private fun BehaviorSection(model: SettingsModel) {
                 summary = stringResource(R.string.summary_local_flag_mode),
                 onSelectedIndexChange = model::onLocalFlagModeChange
             )
-            SwitchPreference(
-                checked = model.downloadEnabled,
-                onCheckedChange = model::onDownloadEnabledChange,
-                title = stringResource(R.string.label_download_enabled),
-                summary = stringResource(R.string.summary_download_enabled)
-            )
-            if (model.downloadEnabled) {
-                SwitchPreference(
-                    checked = model.downloadHighQuality,
-                    onCheckedChange = model::onDownloadHighQualityChange,
-                    title = stringResource(R.string.label_download_high_quality),
-                    summary = stringResource(R.string.summary_download_high_quality)
-                )
-            }
             OverlayDropdownPreference(
                 items = SettingsModel.CONCURRENCY_ITEMS,
                 selectedIndex = model.concurrencyIndex,

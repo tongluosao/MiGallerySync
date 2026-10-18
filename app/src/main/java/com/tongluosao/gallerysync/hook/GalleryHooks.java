@@ -64,6 +64,7 @@ public final class GalleryHooks {
     private volatile OriginalRestoreHook mOriginalRestoreHook;
     /** Protects registered WebDAV originals when Gallery's native slim operation runs. */
     private volatile SlimHook mSlimHook;
+    private volatile NativeDownloadHook mNativeDownloadHook;
     private volatile Config mConfig;
     /** 宿主 Application 是否已经 onCreate：配置与它谁先到都有可能，两边都要能补建队列 */
     private volatile boolean mAppStarted;
@@ -84,6 +85,7 @@ public final class GalleryHooks {
         hooks.installDirtyCountHook();
         hooks.installOriginalRestoreHook();
         hooks.installSlimHook();
+        hooks.installNativeDownloadHook();
         return hooks;
     }
 
@@ -101,6 +103,8 @@ public final class GalleryHooks {
         Logger.i("event=queue_resume reason=hot_reloaded");
         mAppStarted = true;
         ensureQueue();
+        NativeDownloadHook nativeDownload = mNativeDownloadHook;
+        if (nativeDownload != null) nativeDownload.resume();
     }
 
     public void setConfig(Config config) {
@@ -274,6 +278,8 @@ public final class GalleryHooks {
                         try {
                             mAppStarted = true;
                             ensureQueue();
+                            NativeDownloadHook nativeDownload = mNativeDownloadHook;
+                            if (nativeDownload != null) nativeDownload.resume();
                             OriginalRestoreHook restoreHook = mOriginalRestoreHook;
                             if (restoreHook != null) {
                                 restoreHook.onAppStart();
@@ -312,6 +318,24 @@ public final class GalleryHooks {
         hook.setConfig(mConfig);
         hook.install();
         mSlimHook = hook;
+    }
+
+    private void installNativeDownloadHook() {
+        NativeDownloadHook hook = new NativeDownloadHook(mXposed, mClassLoader,
+                this::onNativeDownloadRequested);
+        mNativeDownloadHook = hook;
+        hook.install();
+    }
+
+    private void onNativeDownloadRequested() {
+        ensureDownloadQueue();
+        DownloadQueue queue = mDownload;
+        NativeDownloadHook hook = mNativeDownloadHook;
+        if (queue != null && hook != null) {
+            queue.setHighQualityPolicy(hook::isHighQuality);
+            queue.setDownloadPolicy(hook);
+            queue.requestFromNative();
+        }
     }
 
     /**
@@ -572,8 +596,8 @@ public final class GalleryHooks {
                     mQueue = UploadQueue.get(context, mConfig);
                     mQueue.setMarker(markSynced(context));
                     mQueue.setProgress(HostSyncState.create(mClassLoader));
-                    // 下载队列与回收站都跟上传队列并列，共用同一个进度发布器
-                    //（上传队列构造时就起了），并由同一个 idle 回调驱动
+                    // Downloads share progress reporting but follow Gallery's own native events.
+                    // Upload-idle callbacks only drain the remote trash queue.
                     mQueue.setIdleListener(this::onUploadIdle);
                     Logger.i("event=queue_ready");
                 } else {
@@ -589,9 +613,7 @@ public final class GalleryHooks {
     /**
      * 建下载队列。与上传队列同一时刻、同一条件：都在拿到宿主 Context 之后。
      *
-     * <p>即便 {@code download_enabled} 关着也照建：那个开关随时可能被用户打开，
-     * 而队列的存在只是几条睡着的线程（{@link DownloadQueue} 的循环在开关关闭时
-     * 一分钟醒一次看配置）。这样"打开开关"不需要重启相册。
+     * <p>下载线程等待相册原生自动下载事件；是否可下载由相册开关和原生条件判断。
      */
     private void ensureDownloadQueue() {
         synchronized (this) {
@@ -607,6 +629,11 @@ public final class GalleryHooks {
                 return;
             }
             DownloadQueue queue = DownloadQueue.get(context, config);
+            NativeDownloadHook nativeDownload = mNativeDownloadHook;
+            if (nativeDownload != null) {
+                queue.setHighQualityPolicy(nativeDownload::isHighQuality);
+                queue.setDownloadPolicy(nativeDownload);
+            }
             UploadQueue upload = mQueue;
             if (upload != null) {
                 queue.addQueueView(upload.publisher());
@@ -617,27 +644,11 @@ public final class GalleryHooks {
         }
     }
 
-    /**
-     * 上传见底的回调：下载补齐与回收站都在这时候动手。
-     *
-     * <p>两件事共用同一个节拍是有意的 —— 它们都在"用户没在传照片"的时候才跑，
-     * 谁也不会跟上传抢带宽。下载队列与回收站都是首次唤醒时才建，省一点启动开销。
-     */
+    /** Upload-idle cleanup is independent of Gallery's native download schedule. */
     private void onUploadIdle() {
-        DownloadQueue queue;
         TrashQueue trash;
         synchronized (this) {
-            queue = mDownload;
             trash = mTrash;
-        }
-        if (queue == null) {
-            ensureDownloadQueue();
-            synchronized (this) {
-                queue = mDownload;
-            }
-        }
-        if (queue != null) {
-            queue.onUploadIdle();
         }
         if (trash == null) {
             synchronized (this) {
@@ -790,6 +801,9 @@ public final class GalleryHooks {
             restoreHook = mOriginalRestoreHook;
             mOriginalRestoreHook = null;
             mSlimHook = null;
+            NativeDownloadHook nativeDownload = mNativeDownloadHook;
+            mNativeDownloadHook = null;
+            if (nativeDownload != null) nativeDownload.shutdown();
         }
         if (restoreHook != null) restoreHook.shutdown();
         if (receiver != null) {
