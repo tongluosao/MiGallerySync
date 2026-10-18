@@ -17,6 +17,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.Arrays;
@@ -294,18 +296,72 @@ public final class HeicPreviewEncoder {
         return sLastFailureReason;
     }
 
-    private static Map<String, String> copyableAttributes(ExifInterface source) {
+    static Map<String, String> copyableAttributes(ExifInterface source) {
         Map<String, String> attributes = new LinkedHashMap<>();
         if (source == null) {
             return attributes;
         }
         for (String tag : PRESERVED_TAGS) {
             String value = source.getAttribute(tag);
+            String rawRational = rawUnsignedRational(source, tag);
+            if (rawRational != null) {
+                value = rawRational;
+            }
             if (value != null) {
                 attributes.put(tag, value);
             }
         }
         return attributes;
+    }
+
+    /**
+     * ExifInterface exposes these two unsigned-rational tags as decimals for compatibility.
+     * Recover their original numerator/denominator from the public raw-byte API so setAttribute
+     * receives "n/d" and does not approximate the source value via createFromDouble().
+     * Ambiguous, malformed, and non-rational values retain the old decimal-copy behavior.
+     */
+    static String rawUnsignedRational(ExifInterface source, String tag) {
+        if (source == null || (!ExifInterface.TAG_EXPOSURE_TIME.equals(tag)
+                && !ExifInterface.TAG_F_NUMBER.equals(tag))) {
+            return null;
+        }
+        return rawUnsignedRational(source.getAttributeBytes(tag),
+                source.getAttributeDouble(tag, Double.NaN));
+    }
+
+    static String rawUnsignedRational(byte[] bytes, double actual) {
+        if (bytes == null || bytes.length != 8 || !Double.isFinite(actual) || actual <= 0.0d) {
+            return null;
+        }
+
+        long[] little = unsignedRational(bytes, ByteOrder.LITTLE_ENDIAN);
+        long[] big = unsignedRational(bytes, ByteOrder.BIG_ENDIAN);
+        boolean littleMatches = rationalMatches(little, actual);
+        boolean bigMatches = rationalMatches(big, actual);
+        if (littleMatches == bigMatches) {
+            if (littleMatches && little[0] == big[0] && little[1] == big[1]) {
+                return little[0] + "/" + little[1];
+            }
+            return null;
+        }
+        long[] value = littleMatches ? little : big;
+        return value[0] + "/" + value[1];
+    }
+
+    private static long[] unsignedRational(byte[] bytes, ByteOrder byteOrder) {
+        ByteBuffer buffer = ByteBuffer.wrap(bytes).order(byteOrder);
+        long numerator = buffer.getInt() & 0xffffffffL;
+        long denominator = buffer.getInt() & 0xffffffffL;
+        return denominator == 0L ? null : new long[]{numerator, denominator};
+    }
+
+    private static boolean rationalMatches(long[] rational, double actual) {
+        if (rational == null || rational[0] == 0L) {
+            return false;
+        }
+        double value = rational[0] / (double) rational[1];
+        double tolerance = Math.max(Math.ulp(actual) * 2.0d, Math.abs(actual) * 1.0e-14d);
+        return Math.abs(value - actual) <= tolerance;
     }
 
     /** Writes allowlisted tags to a temporary JPEG and extracts its complete APP1 EXIF block. */

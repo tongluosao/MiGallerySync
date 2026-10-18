@@ -1319,6 +1319,8 @@ public final class DownloadQueue {
                     continue;
                 }
                 String value = source.getAttribute(tag);
+                String rawRational = HeicPreviewEncoder.rawUnsignedRational(source, tag);
+                if (rawRational != null) value = rawRational;
                 if (value != null) target.setAttribute(tag, value);
             }
         }

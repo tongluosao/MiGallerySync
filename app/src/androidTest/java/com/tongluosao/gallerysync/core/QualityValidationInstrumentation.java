@@ -18,8 +18,16 @@ public final class QualityValidationInstrumentation extends Instrumentation {
     @Override
     public void onStart() {
         Bundle result = new Bundle();
+        String exposureRoundTripInput = mArguments.getString("exposure_time_roundtrip_input");
         String probeInput = mArguments.getString("photo_quality_probe_input");
         try {
+            if (exposureRoundTripInput != null) {
+                result.putAll(ExposureTimeRoundTripInstrumentation.runProbe(
+                        getTargetContext(), exposureRoundTripInput));
+                finish(Activity.RESULT_OK, result);
+                return;
+            }
+
             if (probeInput != null) {
                 result.putAll(PhotoQualityProbeInstrumentation.runProbe(
                         getTargetContext(), probeInput));
@@ -41,7 +49,13 @@ public final class QualityValidationInstrumentation extends Instrumentation {
             }
         } catch (Throwable error) {
             String detail = android.util.Log.getStackTraceString(error);
-            if (probeInput != null) {
+            if (exposureRoundTripInput != null) {
+                // Keep a failing diagnostic from printing the input's private path or metadata.
+                android.util.Log.e("ExposureTimeRoundTrip",
+                        "diagnostic failed: " + error.getClass().getSimpleName());
+                result.putString("status", "FAILED");
+                result.putString("failure", error.getClass().getSimpleName());
+            } else if (probeInput != null) {
                 android.util.Log.e("PhotoQualityProbe", detail);
                 result.putString("status", "FAILED");
                 result.putString("failure", detail);
