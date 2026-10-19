@@ -31,15 +31,16 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # ubuntu runner 已预装 Android SDK（licenses 已接受），这里只补齐 compileSdk 需要的包；
+      # 补不上也不要紧，AGP 会自己下载。
       - name: Install SDK packages
         run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          # compileSdk = 37（Android 17）。包名带次版本号，写错就让 Gradle 自己下载兜底。
           sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" "platform-tools" \
             || echo "::warning::sdkmanager 安装失败，交给 Gradle 自动下载"
+          sdkmanager --list_installed 2>/dev/null | grep -E 'platforms;android-3[67]|build-tools;37' || true
 
       - name: Unit tests
         run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
