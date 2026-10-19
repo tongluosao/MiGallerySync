@@ -22,6 +22,20 @@ android {
         versionName = "1.2.41"
     }
 
+    // 发布签名：CI 通过环境变量提供 keystore；本地没有这些变量时 release 不签名，
+    // 仍可用 assembleDebug 装机验证。变量名见 .github/workflows/release.yml。
+    val releaseKeystore = System.getenv("MGS_KEYSTORE_FILE")
+    signingConfigs {
+        if (!releaseKeystore.isNullOrBlank()) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("MGS_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("MGS_KEY_ALIAS")
+                keyPassword = System.getenv("MGS_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -29,6 +43,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.findByName("release")
         }
     }
     compileOptions {

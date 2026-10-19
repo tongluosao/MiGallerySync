@@ -1,0 +1,94 @@
+name: Release
+
+# 打 tag（v1.2.41 这种）时自动跑单测、构建签名 APK 并发 Release；
+# 手动触发只构建、不发布，方便先验证能编过。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # compileSdk = 37（Android 17）。包名带次版本号，写错就让 Gradle 自己下载兜底。
+          sdkmanager --install "platforms;android-37.0" "build-tools;37.0.0" "platform-tools" \
+            || echo "::warning::sdkmanager 安装失败，交给 Gradle 自动下载"
+
+      - name: Unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::缺少 ANDROID_KEYSTORE_BASE64，无法签名发布"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          test -s "$RUNNER_TEMP/release.jks"
+
+      - name: Build release APK
+        env:
+          MGS_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
+          MGS_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          MGS_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MGS_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify signature
+        run: |
+          APK=app/build/outputs/apk/release/app-release.apk
+          test -f "$APK" || { echo "::error::没有找到 release APK"; exit 1; }
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort | tail -n 1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee /tmp/certs.txt
+          grep -qi "CN=MiGallerySync" /tmp/certs.txt \
+            || { echo "::error::APK 不是用发布密钥签的"; exit 1; }
+
+      - name: Rename artifact
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk "dist/MiGallerySync-${GITHUB_REF_NAME}.apk"
+          ls -l dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiGallerySync-${{ github.ref_name }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
