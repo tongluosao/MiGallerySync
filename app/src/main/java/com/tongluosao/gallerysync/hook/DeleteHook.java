@@ -83,10 +83,10 @@ final class DeleteHook {
                     .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
                     .intercept(chain -> {
                         try {
-                            // args: (context, db, manager, arrayList, long[] ids, int reason,
-                            //        arrayList2, int deleteOptions)
+                            // DEX: (context, db, manager, arrayList, ids, deleteOptions,
+                            //       affectedRows, deleteReason). Local-only is argument 5.
                             Object idsArg = chain.getArg(4);
-                            Object optionsArg = chain.getArg(7);
+                            Object optionsArg = chain.getArg(5);
                             long[] ids = idsArg instanceof long[] ? (long[]) idsArg : null;
                             int deleteOptions = optionsArg instanceof Integer ? (Integer) optionsArg : 0;
                             handleDelete(ids, deleteOptions);
