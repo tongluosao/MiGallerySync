@@ -54,7 +54,6 @@ final class MetadataRestoreJob {
         thread.setDaemon(true);
         return thread;
     });
-    private final ScannerIngest mScanner;
     private final ClassLoader mLoader;
     private volatile Config mConfig;
     private Future<?> mFuture;
@@ -63,7 +62,6 @@ final class MetadataRestoreJob {
 
     MetadataRestoreJob(ClassLoader loader) {
         mLoader = loader;
-        mScanner = new ScannerIngest(loader);
     }
 
     void setConfig(Config config) {
@@ -269,7 +267,8 @@ final class MetadataRestoreJob {
                 cleanupFailure = cleanup.reason;
             }
         }
-        mScanner.ingest(record.originalLocalPath);
+        // The existing cloud row was updated above; rescanning this path can create another row
+        // when Gallery's stored file identity still reflects the slim/derived bytes.
         return new ItemResult(item.row, cleanupFailure.isEmpty() ? "success" : "partial",
                 cleanupFailure, repairs.copies, repairs.rows, cleanedDuplicates);
     }
