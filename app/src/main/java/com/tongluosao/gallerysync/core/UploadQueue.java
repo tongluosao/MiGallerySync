@@ -224,6 +224,8 @@ public final class UploadQueue {
 
     private final Context mContext;
     private final OriginalStore mOriginalStore;
+    /** 用户主动删掉的垃圾副本的远端路径账本，见 {@link RemoteSuppress} */
+    private final RemoteSuppress mRemoteSuppress;
     private final Object mLock = new Object();
     private final LinkedHashMap<String, Task> mPending = new LinkedHashMap<>();
     private final LinkedHashMap<String, Long> mDone = new LinkedHashMap<>();
@@ -399,6 +401,7 @@ public final class UploadQueue {
         mContext = context.getApplicationContext();
         mConfig = config;
         mOriginalStore = OriginalStore.get(mContext);
+        mRemoteSuppress = RemoteSuppress.get(mContext);
         load();
         mPublisher = UploadProgressPublisher.start(mContext);
         mPublisher.addQueueView(new UploadProgressPublisher.QueueView() {
@@ -1162,6 +1165,19 @@ public final class UploadQueue {
                             + requestedRemoteDir);
                 }
                 remotePath = WebDavClient.joinPath(remoteDir, file.getName());
+                // 防御纵深：用户主动删掉的垃圾副本，远端那份也不许再被 PUT 回去。正常链路走不到
+                // 这里（那些副本在 registry 里被标成 derived/受保护），但一旦走到，传上去就等于
+                // 把用户删掉的东西又送回远端，下载侧再取回来 —— 闭环必须两边都堵。
+                if (mRemoteSuppress.isSuppressed(config, remotePath)) {
+                    Logger.w("event=upload_skip_suppressed remote=" + remotePath
+                            + " path=" + task.path);
+                    synchronized (mLock) {
+                        mPending.remove(taskKey);
+                        mPendingVersion++;
+                        saveThrottledLocked();
+                    }
+                    return;
+                }
                 // A name and size match only identifies a candidate. GET and SHA-256 must confirm
                 // byte identity before this shortcut can register or mark the item complete.
                 if (config.isSkipExistingRemote()
@@ -1245,6 +1261,19 @@ public final class UploadQueue {
                 // 能自动补父目录的服务器（alist / OpenList / CloudDrive2）本来就不需要这一步；
                 // 不需要的由 put() 在 404/409 时补建一次。
                 //
+                // 载荷闸门：空/全 0/没有有效签名的文件绝不能再走出去。2026-10 事故里
+                // 就是<stem>.jpg 这种全 0 内容被 PUT 上去，远端于是躺着 80 个空 jpg。
+                // 与上面的"保护上传"同一套处理：从待传队列里摘掉，不重试、不打断宿主。
+                if (!MediaPayload.isUsableMedia(file)) {
+                    Logger.w("event=upload_rejected reason=invalid_payload path=" + task.path
+                            + " size=" + file.length());
+                    synchronized (mLock) {
+                        mPending.remove(taskKey);
+                        mPendingVersion++;
+                        saveThrottledLocked();
+                    }
+                    return;
+                }
                 // **顺序不能颠倒：先把字节发出去，再谈复核。** 复核（HEAD/PROPFIND）问的是
                 // "这个路径在不在"，它对"是我刚传上去的"还是"上一轮就躺在那儿的"一无所知。
                 // 一旦只复核不发送，远端早就有的同名文件就会被判成"这次传成功了"，

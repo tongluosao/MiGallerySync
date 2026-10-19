@@ -40,3 +40,19 @@ java_pid*.hprof
 # ---- 系统 ----
 .DS_Store
 Thumbs.db
+
+# ---- 开发期取证材料（不得入库）----
+# debug/ 内有相册原包（gallery-base.apk）、反编译产物、设备数据库 dump、
+# 模块日志与 UI dump；.tmp-analysis/ 内有取证脚本与设备快照。两者都含
+# 用户数据或第三方专有内容，绝不随仓库分发。
+debug/
+.tmp-analysis/
+.adb-evidence/
+.tmp-debug/
+
+# ---- 设备数据快照 ----
+*.db
+*.db-wal
+*.db-shm
+*.dump
+*.dexdump

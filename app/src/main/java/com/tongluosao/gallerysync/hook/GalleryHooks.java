@@ -646,7 +646,9 @@ public final class GalleryHooks {
             if (upload != null) {
                 queue.addQueueView(upload.publisher());
             }
-            queue.setIngest(new ScannerIngest(mClassLoader)::ingest);
+            // 用实例而不是方法引用：隐藏目录里的预览要走 adoptPreview（改既有云行），
+            // 不是 ingest（宿主扫描器会建新行）
+            queue.setIngest(new ScannerIngest(mClassLoader));
             mDownload = queue;
             Logger.i("event=download_queue_ready");
         }

@@ -1,12 +1,14 @@
 package com.tongluosao.gallerysync.core;
 
 import android.content.Context;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.net.Uri;
 import androidx.exifinterface.media.ExifInterface;
 import android.os.StatFs;
 import android.os.SystemClock;
@@ -21,12 +23,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -56,6 +60,8 @@ public final class DownloadQueue {
 
     private static final String STATE_DIR = "webdav_sync";
     private static final String STATE_FILE = "state.json";
+    /** 瘦身副本所在的隐藏目录：媒体扫描器跳过点目录，副本因此不会变成新的照片行 */
+    private static final String SLIM_DIRECTORY = ".gallerysync-slim";
     /** Public storage root used when the remote path can be mapped back to an album. */
     private static final String PRIMARY_STORAGE_ROOT = "/storage/emulated/0";
 
@@ -64,6 +70,16 @@ public final class DownloadQueue {
      * Everything stays below one reserved directory so the fallback remains easy to inspect.
      */
     private static final String MIRROR_ROOT = PRIMARY_STORAGE_ROOT + "/DCIM/MiGallerySync";
+
+    /**
+     * 相册自己的云端索引表。模块判断"这张照片宿主还要不要"看的就是它：表里还有指向该本地
+     * 路径的行 = 用户没删；查不到行 = 用户已删，绝不能自动下回来（见 {@link #shouldPlanDownload}）。
+     * 与 core/TrashQueue.java:474-475 用的是同一个 provider。
+     *
+     * <p>只存字符串、用到时才 {@code Uri.parse}：纯 JVM 单测没有 android.net.Uri，放在静态
+     * 初始化里会让整个类加载失败。
+     */
+    private static final String CLOUD_URI = "content://com.miui.gallery.cloud.provider/cloud";
 
     /** 一轮最多走几个目录（含子目录），防止一次枚举把整棵树拉下来 */
     private static final int MAX_DIRS_PER_ROUND = 200;
@@ -92,6 +108,8 @@ public final class DownloadQueue {
 
     private final Context mContext;
     private final OriginalStore mOriginalStore;
+    /** 用户主动删掉的垃圾副本的远端路径账本，见 {@link RemoteSuppress} */
+    private final RemoteSuppress mRemoteSuppress;
     private final Object mLock = new Object();
 
     /** 认出但还没下完的项。计划线程添、worker 线程取 */
@@ -130,7 +148,63 @@ public final class DownloadQueue {
 
     /** 让相册把刚落地的文件收进媒体库 */
     public interface Ingest {
+        /** 把相册目录里的真原图交给宿主扫描器，让宿主自己算出缩略图并建行。 */
         void ingest(String absolutePath);
+
+        /**
+         * 把 {@code <相册目录>/.gallerysync-slim/} 下的预览挂到**既有云行**上：把该行改成
+         * "本地表示 = 这张预览"（thumbnailFile = previewPath、localFile 置空），与
+         * {@code SlimHook} 走的是同一条 {@code SlimController.saveToDB} 路径。
+         *
+         * <p>**绝不**调用宿主扫描器：扫描器会把隐藏目录里的预览当成一张新照片，
+         * 在相册的原图行之外多出一行"副本"（设备实证：cloud 表多出 _id=15989/15991）。
+         *
+         * <p>默认实现什么都不做（并留一条日志）：隐藏目录里的预览宁可暂时不上屏，
+         * 也绝不能被扫描器当成新照片入库。
+         */
+        default void adoptPreview(String albumPath, String previewPath) {
+            Logger.d("event=ingest_adopt_preview_unsupported album=" + albumPath
+                    + " preview=" + previewPath);
+        }
+    }
+
+    /**
+     * 宿主扫描器的唯一闸门：只有相册目录里的真原图才允许交给 {@link Ingest#ingest}。
+     *
+     * <p>判据是路径分段里有没有 {@code .gallerysync-slim}（忽略大小写、同时认 {@code /} 与
+     * {@code \}），因此相册目录本身、以及名字里带这段字符的普通文件都仍然是 true。
+     * 纯字符串逻辑，不碰 Android，可以直接单测。
+     */
+    public static boolean hostScanAllowed(String destPath) {
+        if (destPath == null || destPath.isEmpty()) {
+            return false;
+        }
+        for (String segment : destPath.replace('\\', '/').split("/", -1)) {
+            if (SLIM_DIRECTORY.equalsIgnoreCase(segment)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 发布成功之后通知宿主：相册目录里的文件照旧交给扫描器；隐藏目录里的预览只能挂到既有云行上，
+     * 两者由 {@link #hostScanAllowed} 分流，调用方不再各自判断。
+     */
+    private void notifyHostAfterPublish(File published, File albumOriginal) {
+        Ingest ingest = mIngest;
+        if (ingest == null || published == null) {
+            return;
+        }
+        String path = published.getAbsolutePath();
+        if (hostScanAllowed(path)) {
+            ingest.ingest(path);
+            return;
+        }
+        File album = albumOriginal == null ? published : albumOriginal;
+        Logger.i("event=download_preview_adopt_requested album=" + album.getAbsolutePath()
+                + " preview=" + path);
+        ingest.adoptPreview(album.getAbsolutePath(), path);
     }
 
     /** 待下载的一项 */
@@ -161,6 +235,7 @@ public final class DownloadQueue {
         mContext = context.getApplicationContext();
         mConfig = config;
         mOriginalStore = OriginalStore.get(mContext);
+        mRemoteSuppress = RemoteSuppress.get(mContext);
         mDownloadTarget = OriginalStore.targetKey(config);
         load();
         mPlanner = new Thread(this::plannerLoop, "MiGallerySync-download-plan");
@@ -576,7 +651,7 @@ public final class DownloadQueue {
         try {
             walk(client, config.getRemoteRoot(), "", 0, found,
                     config, OriginalStore.targetKey(config), isHighQualityRequested(),
-                    generation);
+                    generation, new HostRows(mContext));
         } finally {
             client.close();
         }
@@ -609,7 +684,7 @@ public final class DownloadQueue {
     /** Walk one bounded round and collect remote files that have no local match. */
     private void walk(WebDavClient client, String remoteDir, String relativeDir, int depth,
             List<Pending> out, Config config, String target, boolean highQuality,
-            int generation) {
+            int generation, HostRows hostRows) {
         if (depth > MAX_DEPTH || out.size() >= MAX_DOWNLOADS_PER_ROUND
                 || !isPolicyCurrent(generation)) {
             return;
@@ -639,13 +714,18 @@ public final class DownloadQueue {
             if (entry.dir) {
                 dirs++;
                 walk(client, WebDavClient.joinPath(remoteDir, name), relative, depth + 1, out,
-                        config, target, highQuality, generation);
+                        config, target, highQuality, generation, hostRows);
                 continue;
             }
             if (skipByExtension(name) || !isGalleryMedia(name)) {
                 continue;
             }
             String remotePath = WebDavClient.joinPath(remoteDir, name);
+            if (!mayDownload(mRemoteSuppress, config, remotePath)) {
+                // 用户主动删掉的垃圾副本：远端还在，但绝不能再下回来（否则删一次下回来一次）
+                Logger.i("event=download_skip_suppressed remote=" + remotePath);
+                continue;
+            }
             File normalLocal = destinationFor(config, relative, entry.size);
             OriginalStore.Record occupied = mOriginalStore.findByLocalPath(normalLocal);
             if (occupied != null && !remotePath.equals(occupied.remotePath)) {
@@ -665,14 +745,127 @@ public final class DownloadQueue {
             }
             boolean restoreMissingOriginal = !highQuality
                     && isRegisteredPreviewNeedingOriginalRestore(remotePath, config, normalLocal);
-            if (scheduled || (done && !restoreMissingOriginal)) {
-                continue;
-            }
-            if (normalLocal.exists() && !restoreMissingOriginal) {
+            if (!shouldPlanDownload(scheduled, done, restoreMissingOriginal, normalLocal.exists(),
+                    hostRows.knows(normalLocal))) {
                 continue;
             }
             out.add(new Pending(remotePath, relative, entry.size, target,
                     normalLocal.getAbsolutePath()));
+        }
+    }
+
+    /**
+     * 缺失的远端文件是否可以自动补齐。
+     *
+     * <p>判据（本次修复）：远端有、本地没有<b>不足以</b>说明这张照片该回来。相册自己的
+     * {@code cloud} 表里还有一行指向这个本地路径，才说明是"相册还要它、只是本地文件被清了"
+     * （换机/空间优化后的正当补齐）；没有行说明用户已经把它删了，此时把它下回来只会变成
+     * 用户反复看到的"副本"。
+     *
+     * <p>2026-10-19 19:49 那次 200 项误下就是这个漏洞：这些 remote 名下的 cloud 行在计划时
+     * 已经不存在（是本模块落盘后扫描器新建的，行号从 3xxx 变成 16xxx），而 {@code dl_done}
+     * 账本里也没有它们（{@code done=false}）、本地文件又已被删（{@code exists()=false}），
+     * 于是 :672/:675 两道 continue 都不成立，直接入队下载。
+     *
+     * <p>注册表里登记着"这一 remote 的原图被瘦身预览替代"的记录仍然放行（ORIGIN 恢复），
+     * 它是模块自己的账本，与 DB 行是否存在无关；按需"下载原图"走的是原生请求链路，不经过这里。
+     */
+    static boolean shouldPlanDownload(boolean scheduled, boolean done,
+            boolean restoreMissingOriginal, boolean localExists, boolean hostKnowsLocalPath) {
+        if (scheduled) {
+            return false;
+        }
+        if (done && !restoreMissingOriginal) {
+            return false;
+        }
+        if (localExists && !restoreMissingOriginal) {
+            return false;
+        }
+        return restoreMissingOriginal || hostKnowsLocalPath;
+    }
+
+    /**
+     * 这条远端路径还允许自动下载吗。
+     *
+     * <p>闸在 {@link #shouldPlanDownload} 之上、也更强：那个判据问的是"要不要补"，
+     * 这个问的是"还准不准碰"。用户主动删掉的垃圾副本（{@link RemoteSuppress} 记过账）
+     * 一律不准碰 —— 远端对象还在，但它已经不再是"缺失的照片"，而是用户明确不要的东西。
+     * 本轮计划与 worker 发 GET 之前各问一次：计划期间账本可能又多了新条目。
+     */
+    static boolean mayDownload(RemoteSuppress ledger, Config config, String remotePath) {
+        return ledger == null || !ledger.isSuppressed(config, remotePath);
+    }
+
+    /** Whether the host still lists a local path (exact path, or its resolved canonical form). */
+    static boolean hostKnowsLocalPath(Set<String> hostLocalPaths, File localPath) {
+        if (hostLocalPaths == null || localPath == null) {
+            return false;
+        }
+        if (hostLocalPaths.contains(localPath.getAbsolutePath())) {
+            return true;
+        }
+        try {
+            return hostLocalPaths.contains(localPath.getCanonicalPath());
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * 一轮下载计划内的宿主 cloud 表本地路径快照，懒加载且最多查一次。
+     *
+     * <p>查询失败（provider 未就绪、被限制等）时 {@link #knows(File)} 返回 false，即
+     * <b>失败即保守</b>：宁可这一轮不下，也不把用户删掉的副本重新写回相册。合法补齐
+     * 允许漏一轮，下轮重试；误下却会立刻污染用户的相册。
+     */
+    private static final class HostRows {
+        private final Context context;
+        private boolean loaded;
+        private Set<String> paths;
+
+        HostRows(Context context) {
+            this.context = context;
+        }
+
+        boolean knows(File localPath) {
+            if (!loaded) {
+                loaded = true;
+                paths = read(context);
+            }
+            return hostKnowsLocalPath(paths, localPath);
+        }
+
+        private static Set<String> read(Context context) {
+            Set<String> found = new LinkedHashSet<>();
+            Cursor cursor = null;
+            try {
+                cursor = context.getContentResolver().query(Uri.parse(CLOUD_URI),
+                        new String[]{"localFile"}, null, null, null);
+                if (cursor == null) {
+                    Logger.w("event=download_host_rows_unavailable reason=null_cursor");
+                    return null;
+                }
+                while (cursor.moveToNext()) {
+                    String local = cursor.getString(0);
+                    if (local == null) {
+                        continue;
+                    }
+                    String path = local.trim();
+                    if (path.isEmpty()) {
+                        continue;
+                    }
+                    found.add(path.startsWith("/") ? path : PRIMARY_STORAGE_ROOT + "/" + path);
+                }
+            } catch (Throwable t) {
+                Logger.w("event=download_host_rows_unavailable reason=" + t);
+                return null;
+            } finally {
+                if (cursor != null) {
+                    cursor.close();
+                }
+            }
+            Logger.d("event=download_host_rows_loaded rows=" + found.size());
+            return found;
         }
     }
 
@@ -699,14 +892,23 @@ public final class DownloadQueue {
         }
     }
 
-    /** A Gallery slim copy is already a local match even when the original path was removed. */
+    /**
+     * 已登记的瘦身副本就是本地匹配：判断依据是注册表里的派生路径 + 指纹，
+     * 而不是目录名。旧版本遗留的 /.gallerysync-slim/ 路径仍然承认，因为它们本来也登记过。
+     */
     private boolean hasValidRegisteredSlimPreview(Config config, String target, String remotePath,
             File originalPath) {
         OriginalStore.Record record = findRecordForOriginal(config, target, remotePath,
                 originalPath);
         if (record == null) return false;
-        for (String path : record.derivedPaths) {
-            if (path == null || !path.replace('\\', '/').contains("/.gallerysync-slim/")) {
+        Set<String> candidates = new LinkedHashSet<>(record.derivedPaths);
+        if (record.previewLocalPath != null) {
+            candidates.add(record.previewLocalPath);
+        }
+        for (String path : candidates) {
+            if (path == null) continue;
+            // 注册表里的派生路径优先；旧版本只记了隐藏目录里的文件名时用路径形状兜底
+            if (!record.derivedPaths.contains(path) && !isLegacySlimPath(path)) {
                 continue;
             }
             File preview = new File(path);
@@ -849,8 +1051,7 @@ public final class DownloadQueue {
                 ensureWorkCurrent(config, generation);
                 dest = mOriginalStore.restoreOriginal(config, record, normalDest);
                 markDone(pending.remotePath, pending.target);
-                Ingest ingest = mIngest;
-                if (ingest != null) ingest.ingest(dest.getAbsolutePath());
+                notifyHostAfterPublish(dest, normalDest);
                 Logger.i("event=download_original_restored remote=" + pending.remotePath
                         + " local=" + dest.getAbsolutePath());
                 ok = true;
@@ -863,6 +1064,12 @@ public final class DownloadQueue {
                 Logger.i("event=download_skip_local_exists remote=" + pending.remotePath
                         + " local=" + normalDest);
                 markDone(pending.remotePath, pending.target);
+                ok = true;
+                return;
+            }
+            if (!mayDownload(mRemoteSuppress, config, pending.remotePath)) {
+                // 计划之后账本又多了这条（删除线程与下载线程并行）：到 GET 之前再拦一次
+                Logger.i("event=download_skip_suppressed remote=" + pending.remotePath);
                 ok = true;
                 return;
             }
@@ -895,16 +1102,31 @@ public final class DownloadQueue {
                         normalDest, raw);
                 String digest = sha256(raw);
                 File previewDest = previewPathFor(normalDest, config.isPreserveHeicFormat());
-                boolean previewCollision = !samePath(previewDest, normalDest) && previewDest.exists();
+                OriginalStore.Record previewRecord = mOriginalStore.findByRemotePath(config,
+                        pending.remotePath, normalDest);
+                if (previewRecord == null) {
+                    // 原图已被隐藏目录里的副本取代时，记录只按副本路径查得到
+                    previewRecord = mOriginalStore.findByRemotePath(config, pending.remotePath,
+                            previewDest);
+                }
+                // 目标位置上的文件只有是这张照片自己登记过的副本才可以复用或覆盖，别的文件一律不碰。
+                boolean registeredPreview = previewDest.exists()
+                        && mOriginalStore.isRegisteredDerivedCopy(previewRecord, previewDest);
+                boolean previewCollision = !samePath(previewDest, normalDest)
+                        && previewPathOccupiedByAnotherFile(previewRecord, previewDest);
                 File parent = previewDest.getAbsoluteFile().getParentFile();
                 if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
                     throw new IOException("cannot create download directory");
                 }
-                compressed = new File(parent, "." + previewDest.getName() + ".mgs-"
-                        + UUID.randomUUID() + ".tmp");
-                boolean compressedOk = !previewCollision && createCompressedPreview(raw, compressed,
-                        normalDest.getName(), config)
-                        && compressed.length() > 0L && compressed.length() < raw.length();
+                boolean compressedOk = false;
+                boolean previewReusable = registeredPreview
+                        && mOriginalStore.isVerifiedDerivedBytes(previewRecord, previewDest);
+                if (!previewCollision && !previewReusable) {
+                    compressed = new File(parent, "." + previewDest.getName() + ".mgs-"
+                            + UUID.randomUUID() + ".tmp");
+                    compressedOk = createCompressedPreview(raw, compressed, normalDest.getName(), config)
+                            && compressed.length() > 0L && compressed.length() < raw.length();
+                }
                 if (compressedOk) {
                     // Persist the protected final path before it becomes visible to a media scanner.
                     ensureWorkCurrent(config, generation);
@@ -915,11 +1137,20 @@ public final class DownloadQueue {
                     if (!isHighQualityRequested()) {
                         throw new DownloadCancelledException();
                     }
-                    publishStagedFile(compressed, dest);
+                    publishStagedFile(compressed, dest, registeredPreview);
                     compressed = null;
                     Logger.i("event=download_preview_ok remote=" + pending.remotePath
                             + " local=" + dest.getAbsolutePath() + " original=" + raw.length()
                             + " preview=" + dest.length());
+                } else if (previewReusable) {
+                    // 已经是这张照片的副本：不再重新编码，只刷新登记与修改时间。
+                    ensureWorkCurrent(config, generation);
+                    mOriginalStore.registerDownloadedPreview(config, pending.remotePath,
+                            raw.length(), digest, normalDest, previewDest);
+                    dest = previewDest;
+                    setModificationTime(dest, registeredOriginalMtime);
+                    Logger.i("event=download_preview_reused remote=" + pending.remotePath
+                            + " local=" + dest.getAbsolutePath() + " preview=" + dest.length());
                 } else {
                     Logger.i("event=download_preview_skipped reason="
                             + (previewCollision ? "destination_collision" : "unsupported_or_no_savings")
@@ -964,10 +1195,8 @@ public final class DownloadQueue {
             raw.delete();
             raw = null;
             markDone(pending.remotePath, pending.target);
-            Ingest ingest = mIngest;
-            if (ingest != null) {
-                ingest.ingest(dest.getAbsolutePath());
-            }
+            // 质量分支的 dest 在 .gallerysync-slim 里时只能挂到既有云行，不能交给宿主扫描器
+            notifyHostAfterPublish(dest, normalDest);
             Logger.i("event=download_ok remote=" + pending.remotePath
                     + " local=" + dest.getAbsolutePath() + " size=" + dest.length());
             ok = true;
@@ -1035,13 +1264,21 @@ public final class DownloadQueue {
         }
     }
 
-    private static File stageBesideDestination(File source, File dest) throws IOException {
-        File parent = dest.getAbsoluteFile().getParentFile();
+    /**
+     * 在目标文件的同一目录里创建一个隐藏的临时文件名，写入完成后再原子改名成目标。
+     * 空间优化与下载共用这个命名，临时文件永远落在同一个目录里。
+     */
+    public static File stageBesideDestination(File destination) throws IOException {
+        File parent = destination.getAbsoluteFile().getParentFile();
         if (parent == null || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
             throw new IOException("cannot create download directory");
         }
-        File stage = new File(parent, "." + dest.getName() + ".mgs-"
+        return new File(parent, "." + destination.getName() + ".mgs-"
                 + UUID.randomUUID() + ".tmp");
+    }
+
+    private static File stageBesideDestination(File source, File dest) throws IOException {
+        File stage = stageBesideDestination(dest);
         try (FileInputStream in = new FileInputStream(source);
                 FileOutputStream out = new FileOutputStream(stage)) {
             byte[] buffer = new byte[64 * 1024];
@@ -1065,12 +1302,35 @@ public final class DownloadQueue {
     }
 
     private static void publishStagedFile(File staged, File dest) throws IOException {
-        if (dest.exists()) {
+        publishStagedFile(staged, dest, false);
+    }
+
+    /**
+     * replaceRegisteredPreview 只允许在目标位置是这条记录自己登记过的副本时置为 true：
+     * 那时覆盖的是我们以前写下的同名副本，不是用户的文件。
+     */
+    private static void publishStagedFile(File staged, File dest, boolean replaceRegisteredPreview)
+            throws IOException {
+        // 载荷闸门：任何东西在改名进入相册之前，都必须真的是有效介质。压缩预览与原图两条
+        // 发布路径都从这里出去，所以闸门放在这一层；不合规就抛 IOException，
+        // 由 download() 的 catch 分支清理临时文件并按一次失败记账（不发布半成品）。
+        if (!MediaPayload.isUsableMedia(staged)) {
+            Logger.w("event=download_rejected reason=invalid_payload path="
+                    + (staged == null ? "null" : staged.getAbsolutePath())
+                    + " dest=" + (dest == null ? "null" : dest.getAbsolutePath())
+                    + " size=" + (staged == null ? -1L : staged.length()));
+            throw new IOException("download produced an invalid payload");
+        }
+        if (!replaceRegisteredPreview && dest.exists()) {
             throw new IOException("download destination appeared before publish: " + dest);
         }
         // Same-directory moves publish the complete file at once and fail if another file wins
         // the race; never replace a file that appeared after planning.
-        Files.move(staged.toPath(), dest.toPath());
+        if (replaceRegisteredPreview) {
+            Files.move(staged.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        } else {
+            Files.move(staged.toPath(), dest.toPath());
+        }
     }
 
     private static boolean isCompressibleExtension(String name) {
@@ -1089,21 +1349,45 @@ public final class DownloadQueue {
         return previewPathFor(original, true);
     }
 
-    static File previewPathFor(File original, boolean preserveHeic) {
+    /**
+     * 本地高清副本的唯一位置与命名规则：相册目录下的隐藏子目录里放一个与原图同名的文件。
+     * 下载高清图与空间优化都必须调用它，调用方不要再自己拼目录或文件名。
+     * 返回原图路径表示这个类型不产生副本（gif、视频等）。规则幂等：同一张图片永远得到同一个路径。
+     */
+    public static File previewPathFor(File original, boolean preserveHeic) {
         String name = original.getName();
-        String lower = name.toLowerCase(Locale.US);
-        if (isHeicName(name) && preserveHeic) return original;
         if (!isCompressibleExtension(name)) {
-            return original;
-        }
-        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
-            // MiGallery's SlimController uses the source JPEG's own pathname for its optimized
-            // representation. The registry's derived hash protects it until the original returns.
             return original;
         }
         int extension = name.lastIndexOf('.');
         String stem = extension > 0 ? name.substring(0, extension) : name;
-        return new File(original.getParentFile(), stem + ".jpg");
+        String suffix = isHeicName(name) && preserveHeic ? ".heic" : ".jpg";
+        return new File(previewDirectoryFor(original), stem + suffix);
+    }
+
+    /**
+     * 视频瘦身产出的封面图沿用同一规则：隐藏目录里一个与视频同名的 JPEG。
+     * 视频本身不可压缩，所以不走 {@link #previewPathFor}。
+     */
+    public static File videoPosterPathFor(File original) {
+        String name = original.getName();
+        int extension = name.lastIndexOf('.');
+        String stem = extension > 0 ? name.substring(0, extension) : name;
+        return new File(previewDirectoryFor(original), stem + ".jpg");
+    }
+
+    /** 相册目录下的隐藏副本目录；副本路径只从这里派生，不再有第二个目录。 */
+    static File previewDirectoryFor(File original) {
+        File parent = original.getParentFile();
+        if (parent == null) {
+            parent = original.getAbsoluteFile().getParentFile();
+        }
+        return new File(parent == null ? new File(".") : parent, SLIM_DIRECTORY);
+    }
+
+    /** 旧版本把副本放在这个隐藏目录里；新副本目录名相同，判断"是否副本"只能靠注册表。 */
+    static boolean isLegacySlimPath(String path) {
+        return path != null && path.replace('\\', '/').contains("/" + SLIM_DIRECTORY + "/");
     }
 
     private static boolean samePath(File first, File second) {
@@ -1114,9 +1398,12 @@ public final class DownloadQueue {
         }
     }
 
-    static boolean previewPathOccupiedByAnotherFile(File original) {
-        File preview = previewPathFor(original);
-        return !samePath(preview, original) && preview.exists();
+    /**
+     * 计算出来的副本位置是否已被别的文件占用。已经存在的文件只有在它是这张照片自己
+     * 登记过的副本时才不算冲突：那种情况可以直接复用或覆盖，不会留下第二份副本。
+     */
+    private boolean previewPathOccupiedByAnotherFile(OriginalStore.Record record, File previewDest) {
+        return previewDest.exists() && !mOriginalStore.isRegisteredDerivedCopy(record, previewDest);
     }
 
     /**
@@ -1187,8 +1474,7 @@ public final class DownloadQueue {
             ensureWorkCurrent(config, generation);
             publishStagedFile(staged, destination);
             staged = null;
-            Ingest ingest = mIngest;
-            if (ingest != null) ingest.ingest(destination.getAbsolutePath());
+            notifyHostAfterPublish(destination, original);
             Logger.i("event=download_legacy_album_migrated local=" + destination);
         } catch (Throwable t) {
             Logger.w("event=download_legacy_album_migration_failed", t);
@@ -1423,11 +1709,45 @@ public final class DownloadQueue {
     public static boolean createCompressedPreview(File original, File output,
             String originalName, Config config) {
         boolean metadata = config == null || config.isPreserveMetadata();
-        if (isHeicName(originalName) && (config == null || config.isPreserveHeicFormat())) {
-            return HeicPreviewEncoder.encode(original, output, PREVIEW_MAX_EDGE,
-                    PREVIEW_JPEG_QUALITY, metadata);
+        boolean heif = isHeicName(originalName)
+                && (config == null || config.isPreserveHeicFormat());
+        boolean encoded = heif
+                ? HeicPreviewEncoder.encode(original, output, PREVIEW_MAX_EDGE,
+                        PREVIEW_JPEG_QUALITY, metadata)
+                : createCompressedPreview(original, output, metadata);
+        if (encoded && metadata) {
+            embedPreviewColorProfile(original, output, heif);
         }
-        return createCompressedPreview(original, output, metadata);
+        return encoded;
+    }
+
+    /**
+     * Carry the source ICC into the preview. The preview pixels are already converted to sRGB, so
+     * only an sRGB-shaped profile may be attached; anything else would tint the preview. Embedding
+     * is best effort and never changes the result of preview creation.
+     */
+    private static void embedPreviewColorProfile(File original, File output, boolean heif) {
+        String format = heif ? "heif" : "jpeg";
+        try {
+            byte[] icc = IccProfile.extract(original);
+            if (icc == null) {
+                return;
+            }
+            if (!IccProfile.isSrgbCompatible(icc)) {
+                Logger.i("event=preview_icc_skipped reason=non_srgb");
+                return;
+            }
+            boolean injected = heif
+                    ? IccInjector.injectHeif(output, icc)
+                    : IccInjector.injectJpeg(output, icc);
+            if (injected) {
+                Logger.i("event=preview_icc_embedded format=" + format + " bytes=" + icc.length);
+            } else {
+                Logger.w("event=preview_icc_inject_failed format=" + format);
+            }
+        } catch (Throwable t) {
+            Logger.w("event=preview_icc_inject_failed format=" + format, t);
+        }
     }
 
     /** Create a JPEG preview with optional allowlisted EXIF copying. */

@@ -3,6 +3,7 @@ package com.tongluosao.gallerysync.core;
 import android.content.Context;
 
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -238,6 +239,8 @@ public final class OriginalStore {
                 || uploadedLength <= 0 || !isSha256(uploadedSha256)) {
             throw new IOException("cannot register missing uploaded original fingerprint");
         }
+        requireUsablePayload(localOriginal, "uploaded_original");
+        requireNonZeroDigest(uploadedSha256, uploadedLength, "uploaded_original");
         persist(new Record(targetKey(config), remotePath, uploadedLength,
                 uploadedSha256.toLowerCase(Locale.US), canonical(localOriginal), null, rowId, sha1,
                 uploadedMtime, Collections.emptySet()));
@@ -254,6 +257,8 @@ public final class OriginalStore {
         if (localOriginal.length() != originalLength || !digest.equals(sha256(localOriginal))) {
             throw new IOException("download original changed before registration");
         }
+        requireUsablePayload(localOriginal, "downloaded_original");
+        requireNonZeroDigest(digest, originalLength, "downloaded_original");
         persist(new Record(targetKey(config), remotePath, originalLength, digest,
                 canonical(localOriginal), null, null, null, localOriginal.lastModified(),
                 Collections.emptySet()));
@@ -267,6 +272,8 @@ public final class OriginalStore {
                 || !originalSha256.equals(sha256(stagedOriginal))) {
             throw new IOException("staged download changed before registration");
         }
+        requireUsablePayload(stagedOriginal, "downloaded_original");
+        requireNonZeroDigest(originalSha256, originalLength, "downloaded_original");
         persist(new Record(targetKey(config), remotePath, originalLength, originalSha256,
                 canonical(finalPath), null, null, null, 0L, Collections.emptySet()));
     }
@@ -295,12 +302,19 @@ public final class OriginalStore {
         if (stagedPreview != null && (!stagedPreview.isFile() || stagedPreview.length() <= 0)) {
             throw new IOException("staged preview is missing");
         }
+        String stagedDigest = null;
+        if (stagedPreview != null) {
+            requireUsablePayload(stagedPreview, "staged_preview");
+            stagedDigest = sha256(stagedPreview);
+            requireNonZeroDigest(stagedDigest, stagedPreview.length(), "staged_preview");
+        }
+        requireNonZeroDigest(originalSha256, originalLength, "downloaded_preview");
         String path = canonical(preview);
         Record record = new Record(targetKey(config), remotePath, originalLength, originalSha256,
                 originalDestination == null ? null : canonical(originalDestination),
                 path, null, null, 0L, Collections.singleton(path));
-        if (stagedPreview != null) {
-            record = record.withDerivedHash(sha256(stagedPreview), stagedPreview.length());
+        if (stagedDigest != null) {
+            record = record.withDerivedHash(stagedDigest, stagedPreview.length());
         }
         persist(record);
     }
@@ -839,6 +853,46 @@ public final class OriginalStore {
         return false;
     }
 
+    /**
+     * 该路径是否只是这条记录登记过的本地副本（路径或字节指纹）。
+     * 下载与瘦身共用这一判断：只有它可以被就地覆盖，别的文件一律不碰。
+     */
+    public boolean isRegisteredDerivedCopy(Record record, File path) {
+        return isRegisteredDerivedPath(record, path) || isVerifiedDerivedBytes(record, path);
+    }
+
+    /**
+     * 只按路径判断：该文件是否是这条记录登记过的副本路径（预览 / 下载镜像 / 瘦身副本）。
+     * 纯路径比较、不做任何哈希，可以安全地在主线程的菜单可见性钩子里对每个 item 调用；
+     * 需要按字节指纹确认副本时用 {@link #isRegisteredDerivedCopy(Record, File)}。
+     */
+    public boolean isRegisteredDerivedPath(Record record, File path) {
+        if (record == null || path == null) {
+            return false;
+        }
+        String canonicalPath;
+        try {
+            canonicalPath = canonical(path);
+        } catch (IOException e) {
+            return false;
+        }
+        return record.derivedPaths.contains(canonicalPath)
+                || canonicalPath.equals(record.previewLocalPath);
+    }
+
+    /** 该文件是否就是这条记录里登记过的副本字节：是的话可以直接复用，不必重新编码。 */
+    public boolean isVerifiedDerivedBytes(Record record, File path) {
+        if (record == null || path == null || !path.isFile() || path.length() <= 0L) {
+            return false;
+        }
+        try {
+            Long expectedLength = record.derivedHashes.get(sha256(path));
+            return expectedLength != null && expectedLength.longValue() == path.length();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     /** Exact reserved mirror root; this remains a safety net even if registry writes fail. */
     public static boolean isReservedDownloadPath(String canonicalPath) {
         if (canonicalPath == null) {
@@ -863,6 +917,45 @@ public final class OriginalStore {
         return (id != null || hash != null) && (idMatches || shaMatches);
     }
 
+    /**
+     * “下载原图”菜单判据（纯逻辑，单测直接覆盖）：本地这份文件是否还需要从 WebDAV 取回原图。
+     *
+     * <p>注册表里有记录只说明这张照片做过云备份登记（上传成功即登记），并不表示本地原图被删过；
+     * 从未优化过的普通照片，本地文件就是完整原图，必须判成“不需要恢复”，菜单不显示。
+     *
+     * <p>判定顺序按代价从低到高，主线程绝不为了菜单哈希整个原图：
+     * <ol>
+     *   <li>{@code originalLength <= 0}：没登记原图大小，菜单没有意义 → false；</li>
+     *   <li>本地文件不存在（空间优化成功后原图被删）→ true；</li>
+     *   <li>该路径就是记录登记的派生副本/预览（{@code .gallerysync-slim}）→ true；</li>
+     *   <li>本地长度 != {@code originalLength} → true；</li>
+     *   <li>长度一致且调用方已算好 sha256 时再比摘要，不一致 → true；</li>
+     *   <li>长度一致、非登记副本、没有摘要可比 → false，本地就是完整原图。</li>
+     * </ol>
+     * 同长度原位替换属于极小概率：真发生时恢复流程自己还会校验远端长度与 SHA-256，
+     * 因此菜单侧不再为此额外读盘。
+     */
+    public static boolean needsOriginalRestore(long originalLength, String originalSha256,
+            boolean localFileExists, long localLength, boolean registeredDerivedCopy,
+            String knownLocalSha256) {
+        if (originalLength <= 0L) {
+            return false;
+        }
+        if (!localFileExists) {
+            return true;
+        }
+        if (registeredDerivedCopy) {
+            return true;
+        }
+        if (localLength != originalLength) {
+            return true;
+        }
+        if (knownLocalSha256 != null && originalSha256 != null && !originalSha256.isEmpty()) {
+            return !originalSha256.equalsIgnoreCase(knownLocalSha256);
+        }
+        return false;
+    }
+
     private void register(Config config, String remotePath, File source, File preview,
             File localOriginal, String rowId, String sha1) throws IOException {
         if (config == null || remotePath == null || remotePath.isEmpty() || source == null
@@ -870,7 +963,9 @@ public final class OriginalStore {
             throw new IOException("cannot register missing original");
         }
         long length = source.length();
+        requireUsablePayload(source, "uploaded_original");
         String digest = sha256(source);
+        requireNonZeroDigest(digest, length, "uploaded_original");
         String originalPath = localOriginal == null ? null : canonical(localOriginal);
         String previewPath = preview == null ? null : canonical(preview);
         Set<String> derived = previewPath == null
@@ -919,7 +1014,6 @@ public final class OriginalStore {
     }
 
     private void saveLocked() throws IOException {
-        File tmp = new File(mFile.getParentFile(), FILE_NAME + ".tmp");
         try {
             JSONObject root = new JSONObject();
             root.put("version", 1);
@@ -957,25 +1051,61 @@ public final class OriginalStore {
                 records.put(item);
             }
             root.put("records", records);
+            writeJsonAtomically(mFile, FILE_NAME, root);
+            mHealthy = true;
+        } catch (Throwable t) {
+            mHealthy = false;
+            throw new IOException("cannot persist original registry", t);
+        }
+    }
+
+    /**
+     * 原子写 JSON：临时文件 + fsync + 改名。
+     *
+     * <p>{@link RemoteSuppress} 的抑制账本用同一套写法（同目录、同风格）：
+     * 两个账本都是"写一半就断电"会读坏的文件，而读坏之后行为会悄悄退化，
+     * 所以只能靠改名来保证磁盘上永远是完整的一份。
+     */
+    static void writeJsonAtomically(File file, String fileName, JSONObject root)
+            throws IOException {
+        if (file == null) {
+            throw new IOException("no ledger file configured");
+        }
+        File tmp = new File(file.getParentFile(), fileName + ".tmp");
+        try {
             try (FileOutputStream out = new FileOutputStream(tmp)) {
                 out.write(root.toString().getBytes(StandardCharsets.UTF_8));
                 out.getFD().sync();
             }
             try {
-                Files.move(tmp.toPath(), mFile.toPath(), StandardCopyOption.ATOMIC_MOVE,
+                Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE,
                         StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException atomicFailure) {
-                Files.move(tmp.toPath(), mFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
-            mHealthy = true;
         } catch (Throwable t) {
-            mHealthy = false;
             try {
                 Files.deleteIfExists(tmp.toPath());
             } catch (Throwable ignored) {
-                // The failed registry remains fail-closed for uploads.
+                // A half-written ledger must never be left behind under the real name.
             }
-            throw new IOException("cannot persist original registry", t);
+            if (t instanceof IOException) {
+                throw (IOException) t;
+            }
+            throw new IOException("cannot persist ledger " + fileName, t);
+        }
+    }
+
+    /** 读 JSON 文件；"读不出来"由调用方决定是兜底还是失败。 */
+    static JSONObject readJsonFile(File file) throws IOException {
+        if (file == null) {
+            throw new IOException("no ledger file configured");
+        }
+        try {
+            return new JSONObject(new String(Files.readAllBytes(file.toPath()),
+                    StandardCharsets.UTF_8));
+        } catch (JSONException invalid) {
+            throw new IOException("invalid ledger json " + file.getName(), invalid);
         }
     }
 
@@ -984,8 +1114,7 @@ public final class OriginalStore {
             return;
         }
         try {
-            JSONObject root = new JSONObject(new String(Files.readAllBytes(mFile.toPath()),
-                    StandardCharsets.UTF_8));
+            JSONObject root = readJsonFile(mFile);
             JSONArray records = root.optJSONArray("records");
             if (records == null || records.length() > MAX_RECORDS) {
                 throw new IOException("invalid original registry record list");
@@ -1071,6 +1200,28 @@ public final class OriginalStore {
                 Logger.d("event=original_verify_temp_cleanup_failed path="
                         + remoteCopy.getAbsolutePath());
             }
+        }
+    }
+
+    /**
+     * 登记闸门：空 / 全 0 / 缺签名的内容绝不进登记表。
+     *
+     * <p>2026-10 事故：{@code originals.json} 里有 24 条记录的 {@code sha256} 恰好等于
+     * SHA256(N 个 0)，也就是"空内容"被当成正常原件登记了。这里在写盘之前拦住。
+     */
+    private static void requireUsablePayload(File file, String role) {
+        if (!MediaPayload.isUsableMedia(file)) {
+            throw new IllegalStateException("cannot register invalid payload role=" + role
+                    + " path=" + (file == null ? "null" : file.getAbsolutePath())
+                    + " size=" + (file == null ? -1L : file.length()));
+        }
+    }
+
+    /** 摘要等于"全 0 内容"的 SHA-256 时，这条记录描述的不是一张照片。 */
+    private static void requireNonZeroDigest(String sha256, long length, String role) {
+        if (MediaPayload.isZeroDigest(sha256, length)) {
+            throw new IllegalStateException("cannot register invalid payload role=" + role
+                    + " reason=zero_digest length=" + length);
         }
     }
 

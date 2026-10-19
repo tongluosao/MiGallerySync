@@ -231,26 +231,41 @@ final class SlimHook {
             return 0L;
         }
 
-        File parent;
+        // 下载高清图与空间优化共用同一个副本路径：隐藏目录里一个与原图同名的文件。
+        File preview;
         try {
-            parent = previewDirectory(original);
-        } catch (IOException e) {
-            Logger.w("event=slim_skipped reason=preview_directory_unavailable path=" + item.path);
+            preview = item.serverType == 1
+                    ? DownloadQueue.previewPathFor(original, config.isPreserveHeicFormat())
+                    : DownloadQueue.videoPosterPathFor(original);
+        } catch (Throwable t) {
+            Logger.w("event=slim_skipped reason=preview_path_unavailable path=" + item.path);
             return 0L;
         }
+        if (item.serverType == 1 && isSameFile(preview, original)) {
+            // 不可压缩的类型没有同名副本可写，绝不覆盖原图字节，交给相册自己的流程。
+            Logger.i("event=slim_skipped reason=unsupported_preview_format path=" + item.path);
+            return 0L;
+        }
+        File parent = preview.getAbsoluteFile().getParentFile();
         if (parent == null || (!parent.exists() && !parent.mkdirs())) {
             Logger.w("event=slim_skipped reason=preview_directory_unavailable path=" + item.path);
             return 0L;
         }
+        // 目标位置上只允许覆盖这张照片自己登记过的旧副本；任何别的文件都不碰。
+        if (preview.exists() && !store.isRegisteredDerivedCopy(record, preview)) {
+            Logger.w("event=slim_skipped reason=destination_occupied path=" + item.path
+                    + " preview=" + preview.getAbsolutePath());
+            return 0L;
+        }
         File staged = null;
-        File preview = null;
         OriginalStore.PathLease originalLease = null;
         OriginalStore.PathLease previewLease = null;
-        boolean previewPublished = false;
+        // 只有三步都成立才算落地：文件已发布、DB 已确认、原图已删除。
+        // 中间任何一步失败都把刚发布的副本删掉，原图字节保持不动。
+        boolean previewReplaced = false;
+        boolean previewCommitted = false;
         try {
-            String previewSuffix = item.serverType == 1 && DownloadQueue.isHeicName(original.getName())
-                    && config.isPreserveHeicFormat() ? ".heic" : ".jpg";
-            staged = File.createTempFile(".slim-", previewSuffix, parent);
+            staged = DownloadQueue.stageBesideDestination(preview);
             boolean previewCreated = item.serverType == 1
                     ? DownloadQueue.createCompressedPreview(original, staged, original.getName(), config)
                     : createNativeVideoPoster(original, staged, parent, item);
@@ -275,18 +290,11 @@ final class SlimHook {
                 return 0L;
             }
 
-            // Create an exclusive, unique destination. Replacing this placeholder publishes only
-            // a path allocated by this operation, never an existing user's file.
-            preview = File.createTempFile(".slim-preview-", previewSuffix, parent);
             // Persist the final path and hold its write lease before publishing the preview. The
             // post-move registration stores its fingerprint for future upload classification.
-            if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
-                Logger.w("event=slim_skipped reason=preview_registration_failed path=" + item.path);
-                return 0L;
-            }
             previewLease = store.beginDerivedMutation(config, item.rowId, item.sha1, preview);
             if (previewLease == null) {
-                Logger.w("event=slim_skipped reason=preview_lease_unavailable path=" + item.path);
+                Logger.w("event=slim_skipped reason=preview_registration_failed path=" + item.path);
                 return 0L;
             }
 
@@ -298,8 +306,8 @@ final class SlimHook {
                 }
 
                 publish(staged, preview);
+                previewReplaced = true;
                 PreviewFileTime.copyModifiedTime(original, preview);
-                previewPublished = true;
                 if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
                     Logger.w("event=slim_db_update_skipped reason=preview_fingerprint_failed path="
                             + item.path);
@@ -320,6 +328,7 @@ final class SlimHook {
                             + " preview=" + preview.getAbsolutePath());
                     return 0L;
                 }
+                previewCommitted = true;
                 // Native publication may touch the thumbnail; keep screenshot chronology even
                 // when no EXIF capture date exists.
                 PreviewFileTime.copyModifiedTime(original, preview);
@@ -358,8 +367,10 @@ final class SlimHook {
             if (staged != null && staged.exists() && !staged.delete()) {
                 Logger.d("event=slim_temp_cleanup_failed path=" + staged.getAbsolutePath());
             }
-            if (!previewPublished && preview != null && preview.exists() && !preview.delete()) {
-                Logger.d("event=slim_placeholder_cleanup_failed path=" + preview.getAbsolutePath());
+            // 发布成功但 DB 没有确认：撤掉这次写下的副本，原图仍在，照片不会悬空。
+            if (previewReplaced && !previewCommitted && !isSameFile(preview, original)
+                    && preview.isFile() && !preview.delete()) {
+                Logger.d("event=slim_rollback_cleanup_failed path=" + preview.getAbsolutePath());
             }
             if (previewLease != null) previewLease.close();
             if (originalLease != null) originalLease.close();
@@ -493,12 +504,6 @@ final class SlimHook {
         }
     }
 
-    private static File previewDirectory(File original) throws IOException {
-        File parent = original.getAbsoluteFile().getParentFile();
-        if (parent == null) throw new IOException("original has no parent directory");
-        return new File(parent, ".gallerysync-slim");
-    }
-
     private static void publish(File staged, File destination) throws IOException {
         try {
             Files.move(staged.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE,
@@ -535,6 +540,15 @@ final class SlimHook {
             return expected.equals(path.getCanonicalPath());
         } catch (IOException e) {
             return false;
+        }
+    }
+
+    private static boolean isSameFile(File first, File second) {
+        if (first == null || second == null) return first == second;
+        try {
+            return first.getCanonicalPath().equals(second.getCanonicalPath());
+        } catch (IOException e) {
+            return first.getAbsoluteFile().equals(second.getAbsoluteFile());
         }
     }
 

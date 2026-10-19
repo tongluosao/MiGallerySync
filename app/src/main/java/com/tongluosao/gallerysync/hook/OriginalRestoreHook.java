@@ -34,6 +34,9 @@ final class OriginalRestoreHook {
     private static final String DOWNLOAD_MENU = "com.miui.gallery.ui.photoPage.bars.menuitem.DownloadOriginal";
     private static final String MENU_HOLDER = "com.miui.gallery.ui.photoPage.bars.PhotoPageMenuManager$MenuItemHolder";
     private static final String MENU_ITEM_TYPE = "com.miui.gallery.ui.photoPage.bars.PhotoPageMenuManager$MenuItemType";
+    /** BaseDataItem 上可能指向本机完整原图的候选路径，顺序即优先级。 */
+    private static final String[] ITEM_LOCAL_PATH_GETTERS =
+            {"getOriginalPath", "getThumnailPath", "getMicroPath"};
     private static final ThreadLocal<Request> ACTIVE_REQUEST = new ThreadLocal<>();
 
     private final XposedInterface mXposed;
@@ -498,9 +501,11 @@ final class OriginalRestoreHook {
                         Object dataItem = chain.getArg(0);
                         if (!menuRestoreReady() || dataItem == null) return chain.proceed();
                         try {
-                            OriginalStore.Record record = recordForItem(dataItem, store(), mConfig);
+                            OriginalStore store = store();
+                            OriginalStore.Record record = recordForItem(dataItem, store, mConfig);
                             if (record == null || record.originalLength <= 0
-                                    || Boolean.TRUE.equals(optionalCall(dataItem, "isBurstItem"))) {
+                                    || Boolean.TRUE.equals(optionalCall(dataItem, "isBurstItem"))
+                                    || !localBytesNeedRestore(dataItem, store, record)) {
                                 return chain.proceed();
                             }
                             Context context = HostContext.get(mLoader);
@@ -561,7 +566,7 @@ final class OriginalRestoreHook {
                         if (delegate != null && DOWNLOAD_MENU.equals(delegate.getClass().getName())
                                 && menuRestoreReady()) {
                             Object currentDataItem = currentItemFromMenu(delegate);
-                            if (managedItem(currentDataItem)) {
+                            if (restorableItem(currentDataItem)) {
                                 // MenuItemHolder.lambda$refreshUI$11 checks visibility before
                                 // dispatching onFilterFinished, so managed items must pass this
                                 // gate once the provider exposes the current BaseDataItem.
@@ -592,7 +597,7 @@ final class OriginalRestoreHook {
                                     != ((MenuItem) menuItem).getItemId()) {
                                 return chain.proceed();
                             }
-                            if (managedItem(currentItemFromMenu(delegate))) {
+                            if (restorableItem(currentItemFromMenu(delegate))) {
                                 Logger.d("event=managed_original_bottom_visibility_forced");
                                 return true;
                             }
@@ -606,7 +611,7 @@ final class OriginalRestoreHook {
                     .intercept(chain -> {
                         Object result = chain.proceed();
                         Object dataItem = chain.getArg(0);
-                        if (mOriginHookReady && mImageLoaderHookReady && managedItem(dataItem)) {
+                        if (mOriginHookReady && mImageLoaderHookReady && restorableItem(dataItem)) {
                             try {
                                 // Keep Gallery's per-item title when initialized, then force the
                                 // visible/enabled state through the overload without its
@@ -649,23 +654,55 @@ final class OriginalRestoreHook {
         }
     }
 
-    private boolean managedItem(Object item) {
+    /**
+     * “下载原图”只在本地确实缺少完整原图时出现。
+     *
+     * <p>旧判据只是“该 item 在注册表里有记录”，但上传成功就会登记，因此从未优化过的普通照片
+     * （本地文件就是完整原图）也满足条件，菜单与标题会错误地显示原图大小。
+     * 现在记录之后再加一道 {@link #localBytesNeedRestore} 物理判定：本地已有完整原图 → 不显示。
+     */
+    private boolean restorableItem(Object item) {
         if (!mOriginHookReady || !mImageLoaderHookReady || item == null) return false;
         Config config = mConfig;
         if (config == null || !config.isReady()) return false;
+        OriginalStore store = store();
         try {
-            return recordForItem(item, store(), config) != null;
+            OriginalStore.Record record = recordForItem(item, store, config);
+            return record != null && localBytesNeedRestore(item, store, record);
         } catch (Throwable t) {
             Logger.d("event=managed_original_lookup_failed detail=" + t);
             return false;
         }
     }
 
+    /**
+     * item 的任一本机候选路径本身就是完整原图（存在、不是登记过的派生副本、长度等于登记原图
+     * 长度）→ 不需要恢复。空间优化成功后 Gallery 会把 thumbnailFile 指向 .gallerysync-slim
+     * 副本、localFile 清空，所以原图路径缺失、缩略图路径是登记副本，两者都判成“需要恢复”。
+     *
+     * <p>只做路径与长度判定（{@link OriginalStore#isRegisteredDerivedPath} 不哈希），主线程安全。
+     */
+    private boolean localBytesNeedRestore(Object item, OriginalStore store,
+            OriginalStore.Record record) throws Exception {
+        for (String getter : ITEM_LOCAL_PATH_GETTERS) {
+            File file = localFileFromPath(optionalStringCall(item, getter));
+            if (file == null) continue;
+            boolean exists = file.isFile();
+            boolean derived = exists && store != null
+                    && store.isRegisteredDerivedPath(record, file);
+            if (!OriginalStore.needsOriginalRestore(record.originalLength, record.sha256,
+                    exists, exists ? file.length() : 0L, derived, null)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private OriginalStore.Record recordForItem(Object item, OriginalStore store, Config config)
             throws Exception {
         if (store == null || config == null || item == null) return null;
         String target = OriginalStore.targetKey(config);
-        for (String getter : new String[]{"getOriginalPath", "getThumnailPath", "getMicroPath"}) {
+        for (String getter : ITEM_LOCAL_PATH_GETTERS) {
             String path = optionalStringCall(item, getter);
             if (path == null || path.isEmpty()) continue;
             File localFile = localFileFromPath(path);
