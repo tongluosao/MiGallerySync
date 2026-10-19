@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -172,6 +173,18 @@ public final class OriginalStore {
                     derivedPaths, aliases, localAliases, derivedHashes);
         }
 
+        private Record withRenamedDerivedAlias(String path, String nextRowId, String nextSha1) {
+            Set<String> paths = new LinkedHashSet<>(derivedPaths);
+            paths.add(path);
+            Set<String> aliases = new LinkedHashSet<>(localAliases);
+            aliases.add(path);
+            Set<String> allIdentities = new LinkedHashSet<>(identities);
+            addIdentity(allIdentities, nextRowId, nextSha1);
+            return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
+                    previewLocalPath, rowId, sha1, originalLocalMtime, paths, allIdentities,
+                    aliases, derivedHashes);
+        }
+
         private Record withDerivedPath(String path) {
             Set<String> paths = new LinkedHashSet<>(derivedPaths);
             paths.add(path);
@@ -199,7 +212,8 @@ public final class OriginalStore {
             aliases.add(path);
             String preview = path.equals(previewLocalPath) ? null : previewLocalPath;
             return new Record(target, remotePath, originalLength, sha256, path, preview,
-                    rowId, sha1, file.lastModified(), paths, identities, aliases, derivedHashes);
+                    rowId, sha1, originalLocalMtime > 0L ? originalLocalMtime : file.lastModified(),
+                    paths, identities, aliases, derivedHashes);
         }
     }
 
@@ -355,6 +369,41 @@ public final class OriginalStore {
         return bindIdentity(localPath, rowId, sha1);
     }
 
+    /**
+     * Register a scanner-renamed file only when it still matches a known derived fingerprint.
+     * The record key pins the operation to the captured target, remote path, and original digest.
+     */
+    public boolean registerRenamedDerivedAlias(Record expected, File newPath, String rowId,
+            String sha1, String expectedHash, long expectedLength) throws IOException {
+        if (expected == null || newPath == null || expectedLength <= 0L
+                || !isSha256(expectedHash)
+                || (clean(rowId) == null && clean(sha1) == null)) {
+            return false;
+        }
+        String digest = expectedHash.toLowerCase(Locale.US);
+        Long capturedLength = expected.derivedHashes.get(digest);
+        if (capturedLength == null || capturedLength.longValue() != expectedLength) {
+            return false;
+        }
+        String path = canonical(newPath);
+        synchronized (mLock) {
+            requireHealthyLocked();
+            String key = recordKey(expected);
+            Record current = mRecords.get(key);
+            if (current == null) return false;
+            Long currentLength = current.derivedHashes.get(digest);
+            if (currentLength == null || currentLength.longValue() != expectedLength
+                    || !newPath.isFile() || newPath.length() != expectedLength
+                    || !digest.equals(sha256(newPath))) {
+                return false;
+            }
+            Record updated = current.withRenamedDerivedAlias(path, rowId, sha1);
+            mRecords.put(key, updated);
+            saveLocked();
+            return true;
+        }
+    }
+
     /** Find a mapping by any known local original, preview, or derived path. */
     public Record findByLocalPath(File localPath) {
         if (localPath == null) {
@@ -479,19 +528,11 @@ public final class OriginalStore {
         }
         PathLease restoreLease = lockPath(destination, true);
         try {
-        if (destination.isFile() && destination.length() == record.originalLength
-                && record.sha256.equals(sha256(destination))) {
+        RestoreDestinationSnapshot initial = snapshotRestoreDestination(record, destination);
+        if (initial.original) {
+            restoreOriginalTimestamp(record, destination);
             saveRestoredLocal(config, record, destination);
             return destination;
-        }
-        if (destination.exists()) {
-            // Never replace unrelated or user-edited bytes, even when the remote is valid.
-            String currentHash = sha256(destination);
-            Long derivedLength = record.derivedHashes.get(currentHash);
-            if (!containsLocalPath(record, canonical(destination)) || derivedLength == null
-                    || derivedLength.longValue() != destination.length()) {
-                throw new IOException("restore destination contains unrecognized local bytes");
-            }
         }
         File parent = destination.getAbsoluteFile().getParentFile();
         if (parent != null && !parent.exists() && !parent.mkdirs()) {
@@ -506,11 +547,32 @@ public final class OriginalStore {
                     || !record.sha256.equals(sha256(staged))) {
                 throw new IOException("remote original failed length or SHA-256 verification");
             }
+            RestoreDestinationSnapshot beforePublish = snapshotRestoreDestination(record,
+                    destination);
+            if (beforePublish.original) {
+                restoreOriginalTimestamp(record, destination);
+                saveRestoredLocal(config, record, destination);
+                return destination;
+            }
+            if (!canPublishOver(initial, beforePublish)) {
+                throw new IOException("restore destination changed during download");
+            }
             try {
+                if (recheckRestoreDestinationBeforePublish(record, destination, beforePublish)) {
+                    restoreOriginalTimestamp(record, destination);
+                    saveRestoredLocal(config, record, destination);
+                    return destination;
+                }
                 Files.move(staged.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE,
                         StandardCopyOption.REPLACE_EXISTING);
             } catch (IOException atomicFailure) {
                 try {
+                    if (recheckRestoreDestinationBeforePublish(record, destination,
+                            beforePublish)) {
+                        restoreOriginalTimestamp(record, destination);
+                        saveRestoredLocal(config, record, destination);
+                        return destination;
+                    }
                     Files.move(staged.toPath(), destination.toPath(),
                             StandardCopyOption.REPLACE_EXISTING);
                 } catch (IOException moveFailure) {
@@ -518,6 +580,7 @@ public final class OriginalStore {
                     throw moveFailure;
                 }
             }
+            restoreOriginalTimestamp(record, destination);
             saveRestoredLocal(config, record, destination);
             return destination;
         } finally {
@@ -528,6 +591,100 @@ public final class OriginalStore {
         }
         } finally {
             restoreLease.close();
+        }
+    }
+
+    /** Snapshot only missing paths or exact registered bytes before a restore can replace them. */
+    private static RestoreDestinationSnapshot snapshotRestoreDestination(Record record,
+            File destination) throws IOException {
+        if (!Files.exists(destination.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            return RestoreDestinationSnapshot.missing();
+        }
+        if (!destination.isFile()) {
+            throw new IOException("restore destination contains unrecognized local bytes");
+        }
+        long length = destination.length();
+        long modified = destination.lastModified();
+        String digest = sha256(destination);
+        if (!destination.isFile() || destination.length() != length
+                || destination.lastModified() != modified) {
+            throw new IOException("restore destination changed during verification");
+        }
+        if (length == record.originalLength && record.sha256.equals(digest)) {
+            return RestoreDestinationSnapshot.original();
+        }
+        Long derivedLength = record.derivedHashes.get(digest);
+        if (!containsLocalPath(record, canonical(destination)) || derivedLength == null
+                || derivedLength.longValue() != length) {
+            throw new IOException("restore destination contains unrecognized local bytes");
+        }
+        return RestoreDestinationSnapshot.derived(digest, length, modified);
+    }
+
+    /** Recheck immediately before each move, accepting only unchanged bytes or a finished restore. */
+    private static boolean recheckRestoreDestinationBeforePublish(Record record, File destination,
+            RestoreDestinationSnapshot expected) throws IOException {
+        RestoreDestinationSnapshot current = snapshotRestoreDestination(record, destination);
+        if (current.original) return true;
+        if (!sameRestoreDestination(expected, current)) {
+            throw new IOException("restore destination changed before publish");
+        }
+        return false;
+    }
+
+    private static boolean canPublishOver(RestoreDestinationSnapshot initial,
+            RestoreDestinationSnapshot current) {
+        if (initial.missing) {
+            // A concurrently created copy is replaceable only when it is already registered.
+            return current.missing || current.derived;
+        }
+        return sameRestoreDestination(initial, current);
+    }
+
+    private static boolean sameRestoreDestination(RestoreDestinationSnapshot first,
+            RestoreDestinationSnapshot second) {
+        if (first.missing || second.missing) return first.missing && second.missing;
+        return first.derived && second.derived && first.length == second.length
+                && first.modified == second.modified && first.sha256.equals(second.sha256);
+    }
+
+    private static final class RestoreDestinationSnapshot {
+        final boolean missing;
+        final boolean original;
+        final boolean derived;
+        final long length;
+        final long modified;
+        final String sha256;
+
+        private RestoreDestinationSnapshot(boolean missing, boolean original, boolean derived,
+                long length, long modified, String sha256) {
+            this.missing = missing;
+            this.original = original;
+            this.derived = derived;
+            this.length = length;
+            this.modified = modified;
+            this.sha256 = sha256;
+        }
+
+        static RestoreDestinationSnapshot missing() {
+            return new RestoreDestinationSnapshot(true, false, false, 0L, 0L, "");
+        }
+
+        static RestoreDestinationSnapshot original() {
+            return new RestoreDestinationSnapshot(false, true, false, 0L, 0L, "");
+        }
+
+        static RestoreDestinationSnapshot derived(String sha256, long length, long modified) {
+            return new RestoreDestinationSnapshot(false, false, true, length, modified, sha256);
+        }
+    }
+
+    private static void restoreOriginalTimestamp(Record record, File destination)
+            throws IOException {
+        if (record.originalLocalMtime > 0L
+                && destination.lastModified() != record.originalLocalMtime
+                && !destination.setLastModified(record.originalLocalMtime)) {
+            throw new IOException("cannot restore original file modification time");
         }
     }
 

@@ -80,12 +80,17 @@ final class OriginalStoreInstrumentationScenario {
             }
             require(Arrays.equals(original, readAll(downloaded)),
                     "fake DAV GET did not preserve the source JPEG bytes");
+            long originalFileTime = 1680000000000L;
+            require(downloaded.setLastModified(originalFileTime),
+                    "could not prepare original file timestamp");
 
             require(DownloadQueue.createCompressedPreview(downloaded, preview),
                     "production HQ preview generation failed");
             require(preview.isFile() && preview.length() > 0L
                             && preview.length() < downloaded.length(),
                     "generated preview was not smaller than the original");
+            require(preview.lastModified() == originalFileTime,
+                    "generated preview lost its original file timestamp");
             ExifInterface previewExif = new ExifInterface(preview.getAbsolutePath());
             require(SYNTHETIC_CAPTURE_DATE.equals(
                             previewExif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)),
@@ -106,6 +111,8 @@ final class OriginalStoreInstrumentationScenario {
             File noMetadataPreview = new File(work, "preview-no-metadata.jpg");
             require(DownloadQueue.createCompressedPreview(downloaded, noMetadataPreview, false),
                     "preview generation with metadata preservation disabled failed");
+            require(noMetadataPreview.lastModified() == originalFileTime,
+                    "metadata-disabled preview changed screenshot fallback time");
             ExifInterface noMetadataExif = new ExifInterface(noMetadataPreview.getAbsolutePath());
             require(noMetadataExif.getAttribute(ExifInterface.TAG_MAKE) == null
                             && noMetadataExif.getAttribute(ExifInterface.TAG_GPS_LATITUDE) == null,
@@ -119,6 +126,9 @@ final class OriginalStoreInstrumentationScenario {
             copy(preview, stagedPreview);
 
             OriginalStore store = isolatedStore(storeDir);
+            // Space optimization starts from an already verified local original, whose file
+            // timestamp must survive a later preview registration and restore.
+            store.registerUploadedOriginal(config, REMOTE_PATH, downloaded, ROW_ID, rowSha1);
             store.registerDownloadedPreview(config, REMOTE_PATH, original.length,
                     originalHash, downloaded, preview, stagedPreview);
             require(store.bindIdentity(preview, ROW_ID, rowSha1),
@@ -134,6 +144,24 @@ final class OriginalStoreInstrumentationScenario {
                     "persisted marker did not protect preview/derived paths after reload");
             require(Arrays.equals(readAll(preview), readAll(derived)),
                     "derived replacement did not finish after upload lease release");
+            File renamedPreview = new File(work, "renamed-preview.jpg");
+            copy(preview, renamedPreview);
+            OriginalStore.Record beforeRename = reloaded.find(config, ROW_ID, rowSha1);
+            String renamedSha1 = digest("SHA-1", readAll(renamedPreview));
+            require(reloaded.registerRenamedDerivedAlias(beforeRename, renamedPreview,
+                            "synthetic-renamed", renamedSha1,
+                            sha256(readAll(renamedPreview)), renamedPreview.length()),
+                    "verified renamed preview did not bind its original identity");
+            require(reloaded.isProtectedUpload(renamedPreview, "synthetic-renamed", renamedSha1),
+                    "renamed preview lost upload protection");
+            require(ROW_ID.equals(reloaded.find(config, ROW_ID, rowSha1).rowId),
+                    "renamed alias replaced the original primary row");
+            File unregisteredAliasFile = new File(work, "unregistered-copy.jpg");
+            write(unregisteredAliasFile, "unregistered-user-file".getBytes(StandardCharsets.UTF_8));
+            require(!reloaded.registerRenamedDerivedAlias(beforeRename, unregisteredAliasFile,
+                            "unrelated-row", rowSha1, sha256(readAll(unregisteredAliasFile)),
+                            unregisteredAliasFile.length()),
+                    "unregistered bytes were accepted as a renamed preview");
 
             File restored = new File(work, "restored.jpg");
             reloaded.restoreOriginal(config, ROW_ID, rowSha1, restored);
@@ -141,6 +169,13 @@ final class OriginalStoreInstrumentationScenario {
                     "restored original does not match source SHA-256");
             require(originalHash.equals(sha256(readAll(restored))),
                     "restored original hash mismatch");
+            require(restored.lastModified() == originalFileTime,
+                    "restored original lost its original file timestamp");
+            require(restored.setLastModified(originalFileTime + 86400000L),
+                    "could not prepare existing-original timestamp repair");
+            reloaded.restoreOriginal(config, ROW_ID, rowSha1, restored);
+            require(restored.lastModified() == originalFileTime,
+                    "existing original did not repair its recorded timestamp");
 
             byte[] sentinel = "keep-existing-local-file".getBytes(StandardCharsets.UTF_8);
             contentServer.setPayload(Arrays.copyOf(original, original.length - 1));

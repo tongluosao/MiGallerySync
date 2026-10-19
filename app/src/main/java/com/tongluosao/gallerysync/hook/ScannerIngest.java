@@ -8,7 +8,10 @@ import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.lang.reflect.Method;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -44,6 +47,21 @@ public final class ScannerIngest {
      * 用 13 是因为下载下来的文件是我们自己核对过长度才改名的，值得标成可信。
      */
     private static final int SCENE_CODE = 13;
+    private static final int MAX_RENAMED_CANDIDATES = 16;
+
+    private static final class SourceSnapshot {
+        final OriginalStore.Record record;
+        final long length;
+        final String sha1;
+        final String sha256;
+
+        SourceSnapshot(OriginalStore.Record record, long length, String sha1, String sha256) {
+            this.record = record;
+            this.length = length;
+            this.sha1 = sha1;
+            this.sha256 = sha256;
+        }
+    }
 
     private final ClassLoader mLoader;
 
@@ -61,12 +79,13 @@ public final class ScannerIngest {
         if (absolutePath == null || absolutePath.isEmpty()) {
             return;
         }
+        SourceSnapshot source = captureSource(absolutePath);
         if (scanFile(absolutePath)) {
-            bindIdentityAfterScan(absolutePath);
+            bindIdentityAfterScan(absolutePath, source);
             return;
         }
         if (scanPaths(absolutePath)) {
-            bindIdentityAfterScan(absolutePath);
+            bindIdentityAfterScan(absolutePath, source);
             return;
         }
         Logger.w("event=download_scan_failed path=" + absolutePath
@@ -77,7 +96,7 @@ public final class ScannerIngest {
      * ScannerEngine is asynchronous. Resolve the cloud row on a worker after its scan request;
      * the registry alias keeps the new preview sha1/row id connected to its verified original.
      */
-    private void bindIdentityAfterScan(String path) {
+    private void bindIdentityAfterScan(String path, SourceSnapshot source) {
         try {
             IDENTITY_BINDER.execute(() -> {
                 Context context = HostContext.get(mLoader);
@@ -113,11 +132,120 @@ public final class ScannerIngest {
                         return;
                     }
                 }
+                if (source != null) {
+                    bindRenamedAliasAfterScan(context, store, path, source);
+                    return;
+                }
                 Logger.w("event=scan_alias_timeout path=" + path);
             });
         } catch (Throwable t) {
             Logger.w("event=scan_alias_schedule_failed path=" + path, t);
         }
+    }
+
+    private SourceSnapshot captureSource(String path) {
+        File file = new File(path);
+        if (!file.isFile() || file.length() <= 0L) return null;
+        try {
+            Context context = HostContext.get(mLoader);
+            if (context == null) return null;
+            OriginalStore.Record record = OriginalStore.get(context.getApplicationContext())
+                    .findByLocalPath(file);
+            if (record == null) return null;
+            long length = file.length();
+            boolean knownDerivedLength = false;
+            for (Long derivedLength : record.derivedHashes.values()) {
+                if (derivedLength != null && derivedLength.longValue() == length) {
+                    knownDerivedLength = true;
+                    break;
+                }
+            }
+            if (!knownDerivedLength) return null;
+            MessageDigest sha1 = MessageDigest.getInstance("SHA-1");
+            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+            try (InputStream input = new FileInputStream(file)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) {
+                    sha1.update(buffer, 0, count);
+                    sha256.update(buffer, 0, count);
+                }
+            }
+            if (file.length() != length) return null;
+            String sourceSha256 = hex(sha256.digest());
+            Long registeredLength = record.derivedHashes.get(sourceSha256);
+            if (registeredLength == null || registeredLength.longValue() != length) return null;
+            return new SourceSnapshot(record, length, hex(sha1.digest()), sourceSha256);
+        } catch (Throwable t) {
+            Logger.d("event=scan_alias_source_fingerprint_failed path=" + path + " detail=" + t);
+            return null;
+        }
+    }
+
+    private void bindRenamedAliasAfterScan(Context context, OriginalStore store, String sourcePath,
+            SourceSnapshot source) {
+        int examined = 0;
+        try (Cursor cursor = context.getContentResolver().query(CLOUD_URI,
+                new String[]{"_id", "sha1", "localFile", "thumbnailFile"}, "sha1 = ?",
+                new String[]{source.sha1}, null)) {
+            while (cursor != null && examined < MAX_RENAMED_CANDIDATES
+                    && cursor.moveToNext()) {
+                examined++;
+                String rowId = cursor.getString(cursor.getColumnIndex("_id"));
+                String rowSha1 = cursor.getString(cursor.getColumnIndex("sha1"));
+                if (rowSha1 == null || !source.sha1.equalsIgnoreCase(rowSha1)) continue;
+                String[] paths = {
+                    cursor.getString(cursor.getColumnIndex("localFile")),
+                    cursor.getString(cursor.getColumnIndex("thumbnailFile"))
+                };
+                for (String candidatePath : paths) {
+                    if (candidatePath == null || candidatePath.isEmpty()) continue;
+                    File candidate = new File(candidatePath);
+                    if (candidate.getCanonicalPath().equals(
+                            new File(sourcePath).getCanonicalPath())) {
+                        continue;
+                    }
+                    if (!candidate.isFile() || candidate.length() != source.length
+                            || !source.sha256.equals(sha256(candidate))) {
+                        continue;
+                    }
+                    if (store.registerRenamedDerivedAlias(source.record, candidate, rowId,
+                            rowSha1, source.sha256, source.length)) {
+                        Logger.i("event=scan_renamed_alias_registered row=" + rowId
+                                + " path=" + candidatePath);
+                        return;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Logger.w("event=scan_renamed_alias_query_failed source=" + sourcePath, t);
+            return;
+        }
+        Logger.w("event=scan_alias_timeout path=" + sourcePath
+                + " renamed_candidates=" + examined);
+    }
+
+    private static String sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new FileInputStream(file)) {
+            byte[] buffer = new byte[64 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) {
+                digest.update(buffer, 0, count);
+            }
+        }
+        return hex(digest.digest());
+    }
+
+    private static String hex(byte[] bytes) {
+        char[] digits = "0123456789abcdef".toCharArray();
+        char[] result = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            int value = bytes[i] & 0xff;
+            result[i * 2] = digits[value >>> 4];
+            result[i * 2 + 1] = digits[value & 0x0f];
+        }
+        return new String(result);
     }
 
     private boolean scanPaths(String absolutePath) {

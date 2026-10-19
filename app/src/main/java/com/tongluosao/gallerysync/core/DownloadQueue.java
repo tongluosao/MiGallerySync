@@ -652,6 +652,10 @@ public final class DownloadQueue {
                 // Another format's JPEG preview must never count as this remote original.
                 normalLocal = new File(MIRROR_ROOT, relative);
             }
+            if (hasValidRegisteredSlimPreview(config, target, remotePath, normalLocal)) {
+                Logger.d("event=download_skip_registered_slim_preview remote=" + remotePath);
+                continue;
+            }
             migrateLegacyDownload(config, remotePath, relative, normalLocal, generation);
             boolean done;
             boolean scheduled;
@@ -692,6 +696,63 @@ public final class DownloadQueue {
                     || !record.sha256.equals(sha256(originalPath));
         } catch (IOException ignored) {
             return false;
+        }
+    }
+
+    /** A Gallery slim copy is already a local match even when the original path was removed. */
+    private boolean hasValidRegisteredSlimPreview(Config config, String target, String remotePath,
+            File originalPath) {
+        OriginalStore.Record record = findRecordForOriginal(config, target, remotePath,
+                originalPath);
+        if (record == null) return false;
+        for (String path : record.derivedPaths) {
+            if (path == null || !path.replace('\\', '/').contains("/.gallerysync-slim/")) {
+                continue;
+            }
+            File preview = new File(path);
+            if (!preview.isFile() || preview.length() <= 0L) continue;
+            try {
+                Long expectedLength = record.derivedHashes.get(sha256(preview));
+                if (expectedLength != null && expectedLength.longValue() == preview.length()) {
+                    return true;
+                }
+            } catch (IOException ignored) {
+                // An unreadable copy is not a verified local match.
+            }
+        }
+        return false;
+    }
+
+    private OriginalStore.Record findRecordForOriginal(Config config, String target,
+            String remotePath, File originalPath) {
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath,
+                originalPath);
+        if (record == null || !target.equals(record.target)
+                || !remotePath.equals(record.remotePath) || record.originalLocalPath == null) {
+            return null;
+        }
+        try {
+            return originalPath.getCanonicalPath().equals(record.originalLocalPath) ? record : null;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private long restoreRegisteredOriginalMtime(Pending pending, Config config,
+            File normalLocal, File downloadedOriginal) throws IOException {
+        OriginalStore.Record record = findRecordForOriginal(config, pending.target,
+                pending.remotePath, normalLocal);
+        if (record == null || record.originalLocalMtime <= 0L) return 0L;
+        if (downloadedOriginal.lastModified() != record.originalLocalMtime
+                && !downloadedOriginal.setLastModified(record.originalLocalMtime)) {
+            throw new IOException("cannot restore registered original modification time");
+        }
+        return record.originalLocalMtime;
+    }
+
+    private static void setModificationTime(File file, long modified) throws IOException {
+        if (modified > 0L && file.lastModified() != modified && !file.setLastModified(modified)) {
+            throw new IOException("cannot preserve downloaded file modification time");
         }
     }
 
@@ -765,8 +826,17 @@ public final class DownloadQueue {
         File raw = null;
         File staged = null;
         File compressed = null;
+        long registeredOriginalMtime = 0L;
         try {
             ensureWorkCurrent(config, generation);
+            if (hasValidRegisteredSlimPreview(config, pending.target, pending.remotePath,
+                    normalDest)) {
+                Logger.d("event=download_skip_registered_slim_preview remote="
+                        + pending.remotePath);
+                markDone(pending.remotePath, pending.target);
+                ok = true;
+                return;
+            }
             boolean restoreRegisteredOriginal = !isHighQualityRequested()
                     && isRegisteredPreviewNeedingOriginalRestore(pending.remotePath, config,
                             normalDest);
@@ -821,6 +891,8 @@ public final class DownloadQueue {
                 }
                 ensureWorkCurrent(config, generation);
                 verifyDownloadedOriginal(pending, raw);
+                registeredOriginalMtime = restoreRegisteredOriginalMtime(pending, config,
+                        normalDest, raw);
                 String digest = sha256(raw);
                 File previewDest = previewPathFor(normalDest, config.isPreserveHeicFormat());
                 boolean previewCollision = !samePath(previewDest, normalDest) && previewDest.exists();
@@ -853,6 +925,7 @@ public final class DownloadQueue {
                             + (previewCollision ? "destination_collision" : "unsupported_or_no_savings")
                             + " remote=" + pending.remotePath);
                     staged = stageBesideDestination(raw, normalDest);
+                    setModificationTime(staged, registeredOriginalMtime);
                     ensureWorkCurrent(config, generation);
                     mOriginalStore.registerDownloadedOriginal(config, pending.remotePath,
                             staged, normalDest, raw.length(), digest);
@@ -875,8 +948,11 @@ public final class DownloadQueue {
                 }
                 ensureWorkCurrent(config, generation);
                 verifyDownloadedOriginal(pending, raw);
+                registeredOriginalMtime = restoreRegisteredOriginalMtime(pending, config,
+                        normalDest, raw);
                 String digest = sha256(raw);
                 staged = stageBesideDestination(raw, normalDest);
+                setModificationTime(staged, registeredOriginalMtime);
                 ensureWorkCurrent(config, generation);
                 mOriginalStore.registerDownloadedOriginal(config, pending.remotePath, staged,
                         normalDest, raw.length(), digest);
@@ -1329,8 +1405,9 @@ public final class DownloadQueue {
                 String.valueOf(ExifInterface.ORIENTATION_NORMAL));
         // A failed EXIF write aborts preview creation, keeping the original in place.
         target.saveAttributes();
-        if (preserveMetadata && original.lastModified() > 0) {
-            preview.setLastModified(original.lastModified());
+        if (original.lastModified() > 0
+                && !preview.setLastModified(original.lastModified())) {
+            throw new IOException("cannot preserve preview file modification time");
         }
     }
 

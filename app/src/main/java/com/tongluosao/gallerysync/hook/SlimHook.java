@@ -298,6 +298,7 @@ final class SlimHook {
                 }
 
                 publish(staged, preview);
+                PreviewFileTime.copyModifiedTime(original, preview);
                 previewPublished = true;
                 if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
                     Logger.w("event=slim_db_update_skipped reason=preview_fingerprint_failed path="
@@ -319,6 +320,9 @@ final class SlimHook {
                             + " preview=" + preview.getAbsolutePath());
                     return 0L;
                 }
+                // Native publication may touch the thumbnail; keep screenshot chronology even
+                // when no EXIF capture date exists.
+                PreviewFileTime.copyModifiedTime(original, preview);
 
                 // Keep the config lock through DB publication and deletion. A config callback
                 // cannot switch the active restore target between this check and the irreversible
@@ -430,6 +434,7 @@ final class SlimHook {
                     || generated.length() <= 0 || generated.length() >= original.length()) {
                 return false;
             }
+            PreviewFileTime.copyModifiedTime(original, generated);
             Files.move(generated.toPath(), staged.toPath(), StandardCopyOption.REPLACE_EXISTING);
             return staged.isFile() && staged.length() > 0
                     && staged.length() < original.length();

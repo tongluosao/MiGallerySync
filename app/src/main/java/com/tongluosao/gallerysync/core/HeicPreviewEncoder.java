@@ -233,11 +233,16 @@ public final class HeicPreviewEncoder {
 
             verifyOutput(stage, rgb.getWidth(), rgb.getHeight(), expectedExif,
                     preserveMetadata);
-            if (preserveMetadata && original.lastModified() > 0) {
-                stage.setLastModified(original.lastModified());
+            if (original.lastModified() > 0
+                    && !stage.setLastModified(original.lastModified())) {
+                throw new IOException("cannot preserve HEIC file modification time");
             }
             Files.move(stage.toPath(), output.toPath(), StandardCopyOption.ATOMIC_MOVE,
                     StandardCopyOption.REPLACE_EXISTING);
+            if (original.lastModified() > 0
+                    && !output.setLastModified(original.lastModified())) {
+                throw new IOException("cannot preserve published HEIC file modification time");
+            }
             stage = null;
             sLastFailureReason = null;
             return true;
