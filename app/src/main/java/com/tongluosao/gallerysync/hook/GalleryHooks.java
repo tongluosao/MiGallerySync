@@ -62,6 +62,8 @@ public final class GalleryHooks {
     private volatile DeleteHook mDeleteHook;
     /** WebDAV original restore path, entered only by the Gallery's verified native request chain. */
     private volatile OriginalRestoreHook mOriginalRestoreHook;
+    /** One-shot, registry-verified restore for a fixed Gallery-private request file. */
+    private final MetadataRestoreJob mMetadataRestoreJob;
     /** Protects registered WebDAV originals when Gallery's native slim operation runs. */
     private volatile SlimHook mSlimHook;
     private volatile NativeDownloadHook mNativeDownloadHook;
@@ -75,6 +77,7 @@ public final class GalleryHooks {
         this.mXposed = xposed;
         this.mClassLoader = classLoader;
         this.mReader = CloudItemReader.create(classLoader);
+        this.mMetadataRestoreJob = new MetadataRestoreJob(classLoader);
     }
 
     public static GalleryHooks install(XposedInterface xposed, ClassLoader classLoader) {
@@ -109,6 +112,7 @@ public final class GalleryHooks {
 
     public void setConfig(Config config) {
         mConfig = config;
+        mMetadataRestoreJob.setConfig(config);
         OriginalRestoreHook originalRestore = mOriginalRestoreHook;
         if (originalRestore != null) {
             originalRestore.setConfig(config);
@@ -751,6 +755,14 @@ public final class GalleryHooks {
         Logger.i("event=command_received command=" + command);
         if (ProgressProtocol.CMD_RESET_UPLOADED.equals(command)) {
             resetUploaded();
+        } else if (ProgressProtocol.CMD_RESTORE_METADATA_ORIGINALS.equals(command)) {
+            Context context = HostContext.get(mClassLoader);
+            Config config = mConfig;
+            if (context == null || config == null || !config.isReady()) {
+                Logger.w("event=metadata_restore_job_skipped status=no_ready_context");
+                return;
+            }
+            mMetadataRestoreJob.start(context, config);
         }
     }
 
@@ -810,6 +822,7 @@ public final class GalleryHooks {
             if (nativeDownload != null) nativeDownload.shutdown();
         }
         if (restoreHook != null) restoreHook.shutdown();
+        mMetadataRestoreJob.shutdown();
         if (receiver != null) {
             try {
                 HostContext.get(mClassLoader).unregisterReceiver(receiver);

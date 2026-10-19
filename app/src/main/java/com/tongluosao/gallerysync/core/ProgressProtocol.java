@@ -54,6 +54,9 @@ public final class ProgressProtocol {
     /** 命令名：把当前账号的"已上传"标记全部重置回未上传 */
     public static final String CMD_RESET_UPLOADED = "reset_uploaded";
 
+    /** Restore metadata-corrupted originals listed in Gallery's private request file. */
+    public static final String CMD_RESTORE_METADATA_ORIGINALS = "restore_metadata_originals";
+
     /** 命令广播的唯一 extra：命令名 */
     public static final String EXTRA_COMMAND = "command";
 
