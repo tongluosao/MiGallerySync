@@ -864,17 +864,28 @@ public final class UploadQueue {
         // 上限在入队这一层判，**不是**在 worker 里：这样超限的项一个字节都不会发出去，
         // 也不会占着并发槽位、不会进重试循环（见 Config.KEY_MAX_UPLOAD_BYTES 的实测依据）。
         long cap = config == null ? Config.DEFAULT_MAX_UPLOAD_BYTES : config.getMaxUploadBytes();
+        // This classifier may hash an entire local file. Keep it outside mLock because the
+        // Gallery main-thread dirty-count hook also reads queue state under that lock.
+        List<CloudItemReader.Item> unprotected = new ArrayList<>(items.size());
+        for (CloudItemReader.Item item : items) {
+            File file = new File(item.path);
+            if (!file.isFile() || file.length() == 0) {
+                skipped++;
+                continue;
+            }
+            if (mOriginalStore.isProtectedUpload(file, item.rowId, item.sha1)) {
+                skipped++;
+                Logger.i("event=upload_skip_protected path=" + item.path
+                        + " row=" + item.rowId + " sha1=" + item.sha1);
+                continue;
+            }
+            unprotected.add(item);
+        }
         synchronized (mLock) {
-            for (CloudItemReader.Item item : items) {
+            for (CloudItemReader.Item item : unprotected) {
                 File file = new File(item.path);
                 if (!file.isFile() || file.length() == 0) {
                     skipped++;
-                    continue;
-                }
-                if (mOriginalStore.isProtectedUpload(file, item.rowId, item.sha1)) {
-                    skipped++;
-                    Logger.i("event=upload_skip_protected path=" + item.path
-                            + " row=" + item.rowId + " sha1=" + item.sha1);
                     continue;
                 }
                 long size = file.length();
