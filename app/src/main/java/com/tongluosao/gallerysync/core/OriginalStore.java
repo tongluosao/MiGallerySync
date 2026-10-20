@@ -320,8 +320,14 @@ public final class OriginalStore {
     }
 
     /**
-     * Confirm an old backup that predates the registry. A size match alone is insufficient: GET
-     * the configured remote object, compare its digest with the current local original, then record.
+     * Confirm an old backup that predates the registry. A size match alone is insufficient: the
+     * remote object must still hold the same bytes as the current local original.
+     *
+     * <p>比对强度与上传侧一致（{@link RemoteByteCheck}）：{@link RemoteByteCheck#FULL_CHECK_LIMIT}
+     * 以内整份回读，更大的文件只读头尾各 {@link RemoteByteCheck#SAMPLE_CHUNK}——截断、补零、
+     * 只写了开头这几种现实损坏都能抓住，而一万多张老照片不必每张都整份下一遍。
+     *
+     * <p>通过后顺手写下旁车，下一次优化前的校验就只剩一个 HEAD。
      */
     public boolean backfillFromRemote(Config config, String remotePath, File localOriginal,
             String rowId, String sha1) throws IOException {
@@ -329,30 +335,37 @@ public final class OriginalStore {
                 || localOriginal == null || !localOriginal.isFile() || localOriginal.length() <= 0) {
             return false;
         }
+        long length = localOriginal.length();
         String localDigest = sha256(localOriginal);
         File tempDir = new File(mFile.getParentFile(), "original_verify");
         if (!tempDir.exists() && !tempDir.mkdirs()) {
             throw new IOException("cannot create original verification directory");
         }
-        File remoteCopy = File.createTempFile("verify-", ".tmp", tempDir);
         WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
                 config.getPassword());
         try {
-            client.get(remotePath, remoteCopy);
-            if (remoteCopy.length() != localOriginal.length()
-                    || !localDigest.equals(sha256(remoteCopy))) {
+            // 先确认对象还在、长度没变；长度不对连读都不用读
+            if (!client.storedAs(remotePath, length)) {
                 return false;
             }
-            persist(new Record(targetKey(config), remotePath, localOriginal.length(), localDigest,
+            if (!RemoteByteCheck.verify(client, remotePath, localOriginal, length, localDigest)) {
+                return false;
+            }
+            persist(new Record(targetKey(config), remotePath, length, localDigest,
                     canonical(localOriginal), null, rowId, sha1,
                     localOriginal.lastModified(), Collections.emptySet()));
+            // 刚核对过的就是头尾这两段，直接写成 v2 证据：下一次校验只需一次 HEAD。
+            RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
+                    RemoteHashes.forClient(client, tempDir));
+            RemoteHashes.Entry evidence = RemoteByteCheck.chunkedEntry(localOriginal, localDigest);
+            if (evidence != null) {
+                hashes.tryWriteChunked(remotePath, evidence.sha256, evidence.length,
+                        evidence.headSha256, evidence.headLength, evidence.tailSha256,
+                        evidence.tailLength);
+            }
             return true;
         } finally {
             client.close();
-            if (remoteCopy.exists() && !remoteCopy.delete()) {
-                Logger.d("event=original_verify_temp_cleanup_failed path="
-                        + remoteCopy.getAbsolutePath());
-            }
         }
     }
 
@@ -1203,7 +1216,9 @@ public final class OriginalStore {
             RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
                     RemoteHashes.forClient(client, tempDir));
             RemoteVerifyResult result = verifyRemote(record.remotePath, record.sha256,
-                    record.originalLength, hashes, new ClientGateway(client, tempDir));
+                    record.originalLength, hashes, new ClientGateway(client, tempDir,
+                            record.originalLocalPath == null ? null
+                                    : new File(record.originalLocalPath)));
             if (!result.verified) {
                 return false;
             }
@@ -1268,9 +1283,20 @@ public final class OriginalStore {
         /** 对象还在、且大小与登记值一致（长度问不到时按通过 —— 见 {@code storedAs}）。 */
         boolean stillStored(String remotePath, long expectedLength) throws IOException;
 
-        /** 整份回读，核对长度与 SHA-256。 */
+        /** 核对远端字节（照片按 {@link RemoteByteCheck} 的策略：小的整份、大的取头尾）。 */
         boolean matchesRemoteBytes(String remotePath, String expectedSha256, long expectedLength)
                 throws IOException;
+
+        /**
+         * 上一步核对通过后，用同一份字节算出的旁车证据（带头尾摘要）。
+         *
+         * <p>默认返回 null：不认识这个能力的实现（单测里的假 gateway）不写 v2 旁车，
+         * 于是行为与以前完全一致。真实实现见 {@link ClientGateway}。
+         */
+        default RemoteHashes.Entry verifiedEvidence(String remotePath, String expectedSha256,
+                long expectedLength) throws IOException {
+            return null;
+        }
     }
 
     /**
@@ -1289,19 +1315,30 @@ public final class OriginalStore {
             long expectedLength, RemoteHashes hashes, RemoteGateway gateway) throws IOException {
         RemoteHashes.Entry entry = hashes == null ? null : hashes.readOrNull(remotePath);
         Decision decision = decideRemoteHash(entry, expectedSha256, expectedLength);
-        // 旁车命中还不够：旁车描述的是“上次传上去的那一份”，原图可能已经被改名/删除/
+        // 旁车命中还不够：旁车描述的是“上次核对过的那一份”，原图可能已经被改名/删除/
         // 被别的工具覆盖。storedAs 用 HEAD 取长度、长度问不到时回退 PROPFIND Depth 0，
         // 它自己的重试逻辑已经够用，这里不再叠一层探测。
-        if (decision == Decision.HIT && stillStored(gateway, remotePath, expectedLength)) {
+        //
+        // 而且只认 v2 旁车（带被核对过的头尾摘要）：v1 只记了“上传时算过的整份摘要”，
+        // 拿它当证据等于用“未核对过”的判断做放行，这正是这次要修掉的漏洞。
+        if (decision == Decision.HIT && entry.hasChunks()
+                && stillStored(gateway, remotePath, expectedLength)) {
             return new RemoteVerifyResult(true, true, false);
         }
         if (gateway == null
                 || !gateway.matchesRemoteBytes(remotePath, expectedSha256, expectedLength)) {
             return RemoteVerifyResult.failed();
         }
-        // 只有真正验证通过才回写旁车：验证失败时写进去的是一条假证据，下一次就会拿它放行
+        // 只有真正验证通过才回写旁车：验证失败时写进去的是一条假证据，下一次就会拿它放行。
+        // 写的是 v2（带头尾摘要）——回写 v1 没有意义，因为它已经不被信任了。
         if (hashes != null) {
-            hashes.tryWrite(remotePath, expectedSha256, expectedLength);
+            RemoteHashes.Entry evidence = gateway.verifiedEvidence(remotePath, expectedSha256,
+                    expectedLength);
+            if (evidence != null) {
+                hashes.tryWriteChunked(remotePath, evidence.sha256, evidence.length,
+                        evidence.headSha256, evidence.headLength, evidence.tailSha256,
+                        evidence.tailLength);
+            }
         }
         return new RemoteVerifyResult(true, false, decision == Decision.STALE);
     }
@@ -1327,10 +1364,13 @@ public final class OriginalStore {
     private static final class ClientGateway implements RemoteGateway {
         private final WebDavClient mClient;
         private final File mTempDir;
+        private final File mLocalOriginal;
+        private RemoteHashes.Entry mEvidence;
 
-        ClientGateway(WebDavClient client, File tempDir) {
+        ClientGateway(WebDavClient client, File tempDir, File localOriginal) {
             mClient = client;
             mTempDir = tempDir;
+            mLocalOriginal = localOriginal;
         }
 
         @Override
@@ -1338,20 +1378,44 @@ public final class OriginalStore {
             return mClient.storedAs(remotePath, expectedLength);
         }
 
+        /**
+         * 核对远端字节。本地原图还在时按 {@link RemoteByteCheck} 的策略比（照片小的整份、
+         * 大的头尾各 {@link RemoteByteCheck#SAMPLE_CHUNK}），并把这次比过的两段留成旁车证据；
+         * 本地文件不在（镜像/已瘦身）时才退回整份 GET。
+         */
         @Override
         public boolean matchesRemoteBytes(String remotePath, String expectedSha256,
                 long expectedLength) throws IOException {
+            File local = mLocalOriginal;
+            if (local != null && local.isFile() && local.length() == expectedLength) {
+                if (!RemoteByteCheck.verify(mClient, remotePath, local, expectedLength,
+                        expectedSha256)) {
+                    return false;
+                }
+                mEvidence = RemoteByteCheck.chunkedEntry(local, expectedSha256);
+                return true;
+            }
             File remoteCopy = File.createTempFile("verify-", ".tmp", mTempDir);
             try {
                 mClient.get(remotePath, remoteCopy);
-                return remoteCopy.length() == expectedLength
-                        && expectedSha256.equals(sha256(remoteCopy));
+                if (remoteCopy.length() != expectedLength
+                        || !expectedSha256.equals(sha256(remoteCopy))) {
+                    return false;
+                }
+                mEvidence = RemoteByteCheck.chunkedEntry(remoteCopy, expectedSha256);
+                return true;
             } finally {
                 if (remoteCopy.exists() && !remoteCopy.delete()) {
                     Logger.d("event=original_verify_temp_cleanup_failed path="
                             + remoteCopy.getAbsolutePath());
                 }
             }
+        }
+
+        @Override
+        public RemoteHashes.Entry verifiedEvidence(String remotePath, String expectedSha256,
+                long expectedLength) {
+            return mEvidence;
         }
     }
 

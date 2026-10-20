@@ -87,6 +87,31 @@ public final class RemoteByteCheck {
         return true;
     }
 
+    /**
+     * 把“这次核对过的头尾两段”算成可写进旁车的证据。
+     *
+     * <p>两段不重叠是硬要求（{@link RemoteHashes#formatChunked} 会拒掉重叠的写法）：
+     * 文件不足两段时退化成“一段覆盖整份 + 长度为 0 的尾段”，语义上仍是“整份核对过”。
+     */
+    public static RemoteHashes.Entry chunkedEntry(File local, String sha256) throws IOException {
+        if (local == null || !local.isFile() || local.length() <= 0L || sha256 == null
+                || sha256.length() != 64) {
+            return null;
+        }
+        long size = local.length();
+        if (size <= 2L * SAMPLE_CHUNK) {
+            String whole = sha256OfLocalRange(local, 0L, size);
+            return whole == null ? null
+                    : new RemoteHashes.Entry(sha256, size, whole, size, whole, 0L);
+        }
+        String head = sha256OfLocalRange(local, 0L, SAMPLE_CHUNK);
+        String tail = sha256OfLocalRange(local, size - SAMPLE_CHUNK, SAMPLE_CHUNK);
+        if (head == null || tail == null) {
+            return null;
+        }
+        return new RemoteHashes.Entry(sha256, size, head, SAMPLE_CHUNK, tail, SAMPLE_CHUNK);
+    }
+
     /** 读远端 {@code [offset, offset+length)} 并算 SHA-256；读到的字节数不对就当失败。 */
     static String sha256OfRemote(WebDavClient client, String remotePath, long offset, long length)
             throws IOException {

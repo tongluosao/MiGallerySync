@@ -34,6 +34,16 @@ public final class RemoteHashes {
     static final String MAGIC = "mgs-hash/1";
 
     /**
+     * 带分块摘要的版本头（v2）。
+     *
+     * <p>v1 只记整份摘要，可它<b>证明不了远端那份到底是什么</b>：命中时只比长度，等于把
+     * “我们上传时算过的摘要”当成“远端现在还是这些字节”。v2 额外记下头尾两段的摘要
+     * （{@link RemoteByteCheck#SAMPLE_CHUNK}），命中时就真的是“这两段字节核对过”的证据，
+     * 而且写它的现场必然是读过远端（或上传后回读过）的那一次。
+     */
+    static final String MAGIC_CHUNKED = "mgs-hash/2";
+
+    /**
      * 旁车字节上限（8 KiB）。
      *
      * <p>真正的旁车只有 79 字节；上限存在的理由是<b>不许把整份文件读进内存</b>：
@@ -58,10 +68,31 @@ public final class RemoteHashes {
     public static final class Entry {
         public final String sha256;
         public final long length;
+        /** 头段摘要；v1 旁车为 null。 */
+        public final String headSha256;
+        public final long headLength;
+        /** 尾段摘要；v1 旁车为 null。 */
+        public final String tailSha256;
+        public final long tailLength;
 
         public Entry(String sha256, long length) {
+            this(sha256, length, null, 0L, null, 0L);
+        }
+
+        public Entry(String sha256, long length, String headSha256, long headLength,
+                String tailSha256, long tailLength) {
             this.sha256 = sha256;
             this.length = length;
+            this.headSha256 = headSha256;
+            this.headLength = headLength;
+            this.tailSha256 = tailSha256;
+            this.tailLength = tailLength;
+        }
+
+        /** v2：带着已核对过的头尾证据。v1 旁车只是“上传时算过的摘要”。 */
+        public boolean hasChunks() {
+            return isHexDigest(headSha256) && isHexDigest(tailSha256)
+                    && headLength >= 0L && tailLength >= 0L;
         }
     }
 
@@ -140,6 +171,24 @@ public final class RemoteHashes {
     }
 
     /**
+     * 序列化带分块证据的 v2 单行：{@code mgs-hash/2 <sha256> <length> <headSha> <headLen> <tailSha> <tailLen>}。
+     *
+     * <p>长度彼此自洽才写：{@code headLength + tailLength <= length}，且两段不重叠。
+     * 任何一项不合法就返回 null —— 宁可不写，也不写一条自相矛盾的证据。
+     */
+    public static String formatChunked(String sha256, long length, String headSha256,
+            long headLength, String tailSha256, long tailLength) {
+        if (!isHexDigest(sha256) || !isHexDigest(headSha256) || !isHexDigest(tailSha256)
+                || length < 0L || headLength < 0L || tailLength < 0L
+                || headLength + tailLength > length) {
+            return null;
+        }
+        return MAGIC_CHUNKED + " " + sha256.toLowerCase(Locale.US) + " " + length + " "
+                + headSha256.toLowerCase(Locale.US) + " " + headLength + " "
+                + tailSha256.toLowerCase(Locale.US) + " " + tailLength + "\n";
+    }
+
+    /**
      * 解析旁车内容；任何不合法的输入都返回 null，绝不抛异常。
      *
      * <p>调用方（{@link OriginalStore} 的校验）把 null 一律当成“没有旁车”，于是自然退回
@@ -166,6 +215,9 @@ public final class RemoteHashes {
             line = line.substring(0, line.length() - 1);
         }
         String[] parts = line.split(" ", -1);
+        if (parts.length == 7 && MAGIC_CHUNKED.equals(parts[0])) {
+            return parseChunked(parts);
+        }
         if (parts.length != 3 || !MAGIC.equals(parts[0])) {
             return null;
         }
@@ -183,6 +235,30 @@ public final class RemoteHashes {
             return null;
         }
         return new Entry(digest.toLowerCase(Locale.US), length);
+    }
+
+    /** v2 行：{@code mgs-hash/2 <sha> <len> <headSha> <headLen> <tailSha> <tailLen>}。 */
+    private static Entry parseChunked(String[] parts) {
+        if (!isHexDigest(parts[1]) || !isHexDigest(parts[3]) || !isHexDigest(parts[5])) {
+            return null;
+        }
+        long length;
+        long headLength;
+        long tailLength;
+        try {
+            length = Long.parseLong(parts[2]);
+            headLength = Long.parseLong(parts[4]);
+            tailLength = Long.parseLong(parts[6]);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+        if (length < 0L || headLength < 0L || tailLength < 0L
+                || headLength + tailLength > length) {
+            return null;
+        }
+        return new Entry(parts[1].toLowerCase(Locale.US), length,
+                parts[3].toLowerCase(Locale.US), headLength,
+                parts[5].toLowerCase(Locale.US), tailLength);
     }
 
     /** 旁车是否仍然描述“这一份”原图。摘要比较忽略大小写（登记表里历史数据有大写）。 */
@@ -210,6 +286,11 @@ public final class RemoteHashes {
             Logger.w("event=remote_hash_write_failed path=" + remotePath + " reason=invalid_digest");
             return false;
         }
+        return writeBody(remotePath, body);
+    }
+
+    /** 落盘：路径冲突（映射退化成原图自己）与 IO 失败都只记日志。 */
+    private boolean writeBody(String remotePath, String body) {
         String hashPath = hashPathFor(mRemoteRoot, remotePath);
         if (hashPath.equals(remotePath)) {
             // 兜底：映射一旦退化成原图自己，写入就会覆盖用户的照片
@@ -223,6 +304,25 @@ public final class RemoteHashes {
             Logger.w("event=remote_hash_write_failed path=" + remotePath + " reason=" + t);
             return false;
         }
+    }
+
+    /**
+     * 写一份带头尾证据的 v2 旁车。调用方只在<b>真的核对过远端这两段字节</b>之后调用，
+     * 于是“旁车存在”就等于“这两段当时是对的”。
+     */
+    public boolean tryWriteChunked(String remotePath, String sha256, long length,
+            String headSha256, long headLength, String tailSha256, long tailLength) {
+        if (mIo == null || remotePath == null || remotePath.isEmpty()) {
+            return false;
+        }
+        String body = formatChunked(sha256, length, headSha256, headLength, tailSha256,
+                tailLength);
+        if (body == null) {
+            Logger.w("event=remote_hash_write_failed path=" + remotePath
+                    + " reason=invalid_chunked_digest");
+            return false;
+        }
+        return writeBody(remotePath, body);
     }
 
     /** 读旁车；没有、内容不合法、IO 失败一律返回 null（调用方据此退回整份回读）。 */

@@ -1545,7 +1545,8 @@ public final class UploadQueue {
         // 本地文件算的，它只证明“我们发了什么”。没核对就写，等于让一次损坏的上传
         // 拿到"合格"证明 —— 而空间优化随后会删掉本地原图，那时就没有第二份可比对了。
         if (bytesVerified) {
-            writeRemoteHash(config, remotePath, uploadedSha256, uploadedLength);
+            writeRemoteHash(config, remotePath, new File(task.path), uploadedSha256,
+                    uploadedLength);
         } else {
             Logger.d("event=remote_hash_skipped reason=bytes_not_verified remote=" + remotePath);
         }
@@ -1615,7 +1616,8 @@ public final class UploadQueue {
      * <p>旁车只是加速缓存：写失败只记 {@code event=remote_hash_write_failed}，
      * 上传结果（已经登记、已经 markSynced）不受任何影响。
      */
-    private void writeRemoteHash(Config config, String remotePath, String sha256, long length) {
+    private void writeRemoteHash(Config config, String remotePath, File file, String sha256,
+            long length) {
         if (config == null || remotePath == null || remotePath.isEmpty()
                 || sha256 == null || sha256.length() != 64 || length <= 0L) {
             return;
@@ -1626,7 +1628,16 @@ public final class UploadQueue {
                     config.getPassword());
             RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
                     RemoteHashes.forClient(client, hashTempDir()));
-            hashes.tryWrite(remotePath, sha256, length);
+            // 写成 v2：这次上传回读核对过的正是头尾两段，旁车里就把这两段的摘要一起记上。
+            // 只记整份摘要（v1）证明不了远端那两段真的对过，命中时也就只能比长度。
+            RemoteHashes.Entry evidence = RemoteByteCheck.chunkedEntry(file, sha256);
+            if (evidence != null) {
+                hashes.tryWriteChunked(remotePath, evidence.sha256, evidence.length,
+                        evidence.headSha256, evidence.headLength, evidence.tailSha256,
+                        evidence.tailLength);
+            } else {
+                hashes.tryWrite(remotePath, sha256, length);
+            }
         } catch (Throwable t) {
             // 走到这里只剩“客户端根本没建起来/关闭前就抛了”这一种情况：
             // tryWrite 自己吞掉了写失败并记过日志，所以这里不重复展开原因
