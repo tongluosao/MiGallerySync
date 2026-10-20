@@ -712,6 +712,13 @@ public final class DownloadQueue {
             }
             String relative = relativeDir.isEmpty() ? name : relativeDir + "/" + name;
             if (entry.dir) {
+                if (name.startsWith(".")) {
+                    // 点开头目录一律不进：远端哈希旁车（{@link RemoteHashes#DIR}）就放在
+                    // <root>/.mgs-hashes/ 里，递归进去只会白列一遍目录、白花一次往返，
+                    // 而里面除了 .sha256 小文件没有任何相册媒体。
+                    Logger.d("event=download_skip_hidden_dir name=" + name);
+                    continue;
+                }
                 dirs++;
                 walk(client, WebDavClient.joinPath(remoteDir, name), relative, depth + 1, out,
                         config, target, highQuality, generation, hostRows);

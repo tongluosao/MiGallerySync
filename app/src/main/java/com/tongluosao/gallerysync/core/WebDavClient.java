@@ -837,6 +837,29 @@ public final class WebDavClient {
     }
 
     /**
+     * 直接 PUT 到给定路径，<b>不做父目录解析</b>。
+     *
+     * <p>为什么需要它（2026-10-20 真机实测）：OpenList + S3 这类后端<b>不支持 MKCOL</b>
+     * ——对任意不存在的路径都回 405，但它会跟着 PUT 自动创建虚拟目录（实测
+     * {@code PUT MiGallerySync/.mgs-hashes/DCIM/Camera/x.jpg.sha256} 回 201）。
+     * 而 {@link #putBytes} 走 {@code resolveFilePath}，要求父目录能先解析出来，
+     * 于是这类服务器上"往新目录写第一个文件"必然报 {@code cannot resolve remote directory}。
+     *
+     * <p>代价是跳过大小写归一：路径按调用方给的原样写入，服务器若做大小写折叠，
+     * 可能建出一个只差大小写的并列目录。只给模块自己的命名空间用（全小写、
+     * 不会被相册扫描的 {@code .mgs-hashes}），<b>不要</b>拿它传用户照片。
+     */
+    public void putBytesDirect(String remotePath, byte[] body) throws IOException {
+        Res res = send("PUT", remotePath, null, body, false);
+        requireSuccess(res, "PUT", remotePath);
+        if (!storedAs(remotePath, body.length)) {
+            throw new IOException("PUT returned " + res.code
+                    + " but the server has no such file (this storage fakes writes)"
+                    + " path=" + remotePath);
+        }
+    }
+
+    /**
      * 只花几百字节问一句"这条路径现在被别人攥着写锁吗"。
      *
      * <p>为什么需要它（2026-10-06 真机实测）：OpenList 判写锁是**读完整个请求体之后**才做的，

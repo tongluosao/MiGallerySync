@@ -1182,23 +1182,175 @@ public final class OriginalStore {
         return latest;
     }
 
+    /**
+     * 校验远端原图。
+     *
+     * <p>优先读远端哈希旁车（{@link RemoteHashes}）：命中就只花一次 {@code storedAs}
+     * 的小请求，不再把整份原图 GET 回来重算摘要 —— 那是空间优化前最贵的一步。
+     * 旁车过期或不存在时退回原来那条“整份回读 + 重算 SHA-256”的路，并在通过后把旁车补上。
+     *
+     * <p>失败语义没变：<b>只有确实验证通过才返回 true</b>。异常照旧抛给调用方
+     * （{@code SlimHook} 已经按失败处理），绝不 fail-open。
+     */
     private boolean verifyRemote(Record record, Config config) throws IOException {
         File tempDir = new File(mFile.getParentFile(), "original_verify");
         if (!tempDir.exists() && !tempDir.mkdirs()) {
             throw new IOException("cannot create original verification directory");
         }
-        File remoteCopy = File.createTempFile("verify-", ".tmp", tempDir);
         WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
                 config.getPassword());
         try {
-            client.get(record.remotePath, remoteCopy);
-            return remoteCopy.length() == record.originalLength
-                    && record.sha256.equals(sha256(remoteCopy));
+            RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
+                    RemoteHashes.forClient(client, tempDir));
+            RemoteVerifyResult result = verifyRemote(record.remotePath, record.sha256,
+                    record.originalLength, hashes, new ClientGateway(client, tempDir));
+            if (!result.verified) {
+                return false;
+            }
+            // 日志留在调用方而不是执行体里：执行体要能在没有 android.util.Log 的 JVM 单测里跑
+            if (result.hashHit) {
+                Logger.d("event=remote_hash_hit path=" + record.remotePath);
+            } else if (result.stale) {
+                Logger.d("event=remote_hash_stale path=" + record.remotePath);
+            } else {
+                Logger.d("event=remote_hash_backfilled path=" + record.remotePath);
+            }
+            return true;
         } finally {
             client.close();
-            if (remoteCopy.exists() && !remoteCopy.delete()) {
-                Logger.d("event=original_verify_temp_cleanup_failed path="
-                        + remoteCopy.getAbsolutePath());
+        }
+    }
+
+    /** 旁车三态：命中（可直接信）、过期（摘要/长度对不上）、缺失。 */
+    enum Decision {
+        HIT,
+        STALE,
+        MISS
+    }
+
+    /**
+     * 纯决策函数：只看旁车内容与登记值，不做任何 IO，单测直接覆盖三态边界。
+     *
+     * <p>{@code entry == null} 一律是 MISS —— 空对象绝不能被判成 HIT，否则“没有证据”
+     * 会被当成“验证通过”。
+     */
+    static Decision decideRemoteHash(RemoteHashes.Entry entry, String expectedSha256,
+            long expectedLength) {
+        if (entry == null) {
+            return Decision.MISS;
+        }
+        return RemoteHashes.matches(entry, expectedSha256, expectedLength)
+                ? Decision.HIT : Decision.STALE;
+    }
+
+    /** 校验结论：{@code hashHit}/{@code stale} 只用于日志与统计，{@code verified} 才是答案。 */
+    static final class RemoteVerifyResult {
+        final boolean verified;
+        final boolean hashHit;
+        final boolean stale;
+
+        RemoteVerifyResult(boolean verified, boolean hashHit, boolean stale) {
+            this.verified = verified;
+            this.hashHit = hashHit;
+            this.stale = stale;
+        }
+
+        static RemoteVerifyResult failed() {
+            return new RemoteVerifyResult(false, false, false);
+        }
+    }
+
+    /**
+     * 远端动作：抽出来是为了让上面那条主流程能在没有网络的情况下被单测覆盖。
+     * 真实实现见 {@link ClientGateway}。
+     */
+    interface RemoteGateway {
+        /** 对象还在、且大小与登记值一致（长度问不到时按通过 —— 见 {@code storedAs}）。 */
+        boolean stillStored(String remotePath, long expectedLength) throws IOException;
+
+        /** 整份回读，核对长度与 SHA-256。 */
+        boolean matchesRemoteBytes(String remotePath, String expectedSha256, long expectedLength)
+                throws IOException;
+    }
+
+    /**
+     * 旁车优先的校验执行体（包级可见，便于单测注入假 Io 与假 gateway）。
+     *
+     * <p>三条分支：
+     * <ul>
+     *   <li>HIT：旁车摘要/长度与登记值一致，再确认对象还在、大小没变 → 直接通过，
+     *       <b>不做整份 GET</b>；</li>
+     *   <li>STALE：旁车过期（换了文件、旁车被手改）→ 走一次整份回读，通过后用真实摘要重写旁车；</li>
+     *   <li>MISS：没有旁车 → 走一次整份回读，通过后回填旁车。</li>
+     * </ul>
+     * 任何一步失败都返回 {@code verified=false}；旁车写入失败不影响结论（它只是缓存）。
+     */
+    static RemoteVerifyResult verifyRemote(String remotePath, String expectedSha256,
+            long expectedLength, RemoteHashes hashes, RemoteGateway gateway) throws IOException {
+        RemoteHashes.Entry entry = hashes == null ? null : hashes.readOrNull(remotePath);
+        Decision decision = decideRemoteHash(entry, expectedSha256, expectedLength);
+        // 旁车命中还不够：旁车描述的是“上次传上去的那一份”，原图可能已经被改名/删除/
+        // 被别的工具覆盖。storedAs 用 HEAD 取长度、长度问不到时回退 PROPFIND Depth 0，
+        // 它自己的重试逻辑已经够用，这里不再叠一层探测。
+        if (decision == Decision.HIT && stillStored(gateway, remotePath, expectedLength)) {
+            return new RemoteVerifyResult(true, true, false);
+        }
+        if (gateway == null
+                || !gateway.matchesRemoteBytes(remotePath, expectedSha256, expectedLength)) {
+            return RemoteVerifyResult.failed();
+        }
+        // 只有真正验证通过才回写旁车：验证失败时写进去的是一条假证据，下一次就会拿它放行
+        if (hashes != null) {
+            hashes.tryWrite(remotePath, expectedSha256, expectedLength);
+        }
+        return new RemoteVerifyResult(true, false, decision == Decision.STALE);
+    }
+
+    /** 探测失败不能当成“还在”：一次网络抖动不该被读成“验证通过”。 */
+    private static boolean stillStored(RemoteGateway gateway, String remotePath,
+            long expectedLength) {
+        if (gateway == null) {
+            return false;
+        }
+        try {
+            return gateway.stillStored(remotePath, expectedLength);
+        } catch (Throwable t) {
+            Logger.d("event=remote_hash_probe_failed path=" + remotePath + " reason=" + t);
+            return false;
+        }
+    }
+
+    /**
+     * 真实网络实现。整份回读仍然落在原来那个临时目录里（{@code original_verify}），
+     * 长度或摘要任一对不上就判失败。
+     */
+    private static final class ClientGateway implements RemoteGateway {
+        private final WebDavClient mClient;
+        private final File mTempDir;
+
+        ClientGateway(WebDavClient client, File tempDir) {
+            mClient = client;
+            mTempDir = tempDir;
+        }
+
+        @Override
+        public boolean stillStored(String remotePath, long expectedLength) throws IOException {
+            return mClient.storedAs(remotePath, expectedLength);
+        }
+
+        @Override
+        public boolean matchesRemoteBytes(String remotePath, String expectedSha256,
+                long expectedLength) throws IOException {
+            File remoteCopy = File.createTempFile("verify-", ".tmp", mTempDir);
+            try {
+                mClient.get(remotePath, remoteCopy);
+                return remoteCopy.length() == expectedLength
+                        && expectedSha256.equals(sha256(remoteCopy));
+            } finally {
+                if (remoteCopy.exists() && !remoteCopy.delete()) {
+                    Logger.d("event=original_verify_temp_cleanup_failed path="
+                            + remoteCopy.getAbsolutePath());
+                }
             }
         }
     }

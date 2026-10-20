@@ -1527,6 +1527,11 @@ public final class UploadQueue {
                 return false;
             }
         }
+        // 原图确实传上去、也登记好了，才把**同一份**摘要写成远端旁车：下次空间优化前的
+        // 校验只需要读这几十字节，而不是把整份原图 GET 回来重算 SHA-256。
+        // 写失败只是让那一次校验多做一次整份回读，绝不能影响“这一项传成功了没有”，
+        // 所以这里只记日志。只给原图写：预览是派生副本，它的摘要不是远端原图的证据。
+        writeRemoteHash(config, remotePath, uploadedSha256, uploadedLength);
         synchronized (mLock) {
             mPending.remove(taskKey);
             mPendingVersion++;
@@ -1561,6 +1566,44 @@ public final class UploadQueue {
             progress.refresh();
         }
         return true;
+    }
+
+    /**
+     * 写远端哈希旁车（只给原图写，预览不写）。
+     *
+     * <p>为什么另开一条连接而不是借用 worker 那条：{@code finalizeOk} 有三个来源
+     * ——上传 worker、异步复核线程、以及“迟到落盘”分支，能借到的那条连接属于别的线程。
+     * 旁车只有一次 PUT，另开一条比把连接所有权在三个调用点之间传来传去安全得多。
+     *
+     * <p>旁车只是加速缓存：写失败只记 {@code event=remote_hash_write_failed}，
+     * 上传结果（已经登记、已经 markSynced）不受任何影响。
+     */
+    private void writeRemoteHash(Config config, String remotePath, String sha256, long length) {
+        if (config == null || remotePath == null || remotePath.isEmpty()
+                || sha256 == null || sha256.length() != 64 || length <= 0L) {
+            return;
+        }
+        WebDavClient client = null;
+        try {
+            client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                    config.getPassword());
+            RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
+                    RemoteHashes.forClient(client, hashTempDir()));
+            hashes.tryWrite(remotePath, sha256, length);
+        } catch (Throwable t) {
+            // 走到这里只剩“客户端根本没建起来/关闭前就抛了”这一种情况：
+            // tryWrite 自己吞掉了写失败并记过日志，所以这里不重复展开原因
+            Logger.w("event=remote_hash_write_failed path=" + remotePath);
+        } finally {
+            if (client != null) {
+                client.close();
+            }
+        }
+    }
+
+    /** 旁车读写的临时目录；只在真的需要 GET 时才建目录（正常上传路径只写不读）。 */
+    private File hashTempDir() {
+        return new File(mContext.getCacheDir(), "remote_hashes");
     }
 
     /**
