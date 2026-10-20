@@ -32,26 +32,30 @@ public class RemoteByteCheckTest {
     }
 
     @Test
-    public void samplesCoverHeadQuarterHalfThreeQuartersAndTail() {
+    public void samplesCoverHeadAndTailOnly() {
         long size = 200L * MIB;
-        long[] offsets = RemoteByteCheck.sampleOffsets(size, RemoteByteCheck.SAMPLE_CHUNK);
-        assertArrayEquals(new long[]{0L, 50L * MIB, 100L * MIB, 150L * MIB, size - MIB}, offsets);
+        long chunk = RemoteByteCheck.SAMPLE_CHUNK;
+        assertArrayEquals(new long[]{0L, size - chunk},
+                RemoteByteCheck.sampleOffsets(size, chunk));
     }
 
     @Test
-    public void duplicateOffsetsAreDroppedOnSmallFiles() {
+    public void middleOfLargeFileIsNotSampled() {
+        // 只读头尾：中间的偏移量一个都不该出现（这正是省带宽的来源）
         long size = 4L * MIB;
-        // 1/4=1MiB, 1/2=2MiB, 3/4=3MiB, tail=3MiB —— 尾段与 3/4 重合，只留一个
-        assertArrayEquals(new long[]{0L, MIB, 2L * MIB, 3L * MIB},
-                RemoteByteCheck.sampleOffsets(size, RemoteByteCheck.SAMPLE_CHUNK));
+        long chunk = RemoteByteCheck.SAMPLE_CHUNK;
+        for (long offset : RemoteByteCheck.sampleOffsets(size, chunk)) {
+            assertTrue("middle offset sampled: " + offset, offset == 0L || offset == size - chunk);
+        }
     }
 
     @Test
     public void fileNoLargerThanOneChunkIsSampledOnce() {
-        assertArrayEquals(new long[]{0L},
-                RemoteByteCheck.sampleOffsets(MIB, RemoteByteCheck.SAMPLE_CHUNK));
-        assertArrayEquals(new long[]{0L},
-                RemoteByteCheck.sampleOffsets(1024L, RemoteByteCheck.SAMPLE_CHUNK));
+        long chunk = RemoteByteCheck.SAMPLE_CHUNK;
+        assertArrayEquals(new long[]{0L}, RemoteByteCheck.sampleOffsets(chunk, chunk));
+        assertArrayEquals(new long[]{0L}, RemoteByteCheck.sampleOffsets(1024L, chunk));
+        assertArrayEquals(new long[]{0L, 1024L},
+                RemoteByteCheck.sampleOffsets(chunk + 1024L, chunk));
     }
 
     @Test

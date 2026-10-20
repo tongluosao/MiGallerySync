@@ -6,7 +6,6 @@ import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.Arrays;
 
 /**
  * 传完之后问一句："远端那份字节，真的和我发出去的一模一样吗？"
@@ -18,18 +17,19 @@ import java.util.Arrays;
  * 空间优化会删掉本地原图，所以这个空格必须在删之前补上：否则上传链路一旦把字节
  * 弄坏而长度不变（截断后补零、填充），旁车就会把坏件盖章成合格，原图再也没了。
  *
- * <p>代价与取舍（用户 2026-10-20 决定）：照片这类小文件整份回读，
- * {@link #FULL_CHECK_LIMIT} 以内一分不省；视频这类大文件抽 5 段各
- * {@link #SAMPLE_CHUNK} 读，头、1/4、1/2、3/4、尾都覆盖到，截断与补零这种
- * 最现实的损坏一定被抓住，而代价固定几 MB。
+ * <p>代价与取舍（用户 2026-10-20 决定）：WebDAV/OpenList 上传本身就带传输层与对象层
+ * 校验（PUT 只有真正落盘才回 201/204，S3 后端还会比 MD5），所以这里不必整份重读。
+ * {@link #FULL_CHECK_LIMIT} 以内整份回读（反正很小）；更大的文件只读**头尾各
+ * {@link #SAMPLE_CHUNK}**——截断、补零、只写了开头这几种最现实的损坏都会被抓住，
+ * 代价固定 200 KiB。
  */
 public final class RemoteByteCheck {
 
-    /** 这个大小以内整份回读算 SHA-256。 */
-    public static final long FULL_CHECK_LIMIT = 64L * 1024L * 1024L;
+    /** 这个大小以内整份回读算 SHA-256；更大的文件只读头尾两段。 */
+    public static final long FULL_CHECK_LIMIT = 256L * 1024L;
 
-    /** 大文件抽样时每段的长度。 */
-    public static final long SAMPLE_CHUNK = 1024L * 1024L;
+    /** 大文件抽样时头/尾各读的长度。 */
+    public static final long SAMPLE_CHUNK = 100L * 1024L;
 
     private RemoteByteCheck() {
     }
@@ -40,8 +40,8 @@ public final class RemoteByteCheck {
     }
 
     /**
-     * 抽样位置：头、1/4、1/2、3/4、尾。夹进 {@code [0, size - chunk]} 后按升序去重，
-     * 文件比一段还小时只返回 {@code {0}}。
+     * 抽样位置：头一段 + 尾一段。文件比一段还小时只返回 {@code {0}}——此时头尾本来就
+     * 重合，读 {@code min(chunk, size)} 个字节就是整份。
      */
     public static long[] sampleOffsets(long size, long chunk) {
         if (size <= 0L || chunk <= 0L) {
@@ -50,17 +50,7 @@ public final class RemoteByteCheck {
         if (size <= chunk) {
             return new long[]{0L};
         }
-        long last = size - chunk;
-        long[] wanted = {0L, size / 4L, size / 2L, size * 3L / 4L, last};
-        long[] out = new long[wanted.length];
-        int count = 0;
-        for (long candidate : wanted) {
-            long offset = Math.max(0L, Math.min(candidate, last));
-            if (count == 0 || out[count - 1] != offset) {
-                out[count++] = offset;
-            }
-        }
-        return Arrays.copyOf(out, count);
+        return new long[]{0L, size - chunk};
     }
 
     /**
