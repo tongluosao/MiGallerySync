@@ -1197,7 +1197,7 @@ public final class UploadQueue {
                         // Keep the success progress accounting consistent with a completed PUT.
                         mPublisher.taskBytes(taskKey, uploadedLength);
                         ok = finalizeOk(task, config, remotePath, "remote_exists",
-                                uploadedSha256, uploadedLength, uploadedMtime, true);
+                                uploadedSha256, uploadedLength, uploadedMtime, true, true);
                         return;
                     }
                     Logger.i("event=remote_exists_mismatch remote=" + remotePath
@@ -1294,8 +1294,10 @@ public final class UploadQueue {
                     // 同步路径：复核没过会抛 IOException（与"服务器直接回错误码"同一句话），
                     // 于是走同一套重试逻辑
                     client.requireStoredAs(remotePath, uploadedLength);
+                    requireMatchingRemoteBytes(client, remotePath, file, uploadedLength,
+                            uploadedSha256);
                     ok = finalizeOk(task, config, remotePath, String.valueOf(index),
-                            uploadedSha256, uploadedLength, uploadedMtime, false);
+                            uploadedSha256, uploadedLength, uploadedMtime, false, true);
                 }
             } catch (WebDavClient.TransportFailure e) {
                 // 链路层失败里有一种**不是失败**：请求体已经全部发出去了，只是服务器迟迟不给
@@ -1303,8 +1305,10 @@ public final class UploadQueue {
                 // 而对象其实已经**完整落盘**，长度分毫不差）。重发一遍要再烧整份上行，
                 // 所以这里回头问一句"远端那一份是不是已经跟我一样大"，是就按成功收尾
                 if (lateLanding(config, remotePath, task, file, bodySent.get())) {
+                    // lateLanding 自己就是"下载远端整份 + 比 SHA-256"，已证明远端字节与本
+                    // 地一致，不再重复回读（126 KB 的照片要多等 20 秒，几百 MB 的视频更贵）
                     ok = finalizeOk(task, config, remotePath, "late_landing", uploadedSha256,
-                            uploadedLength, uploadedMtime, true);
+                            uploadedLength, uploadedMtime, true, true);
                 } else {
                     finalizeFail(task, config, e);
                 }
@@ -1314,8 +1318,9 @@ public final class UploadQueue {
                 // 才回 423，而远端那一份早就完整了。字节都发完了还判"失败重传"，
                 // 等于每次同步都再烧一份 1.35GB 上行去换同一个 423
                 if (lateLanding(config, remotePath, task, file, bodySent.get())) {
+                    // 同上：lateLanding 已按 SHA-256 验过整份远端内容
                     ok = finalizeOk(task, config, remotePath, "late_landing", uploadedSha256,
-                            uploadedLength, uploadedMtime, true);
+                            uploadedLength, uploadedMtime, true, true);
                 } else {
                     finalizeFail(task, config, e);
                 }
@@ -1481,8 +1486,12 @@ public final class UploadQueue {
                 // 那句话只有一处定义，日志里同一个故障不会出现两种写法。
                 // 复核不过绝不能记成功 —— 一写标记这项就再也不会重传了
                 client.requireStoredAs(job.remotePath, job.size);
+                // 长度只是"候选"：字节回读核对过才算合格，不合格按普通失败重传 ——
+                // 它同时也是写远端旁车的前提（旁车摘要来自本地，不能自己证明自己）
+                requireMatchingRemoteBytes(client, job.remotePath, new File(job.task.path),
+                        job.size, job.uploadedSha256);
                 ok = finalizeOk(job.task, job.config, job.remotePath, "verify-" + index,
-                        job.uploadedSha256, job.size, job.uploadedMtime, false);
+                        job.uploadedSha256, job.size, job.uploadedMtime, false, true);
                 Logger.i("event=verify_async_done ok=" + ok + " path=" + job.task.path
                         + " remote=" + job.remotePath);
             } catch (WebDavClient.TransportFailure e) {
@@ -1514,7 +1523,7 @@ public final class UploadQueue {
      */
     private boolean finalizeOk(Task task, Config config, String remotePath, String worker,
             String uploadedSha256, long uploadedLength, long uploadedMtime,
-            boolean alreadyRegistered) {
+            boolean alreadyRegistered, boolean bytesVerified) {
         final String taskKey = task.key();
         if (!alreadyRegistered) {
             try {
@@ -1531,7 +1540,15 @@ public final class UploadQueue {
         // 校验只需要读这几十字节，而不是把整份原图 GET 回来重算 SHA-256。
         // 写失败只是让那一次校验多做一次整份回读，绝不能影响“这一项传成功了没有”，
         // 所以这里只记日志。只给原图写：预览是派生副本，它的摘要不是远端原图的证据。
-        writeRemoteHash(config, remotePath, uploadedSha256, uploadedLength);
+        //
+        // **只在这份字节被回读核对过之后才写**（bytesVerified）：旁车的摘要是发送前对
+        // 本地文件算的，它只证明“我们发了什么”。没核对就写，等于让一次损坏的上传
+        // 拿到"合格"证明 —— 而空间优化随后会删掉本地原图，那时就没有第二份可比对了。
+        if (bytesVerified) {
+            writeRemoteHash(config, remotePath, uploadedSha256, uploadedLength);
+        } else {
+            Logger.d("event=remote_hash_skipped reason=bytes_not_verified remote=" + remotePath);
+        }
         synchronized (mLock) {
             mPending.remove(taskKey);
             mPendingVersion++;
@@ -1566,6 +1583,26 @@ public final class UploadQueue {
             progress.refresh();
         }
         return true;
+    }
+
+    /**
+     * 字节必须与本地文件一致，否则抛异常走重试。
+     *
+     * <p>为什么"长度对得上"还不够：PUT 是整份请求体，服务器完全可能原样收下一个被中间层
+     * 改坏的载荷（长度不变），或者截断后补零。而空间优化之后本地原图就删了，远端那份是
+     * 唯一副本 —— 所以长度只是"候选合格"，内容才决定能不能证明。
+     *
+     * <p>成本按 {@link RemoteByteCheck} 的策略：照片整份回读（{@code ≤64 MiB}），
+     * 视频抽头/1/4/1/2/3/4/尾共 5 段。
+     */
+    private void requireMatchingRemoteBytes(WebDavClient client, String remotePath, File file,
+            long size, String expectedSha256) throws IOException {
+        if (!RemoteByteCheck.verify(client, remotePath, file, size, expectedSha256)) {
+            Logger.w("event=upload_bytes_mismatch remote=" + remotePath + " size=" + size);
+            throw new IOException("remote bytes differ from the uploaded file"
+                    + " remote=" + remotePath);
+        }
+        Logger.d("event=upload_bytes_verified remote=" + remotePath + " size=" + size);
     }
 
     /**
