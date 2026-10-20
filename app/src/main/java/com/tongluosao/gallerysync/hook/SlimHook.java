@@ -220,6 +220,12 @@ final class SlimHook {
             return 0L;
         }
 
+        long t0 = System.nanoTime();
+        long tVerifyEnd = 0L;
+        long tEncodeEnd = 0L;
+        long tLeaseEnd = 0L;
+        long tPublishEnd = 0L;
+        long tDbEnd = 0L;
         try {
             if (!verifiedByMigration
                     && !store.ensureVerifiedRemoteOriginal(config, item.rowId, item.sha1)) {
@@ -230,6 +236,7 @@ final class SlimHook {
             Logger.e("event=slim_remote_verify_failed path=" + item.path, t);
             return 0L;
         }
+        tVerifyEnd = System.nanoTime();
 
         // 下载高清图与空间优化共用同一个副本路径：隐藏目录里一个与原图同名的文件。
         File preview;
@@ -275,6 +282,7 @@ final class SlimHook {
                 Logger.i("event=slim_skipped reason=preview_not_smaller path=" + item.path);
                 return 0L;
             }
+            tEncodeEnd = System.nanoTime();
 
             // Acquire the source write lease before registering it as derived. This waits for any
             // native upload holding the matching read lease, and then protects the source through
@@ -297,6 +305,7 @@ final class SlimHook {
                 Logger.w("event=slim_skipped reason=preview_registration_failed path=" + item.path);
                 return 0L;
             }
+            tLeaseEnd = System.nanoTime();
 
             synchronized (mConfigLock) {
                 if (!isCurrentTargetLocked(config)) {
@@ -308,6 +317,7 @@ final class SlimHook {
                 publish(staged, preview);
                 previewReplaced = true;
                 PreviewFileTime.copyModifiedTime(original, preview);
+                tPublishEnd = System.nanoTime();
                 if (!store.registerDerivedPath(config, item.rowId, item.sha1, preview)) {
                     Logger.w("event=slim_db_update_skipped reason=preview_fingerprint_failed path="
                             + item.path);
@@ -329,6 +339,7 @@ final class SlimHook {
                     return 0L;
                 }
                 previewCommitted = true;
+                tDbEnd = System.nanoTime();
                 // Native publication may touch the thumbnail; keep screenshot chronology even
                 // when no EXIF capture date exists.
                 PreviewFileTime.copyModifiedTime(original, preview);
@@ -364,6 +375,15 @@ final class SlimHook {
             // been confirmed to point at it.
             return 0L;
         } finally {
+            long tEnd = System.nanoTime();
+            Logger.i("event=slim_timing total=" + elapsedMillis(t0, tEnd)
+                    + " verify=" + elapsedMillis(t0, tVerifyEnd)
+                    + " encode=" + elapsedMillis(tVerifyEnd, tEncodeEnd)
+                    + " lease=" + elapsedMillis(tEncodeEnd, tLeaseEnd)
+                    + " publish=" + elapsedMillis(tLeaseEnd, tPublishEnd)
+                    + " db=" + elapsedMillis(tPublishEnd, tDbEnd)
+                    + " tail=" + elapsedMillis(tDbEnd, tEnd)
+                    + " path=" + item.path);
             if (staged != null && staged.exists() && !staged.delete()) {
                 Logger.d("event=slim_temp_cleanup_failed path=" + staged.getAbsolutePath());
             }
@@ -375,6 +395,11 @@ final class SlimHook {
             if (previewLease != null) previewLease.close();
             if (originalLease != null) originalLease.close();
         }
+    }
+
+    private static long elapsedMillis(long from, long to) {
+        if (from <= 0L || to <= 0L || to < from) return -1L;
+        return (to - from) / 1_000_000L;
     }
 
     private boolean videoRestoreReady() {

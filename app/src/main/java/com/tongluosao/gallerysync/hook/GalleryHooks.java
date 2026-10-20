@@ -73,6 +73,19 @@ public final class GalleryHooks {
     /** 模块 App 发来的命令广播的接收器；注册后要留着引用，注销时才找得到 */
     private volatile BroadcastReceiver mCommandReceiver;
 
+    /**
+     * 同一页任务被重复交回来的合并窗口。空间优化每完成一张都会把同一页再交一遍，
+     * 每遍都要反射读完上千项再逐项查账本，真正干活的是同一批。窗口内首尾项与条数
+     * 都一致时沿用上一次结论：拦截/放行不变，没入队的项下一轮照样会再交回来。
+     */
+    private static final long BATCH_COALESCE_MS = 1500L;
+    private long mLastBatchAt;
+    private int mLastBatchSize = -1;
+    private String mLastBatchFirstKey;
+    private String mLastBatchLastKey;
+    /** 上一次确实把这一批交给队列了；没交成功时不许合并，否则会把上传饿死 */
+    private boolean mLastBatchEnqueued;
+
     private GalleryHooks(XposedInterface xposed, ClassLoader classLoader) {
         this.mXposed = xposed;
         this.mClassLoader = classLoader;
@@ -491,6 +504,21 @@ public final class GalleryHooks {
         int thumbnails = 0;
         int others = 0;
         int unreadable = 0;
+        String firstKey = batchEdgeKey(raw, 0);
+        String lastKey = batchEdgeKey(raw, raw.size() - 1);
+        long nowMs = System.nanoTime() / 1_000_000L;
+        if (mLastBatchEnqueued && raw.size() == mLastBatchSize
+                && nowMs - mLastBatchAt < BATCH_COALESCE_MS
+                && firstKey != null && firstKey.equals(mLastBatchFirstKey)
+                && lastKey != null && lastKey.equals(mLastBatchLastKey)) {
+            Logger.d("event=invoke_list_coalesced total=" + raw.size());
+            return replaceMode;
+        }
+        mLastBatchAt = nowMs;
+        mLastBatchSize = raw.size();
+        mLastBatchFirstKey = firstKey;
+        mLastBatchLastKey = lastKey;
+        mLastBatchEnqueued = false;
         // 这里**故意不截断**：以前有个 max_items_per_sync 上限，真机量下来它从来没生效过 ——
         // 相册每次只交来一页（实测最大 998 行），而上限默认就是 1000，等于永远不裁。
         // 调小它也只是把"一轮喂多少项"切碎，队列该涨还是涨（实测 12649 项待传），
@@ -567,12 +595,26 @@ public final class GalleryHooks {
         }
         try {
             queue.enqueue(backup);
+            mLastBatchEnqueued = true;
         } catch (Throwable t) {
             Logger.e("event=enqueue_failed", t);
+            mLastBatchEnqueued = false;
             // 入队炸了同样别改道：这批留在相册侧，下轮再来
             return replace;
         }
         return replace;
+    }
+
+    /** 一页任务的首/尾指纹：优先挑那种同一批里每次都一样、又不必整页反射读的字段。 */
+    private String batchEdgeKey(List<Object> raw, int index) {
+        if (index < 0 || index >= raw.size()) {
+            return null;
+        }
+        CloudItemReader.Item item = mReader.read(raw.get(index));
+        if (item == null) {
+            return "null";
+        }
+        return item.priority + "|" + item.path + "|" + item.size;
     }
 
     /**
