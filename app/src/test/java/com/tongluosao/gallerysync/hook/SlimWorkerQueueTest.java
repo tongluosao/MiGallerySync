@@ -78,14 +78,15 @@ public final class SlimWorkerQueueTest {
     // ------------------------------------------------------------ 并发数
 
     @Test
-    public void clampConcurrencyStaysWithinOneToFour() {
+    public void clampConcurrencyStaysWithinOneToEight() {
         assertEquals(1, SlimWorker.clampConcurrency(1));
         assertEquals(2, SlimWorker.clampConcurrency(2));
         assertEquals(4, SlimWorker.clampConcurrency(4));
-        assertEquals(4, SlimWorker.clampConcurrency(17));
-        // 调用方没指定（<=0）就走默认 3，而不是被夹成 1
-        assertEquals(3, SlimWorker.clampConcurrency(-3));
-        assertEquals(3, SlimWorker.clampConcurrency(0));
+        assertEquals(8, SlimWorker.clampConcurrency(8));
+        assertEquals(8, SlimWorker.clampConcurrency(17));
+        // 调用方没指定（<=0）就走默认 6，而不是被夹成 1
+        assertEquals(6, SlimWorker.clampConcurrency(-3));
+        assertEquals(6, SlimWorker.clampConcurrency(0));
     }
 
     // ------------------------------------------------------------ 停止后不再取任务

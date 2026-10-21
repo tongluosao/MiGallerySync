@@ -40,7 +40,7 @@ import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /** 默认并行路数。设置页里能改，这里只是"开始"按钮的初值 —— 3 路是经验上相册 IO 不卡的上限 */
-private const val DEFAULT_CONCURRENCY = 3
+private const val DEFAULT_CONCURRENCY = 6
 
 /** 文件名超过这个长度就中间省略：HEIC 的尾巴（扩展名）比开头更有辨识度 */
 private const val MAX_NAME_CHARS = 32
