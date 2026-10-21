@@ -344,8 +344,17 @@ public final class OriginalStore {
         WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
                 config.getPassword());
         try {
-            // 先确认对象还在、长度没变；长度不对连读都不用读
-            if (!client.storedAs(remotePath, length)) {
+            // 先确认对象还在、长度没变；长度不对连读都不用读。
+            // 优先 PROPFIND：这台 OpenList 对移动客户端的 HEAD 会挂十几秒，而老照片建档是逐个
+            // 走的，一次 HEAD 卡住就是一张 20 秒。问不出来才退回 HEAD 那条路。
+            boolean present;
+            long remoteLength = client.propfindSize(remotePath);
+            if (remoteLength >= 0L) {
+                present = remoteLength == 0L || remoteLength == length;
+            } else {
+                present = remoteLength != -1L && client.storedAs(remotePath, length);
+            }
+            if (!present) {
                 return false;
             }
             if (!RemoteByteCheck.verify(client, remotePath, localOriginal, length, localDigest)) {
@@ -1373,8 +1382,17 @@ public final class OriginalStore {
             mLocalOriginal = localOriginal;
         }
 
+        /**
+         * 远端原件是否还在、长度是否还是这个值。
+         *
+         * <p>先用一次 PROPFIND Depth 0 问大小，问得出来就直接给答案：这台 OpenList 对移动客户端
+         * 的 HEAD 会整条挂住十几秒（模块日志里成片的 {@code HEAD ... failed: SocketTimeoutException}），
+         * 而空间优化每张照片都要走这一步，HEAD 一卡就变成 20 秒一张。PROPFIND 0.3 秒就能答。
+         * 只有 PROPFIND 问不出来（不支持/网络失败/大小未知）才退回原来那条 HEAD+PROPFIND 的路。
+         */
         @Override
         public boolean stillStored(String remotePath, long expectedLength) throws IOException {
+            // storedAs 现在先走 PROPFIND、问不出来才走 HEAD，这里直接用即可
             return mClient.storedAs(remotePath, expectedLength);
         }
 

@@ -57,6 +57,18 @@ public final class ProgressProtocol {
     /** Restore metadata-corrupted originals listed in Gallery's private request file. */
     public static final String CMD_RESTORE_METADATA_ORIGINALS = "restore_metadata_originals";
 
+    /**
+     * 启动模块自己的空间优化队列。相册进程收到后自己查候选（{@code SlimCandidates}）、
+     * 起工作线程池；进度走 {@link #STATE_*} 那套广播回模块 App 的优化页。
+     */
+    public static final String CMD_SLIM_START = "slim_start";
+
+    /** 停止空间优化队列：正在处理的那张做完就收尾，不再领新任务 */
+    public static final String CMD_SLIM_STOP = "slim_stop";
+
+    /** 优化并发路数（1..4），随 {@link #CMD_SLIM_START} 一起下发 */
+    public static final String EXTRA_CONCURRENCY = "concurrency";
+
     /** 命令广播的唯一 extra：命令名 */
     public static final String EXTRA_COMMAND = "command";
 

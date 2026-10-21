@@ -12,6 +12,7 @@
 
     <string name="tab_settings">设置</string>
     <string name="tab_progress">进度</string>
+    <string name="slim_title">空间优化</string>
 
     <string name="hint_base_url">服务器地址</string>
     <string name="hint_username">用户名</string>

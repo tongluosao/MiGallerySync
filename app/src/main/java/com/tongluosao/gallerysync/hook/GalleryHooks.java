@@ -37,6 +37,9 @@ import io.github.libxposed.api.XposedInterface;
  */
 public final class GalleryHooks {
 
+    /** 模块自驱优化队列的默认并发路数；界面可覆盖，最终由 {@code SlimWorker} 夹到 1..4 */
+    private static final int DEFAULT_SLIM_CONCURRENCY = 4;
+
     private static final String CLS_UP_DOWNLOAD_MANAGER = "com.miui.gallery.cloud.UpDownloadManager";
     private static final String CLS_GALLERY_APP = "com.miui.gallery.GalleryApp";
     private static final String CLS_SFS_TRANSFER_MANAGER =
@@ -330,6 +333,11 @@ public final class GalleryHooks {
         mOriginalRestoreHook = hook;
     }
 
+    /** 当前生效的配置；{@code mConfig} 会在配置变更时被整体替换，所以只取当时的快照 */
+    private Config currentConfig() {
+        return mConfig;
+    }
+
     private void installSlimHook() {
         SlimHook hook = new SlimHook(mXposed, mClassLoader);
         hook.setConfig(mConfig);
@@ -339,6 +347,8 @@ public final class GalleryHooks {
         });
         hook.install();
         mSlimHook = hook;
+        // 把相册自己的"空间优化"页面换成模块的页面（见 SlimEntryHook 的类注释）
+        new SlimEntryHook(mXposed, mClassLoader, this::currentConfig).install();
     }
 
     private void installNativeDownloadHook() {
@@ -771,7 +781,7 @@ public final class GalleryHooks {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
                     try {
-                        handleCommand(intent.getStringExtra(ProgressProtocol.EXTRA_COMMAND));
+                        handleCommand(intent);
                     } catch (Throwable t) {
                         // 广播接收器里漏出去的异常会打死宿主的接收线程
                         Logger.e("event=command_failed", t);
@@ -792,7 +802,11 @@ public final class GalleryHooks {
     }
 
     /** 执行一条来自模块 App 的命令。未知命令只留痕，不猜。 */
-    private void handleCommand(String command) {
+    private void handleCommand(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String command = intent.getStringExtra(ProgressProtocol.EXTRA_COMMAND);
         if (command == null || command.isEmpty()) {
             return;
         }
@@ -807,7 +821,36 @@ public final class GalleryHooks {
                 return;
             }
             mMetadataRestoreJob.start(context, config);
+        } else if (ProgressProtocol.CMD_SLIM_START.equals(command)) {
+            startSlimWorker(intent.getIntExtra(ProgressProtocol.EXTRA_CONCURRENCY, DEFAULT_SLIM_CONCURRENCY));
+        } else if (ProgressProtocol.CMD_SLIM_STOP.equals(command)) {
+            SlimWorker.get().stop();
         }
+    }
+
+    /**
+     * 启动模块自己的空间优化队列。
+     *
+     * <p>候选由 {@link SlimCandidates} 查，工作线程池在 {@link SlimWorker}；这里只做
+     * "配置就绪 + 有候选" 这两道闸，然后把活交出去。一条队列同时只能有一轮在跑
+     * （{@code start} 在跑着的时候会返回 false）。
+     */
+    private void startSlimWorker(int concurrency) {
+        Context context = HostContext.get(mClassLoader);
+        Config config = mConfig;
+        if (context == null || config == null || !config.isReady()) {
+            Logger.w("event=slim_start_skipped reason=no_ready_context");
+            return;
+        }
+        List<Long> candidates = SlimCandidates.collect(context);
+        if (candidates.isEmpty()) {
+            Logger.i("event=slim_start_skipped reason=no_candidates");
+            return;
+        }
+        boolean started = SlimWorker.get().start(config, candidates, concurrency, 0);
+        Logger.i("event=slim_start_result started=" + started
+                + " candidates=" + candidates.size()
+                + " concurrency=" + concurrency);
     }
 
     /**

@@ -632,6 +632,13 @@ public final class WebDavClient {
      * 判定"确实没有"要 HEAD 与 PROPFIND 都不给活路，只看一条会误伤。
      */
     public boolean storedAs(String remotePath, long expectedSize) throws IOException {
+        // 先问一次对象级 PROPFIND（0.3 秒级）：这台 OpenList 对移动客户端的 HEAD 会整条挂住
+        // 十几秒，而上传后复核、旁车写入复核、空间优化前确认都走这里，HEAD 一卡全都变慢。
+        // 问不出来（-1 不存在 / -2 不支持 / 0 大小未知）再走下面那条 HEAD + 父目录兜底的老路。
+        long earlyPropSize = propfindSize(remotePath);
+        if (earlyPropSize > 0L && (expectedSize <= 0L || earlyPropSize == expectedSize)) {
+            return true;
+        }
         int headCode = -1;
         long headLength = -1L;
         int propCode = -1;
@@ -1533,6 +1540,35 @@ public final class WebDavClient {
             return size < 0L ? 0L : size;
         }
         return prop.code == 404 ? -1L : 0L;
+    }
+
+    /**
+     * 只用一次 PROPFIND Depth 0 问对象大小，**不发 HEAD**。
+     *
+     * <p>为什么单独开一个方法：这台 OpenList 对**移动网络客户端**的 HEAD 时不时整条挂住
+     * （实测模块日志里 {@code HEAD ... failed: java.net.SocketTimeoutException} 每次要等十几秒），
+     * 而空间优化每张照片都要确认一次"远端原件还在"，HEAD 一卡，整条队列就卡成 20 秒一张。
+     * PROPFIND 在这台服务器上 0.3 秒内就能答。
+     *
+     * @return 正整数=对象大小；0=存在但大小未知；-1=明确不存在；-2=问不出来（不支持/网络失败）
+     */
+    public long propfindSize(String remotePath) throws IOException {
+        Res prop = propfind(remotePath, 0);
+        if (prop == null) {
+            return -2L;
+        }
+        if (prop.code == 401 || prop.code == 403) {
+            throw new IOException("auth failed code=" + prop.code + prop.detail);
+        }
+        if (prop.code == 404
+                || (prop.body != null && NOT_FOUND_STATUS.matcher(prop.body).find())) {
+            return -1L;
+        }
+        if (prop.code != 207) {
+            return -2L;
+        }
+        long size = contentLengthOf(prop);
+        return size < 0L ? 0L : size;
     }
 
     /** Unknown/404 sizes never authorize a skip; only a positive exact size does. */

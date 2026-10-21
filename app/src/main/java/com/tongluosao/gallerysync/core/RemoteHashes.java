@@ -355,7 +355,12 @@ public final class RemoteHashes {
         return new Io() {
             @Override
             public byte[] read(String remotePath) throws IOException {
-                long known = client.directRemoteSize(remotePath);
+                // 先 PROPFIND 问大小：这台 OpenList 对移动客户端的 HEAD 会挂十几秒，而空间优化
+                // 每张照片都要先读一次旁车，HEAD 一卡就是 20 秒一张。问不出来才退回 HEAD 那条路。
+                long known = client.propfindSize(remotePath);
+                if (known == -2L || known == 0L) {
+                    known = client.directRemoteSize(remotePath);
+                }
                 if (known < 0L) {
                     return null;
                 }

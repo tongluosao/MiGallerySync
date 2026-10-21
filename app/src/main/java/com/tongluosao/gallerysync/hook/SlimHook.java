@@ -38,12 +38,23 @@ final class SlimHook {
     private static final String CLS_MEDIA_ITEM = CLS_CONTROLLER + "$MediaItem";
     private static final String CLS_CLOUD_CONTRACT = "com.miui.gallery.provider.GalleryContract$Cloud";
 
+    /**
+     * {@link #runSlim} 的返回值：这张不属于模块管理，调用方必须把它原样交还给相册自己的流程
+     * （命中条件是"没登记过、也不在当前目标的保护名单里"）。真实结果只有 0 和正数两种。
+     */
+    static final long PASSTHROUGH = Long.MIN_VALUE;
+
     private final XposedInterface mXposed;
     private final ClassLoader mClassLoader;
     private final Object mConfigLock = new Object();
     private volatile Config mConfig;
     private volatile SlimScannerHook mScannerHook;
     private volatile BooleanSupplier mVideoRestorePolicy = () -> false;
+    /** 宿主 {@code SlimController.saveToDB(int,String,String)}，install() 时解析一次。 */
+    private volatile Method mSaveToDb;
+
+    /** 上一张处理完的时刻，用来量相册自己在这张上花的时间（见 slim_timing 的 gap）。 */
+    private static volatile long sLastDoneNanos = 0L;
 
     SlimHook(XposedInterface xposed, ClassLoader classLoader) {
         mXposed = xposed;
@@ -86,6 +97,7 @@ final class SlimHook {
                     || !Modifier.isStatic(saveToDb.getModifiers())) {
                 throw new NoSuchMethodException("saveToDB is not static void");
             }
+            mSaveToDb = saveToDb;
 
             mXposed.hook(handleSlim)
                     .setId("gallery_slim_registered_original")
@@ -107,7 +119,13 @@ final class SlimHook {
                         if (item.path == null || item.path.isEmpty()) {
                             return chain.proceed();
                         }
-                        return interceptManaged(item, saveToDb, chain);
+                        // 单张流程抽成了 runSlim：模块自己的工作线程池（SlimWorker）也调它，
+                        // 两条入口共用同一份校验/编码/租约/发布/删除逻辑，日志一字不差。
+                        long saved = runSlim(item);
+                        if (saved != PASSTHROUGH) {
+                            return saved;
+                        }
+                        return chain.proceed();
                     });
             Logger.i("event=hook_registered method=SlimController.handleSlim(MediaItem,ArrayList)");
 
@@ -116,6 +134,8 @@ final class SlimHook {
             scanner.setVideoRestorePolicy(mVideoRestorePolicy);
             scanner.install();
             mScannerHook = scanner;
+            // 把宿主 ClassLoader 与本实例交给工作线程池（SlimWorker 自己驱动队列时要用）
+            SlimWorker.attach(this, mClassLoader);
         } catch (ClassNotFoundException e) {
             Logger.e("event=slim_hook_class_not_found class=" + CLS_CONTROLLER, e);
         } catch (NoSuchMethodException e) {
@@ -125,8 +145,19 @@ final class SlimHook {
         }
     }
 
-    private Object interceptManaged(SlimItem item, Method saveToDb,
-            XposedInterface.Chain chain) throws Throwable {
+    /**
+     * 跑完一张的完整流程：校验远端 → 编码 → 租约 → 发布 → saveToDB → 删原图 → 回滚。
+     *
+     * <p>相册自己的 {@code SlimController.handleSlim} 与本模块的工作线程池（{@link SlimWorker}）
+     * 都走这一份实现，行为与日志保持一致：能省下字节就返回省下的字节，跳过或失败返回 0，
+     * 而"这张根本不归模块管"时返回 {@link #PASSTHROUGH}，由调用方决定怎么交还给相册。
+     */
+    long runSlim(SlimItem item) {
+        Method saveToDb = mSaveToDb;
+        if (saveToDb == null) {
+            Logger.e("event=slim_save_db_unavailable");
+            return PASSTHROUGH;
+        }
         File original = new File(item.path);
         Context context = HostContext.get(mClassLoader);
         if (context == null) {
@@ -183,7 +214,8 @@ final class SlimHook {
                 // every path protected, which distinguishes it from an unregistered original.
                 try {
                     if (!store.isProtectedUpload(original, item.rowId, item.sha1)) {
-                        return chain.proceed();
+                        // 普通相册清理：交还给宿主自己的流程（工作线程池里没有 chain 可用）
+                        return PASSTHROUGH;
                     }
                 } catch (Throwable t) {
                     Logger.e("event=slim_classification_failed path=" + item.path, t);
@@ -221,6 +253,8 @@ final class SlimHook {
         }
 
         long t0 = System.nanoTime();
+        long lastDone = sLastDoneNanos;
+        long gapMillis = lastDone > 0L ? (t0 - lastDone) / 1_000_000L : -1L;
         long tVerifyEnd = 0L;
         long tEncodeEnd = 0L;
         long tLeaseEnd = 0L;
@@ -376,6 +410,7 @@ final class SlimHook {
             return 0L;
         } finally {
             long tEnd = System.nanoTime();
+            sLastDoneNanos = tEnd;
             Logger.i("event=slim_timing total=" + elapsedMillis(t0, tEnd)
                     + " verify=" + elapsedMillis(t0, tVerifyEnd)
                     + " encode=" + elapsedMillis(tVerifyEnd, tEncodeEnd)
@@ -383,6 +418,7 @@ final class SlimHook {
                     + " publish=" + elapsedMillis(tLeaseEnd, tPublishEnd)
                     + " db=" + elapsedMillis(tPublishEnd, tDbEnd)
                     + " tail=" + elapsedMillis(tDbEnd, tEnd)
+                + " gap=" + gapMillis
                     + " path=" + item.path);
             if (staged != null && staged.exists() && !staged.delete()) {
                 Logger.d("event=slim_temp_cleanup_failed path=" + staged.getAbsolutePath());
@@ -612,7 +648,7 @@ final class SlimHook {
         }
     }
 
-    private static final class ItemFields {
+    static final class ItemFields {
         final Field id;
         final Field path;
         final Field thumbnailPath;
@@ -660,7 +696,7 @@ final class SlimHook {
         }
     }
 
-    private static final class SlimItem {
+    static final class SlimItem {
         final int id;
         final String path;
         final String thumbnailFilePath;

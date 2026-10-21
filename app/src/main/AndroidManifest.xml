@@ -31,6 +31,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Gallerysync">
 
+        <!-- 空间优化页：由注入相册进程的 SlimEntryHook 拉起，所以必须 exported
+             （启动方是相册进程，不同 UID）。它只读写模块自己的 prefs 与进度广播，
+             不接收任何外部参数；没有权限保护也不扩大攻击面 -->
+        <activity
+            android:name=".ui.SlimActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|mnc|colorMode|density|fontScale|fontWeightAdjustment|keyboard|layoutDirection|locale|mcc|navigation|smallestScreenSize|touchscreen|uiMode"
+            android:exported="true"
+            android:label="@string/slim_title" />
+
         <activity
             android:name=".ui.SettingsActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|mnc|colorMode|density|fontScale|fontWeightAdjustment|keyboard|layoutDirection|locale|mcc|navigation|smallestScreenSize|touchscreen|uiMode"
