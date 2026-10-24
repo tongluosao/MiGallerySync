@@ -43,6 +43,16 @@ public final class OriginalStore {
     private static volatile OriginalStore sInstance;
     private static final ConcurrentHashMap<String, ReentrantReadWriteLock> PATH_LOCKS =
             new ConcurrentHashMap<>();
+    /**
+     * 远端校验专用的共享客户端。
+     *
+     * <p>空间优化每张照片都要先确认远端原件还在。之前每张都 {@code new WebDavClient(...)}，
+     * 而 {@link WebDavClient} 内部自持一个 OkHttp 客户端，等于每张照片重新做一次 DNS + TLS
+     * 握手，再发三四个往返请求；实测把 {@code verify} 拖到 13–30 秒，占掉单张总耗时的大头。
+     * 这里按配置缓存一个实例，其他上传/下载队列各自持有自己的客户端，互不影响。
+     */
+    private static volatile WebDavClient sVerifyClient;
+    private static volatile String sVerifyClientKey;
 
     private final Object mLock = new Object();
     private final File mFile;
@@ -1219,29 +1229,56 @@ public final class OriginalStore {
         if (!tempDir.exists() && !tempDir.mkdirs()) {
             throw new IOException("cannot create original verification directory");
         }
-        WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
-                config.getPassword());
-        try {
-            RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
-                    RemoteHashes.forClient(client, tempDir));
-            RemoteVerifyResult result = verifyRemote(record.remotePath, record.sha256,
-                    record.originalLength, hashes, new ClientGateway(client, tempDir,
-                            record.originalLocalPath == null ? null
-                                    : new File(record.originalLocalPath)));
-            if (!result.verified) {
-                return false;
+        WebDavClient client = verifyClient(config);
+        RemoteHashes hashes = new RemoteHashes(config.getRemoteRoot(),
+                RemoteHashes.forClient(client, tempDir));
+        RemoteVerifyResult result = verifyRemote(record.remotePath, record.sha256,
+                record.originalLength, hashes, new ClientGateway(client, tempDir,
+                        record.originalLocalPath == null ? null
+                                : new File(record.originalLocalPath)));
+        if (!result.verified) {
+            return false;
+        }
+        // 日志留在调用方而不是执行体里：执行体要能在没有 android.util.Log 的 JVM 单测里跑
+        if (result.hashHit) {
+            Logger.d("event=remote_hash_hit path=" + record.remotePath);
+        } else if (result.stale) {
+            Logger.d("event=remote_hash_stale path=" + record.remotePath);
+        } else {
+            Logger.d("event=remote_hash_backfilled path=" + record.remotePath);
+        }
+        return true;
+    }
+
+    /**
+     * 取（或建立）校验用共享客户端。配置变了就换新的，旧的关掉。
+     *
+     * <p>故意不对外暴露关闭：这个客户端活到进程结束，和上传/下载队列的长连接是一个思路。
+     */
+    private static WebDavClient verifyClient(Config config) {
+        String key = config.getBaseUrl() + "\n" + config.getUsername() + "\n"
+                + config.getPassword() + "\n" + config.getRemoteRoot();
+        WebDavClient cached = sVerifyClient;
+        if (cached != null && key.equals(sVerifyClientKey)) {
+            return cached;
+        }
+        synchronized (OriginalStore.class) {
+            if (sVerifyClient != null && key.equals(sVerifyClientKey)) {
+                return sVerifyClient;
             }
-            // 日志留在调用方而不是执行体里：执行体要能在没有 android.util.Log 的 JVM 单测里跑
-            if (result.hashHit) {
-                Logger.d("event=remote_hash_hit path=" + record.remotePath);
-            } else if (result.stale) {
-                Logger.d("event=remote_hash_stale path=" + record.remotePath);
-            } else {
-                Logger.d("event=remote_hash_backfilled path=" + record.remotePath);
+            WebDavClient fresh = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                    config.getPassword());
+            WebDavClient stale = sVerifyClient;
+            sVerifyClient = fresh;
+            sVerifyClientKey = key;
+            if (stale != null) {
+                try {
+                    stale.close();
+                } catch (Throwable ignored) {
+                    // 换客户端时关不掉旧连接不影响本次校验
+                }
             }
-            return true;
-        } finally {
-            client.close();
+            return fresh;
         }
     }
 

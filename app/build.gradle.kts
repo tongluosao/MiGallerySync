@@ -18,8 +18,8 @@ android {
         testInstrumentationRunner = "com.tongluosao.gallerysync.core.QualityValidationInstrumentation"
         // 发布必须升 versionCode：框架按目标进程里的 loadedVersionCode 判断那一代代码旧不旧。
         // 注意它不是"热重载失败"的原因（那是 onPackageReady 里的 detach()），号涨了也照样会被跳过
-        versionCode = 117
-        versionName = "1.2.61"
+        versionCode = 123
+        versionName = "1.2.66"
     }
 
     // 发布签名：CI 通过环境变量提供 keystore；本地没有这些变量时 release 不签名，
@@ -79,3 +79,8 @@ dependencies {
     // 底栏图标（设置/进度）。不加也能编译，只是 MiuixIcons.Settings 这类扩展属性不存在
     implementation(libs.miuix.icons)
 }
+
+
+
+
+

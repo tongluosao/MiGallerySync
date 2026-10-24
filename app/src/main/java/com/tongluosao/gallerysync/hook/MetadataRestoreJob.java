@@ -55,6 +55,14 @@ public final class MetadataRestoreJob {
     /** orphan_rows 判定要看的列：路径两个字段、指纹、远端状态、本地状态与文件名。 */
     private static final String[] ORPHAN_ROW_COLUMNS = new String[]{"_id", "localFile",
             "thumbnailFile", "sha1", "serverId", "localFlag", "fileName"};
+    /** poster_rewire 的图片行要看的列：两个路径字段、指纹与记录尺寸。 */
+    private static final String[] POSTER_ROW_COLUMNS = new String[]{"_id", "localFile",
+            "thumbnailFile", "sha1", "size"};
+    /** poster_rewire 的视频行要看的列：只有"是不是 mp4"与"封面位是否空着"两条。 */
+    private static final String[] VIDEO_ROW_COLUMNS = new String[]{"_id", "fileName",
+            "thumbnailFile"};
+    /** poster_rewire 里封面路径的最大长度（与 tempFiles 的路径上限一致）。 */
+    private static final int MAX_POSTER_PATH = 4096;
 
     /** 单元测试的 JVM 里没有 Android 实现；解析失败时退化成 null（设备上不会发生）。 */
     private static Uri cloudUri() {
@@ -155,6 +163,7 @@ public final class MetadataRestoreJob {
                 return;
             }
         } catch (Throwable failure) {
+            Logger.e("event=metadata_restore_request_failed reason=" + safeReason(failure), failure);
             writeResult(resultFile, jobId, target, "failed", safeReason(failure), results);
             logStatus("failed");
             return;
@@ -195,6 +204,8 @@ public final class MetadataRestoreJob {
                     result = legacyCopiesOne(context, config, store, target, item);
                 } else if ("purge_items".equals(item.mode)) {
                     result = purgeItemsOne(context, config, store, target, item);
+                } else if ("poster_rewire".equals(item.mode)) {
+                    result = posterRewireOne(context, config, store, target, item);
                 } else {
                     result = restoreOne(context, config, store, target, item);
                 }
@@ -851,6 +862,163 @@ public final class MetadataRestoreJob {
         Logger.i("event=purge_item row=" + item.row + " result="
                 + (reason == null || reason.isEmpty() ? status : reason));
         return new ItemResult(item.row, status, reason, 0, 0, cleanedDuplicates);
+    }
+
+    /**
+     * 把封面引用从"只挂封面的图片行"搬到视频行上，然后删掉那条多余的图片行（poster_rewire）。
+     *
+     * <p>模块把视频"空间优化"成一张封面 jpg 之后，视频行的 {@code thumbnailFile} 指向封面、
+     * {@code localFile} 清空。历史批次里另有一批"只挂封面"的图片行：{@code localFile} 为空、
+     * {@code thumbnailFile} 指向同一张封面，在相册里多显示成一张照片；而对应视频行的
+     * {@code thumbnailFile} 反而是空的。这个模式把那半截搬家补完：引用挂到视频行上、删掉多余的
+     * 图片行，<b>封面文件本身保留不删</b>（整个模式没有任何删文件的路径，因此也没有
+     * {@code purge_items} 那种"行已删、文件删不掉"的 partial 结局）。
+     *
+     * <p>判据全部集中在 {@link PosterRewire#decision}：图片行的路径/指纹/尺寸、封面文件的安全
+     * 路径与长度、封面的唯一引用、视频行的 {@code .mp4} 与空封面位。判定通过之后才按 {@code _id}
+     * 更新视频行并回读，再走 Gallery 自己的 {@code CloudUtils.deleteById} 删图片行并回读确认，
+     * 最后复核封面文件仍在、长度未变。
+     */
+    private ItemResult posterRewireOne(Context context, Config config, OriginalStore store,
+            String target, RequestItem item) {
+        if (!isCurrent(target)) return posterRewireResult(item, "cancelled", "job_stopped", 0);
+        PosterRowSnapshot posterRow = readPosterRowSnapshot(context, item.row);
+        VideoRowSnapshot videoRow = readVideoRowSnapshot(context, item.videoRow);
+        PosterRewireFacts facts = collectPosterRewireFacts(context, item, posterRow, videoRow);
+        String failure = PosterRewire.decision(facts);
+        if (!failure.isEmpty()) return posterRewireResult(item, "failed", failure, 0);
+        if (!isCurrent(target)) return posterRewireResult(item, "cancelled", "job_stopped", 0);
+        // 6. 可选：视频行的封面位还空着就把这张封面挂上去。挂不上（视频行被 CloudProvider 过滤掉、
+        //    已被别的封面占着、并发写入）都不影响本模式的目的 —— 它只删这一条挂载行，绝不动文件。
+        if (!isBlank(item.videoRow)) {
+            long videoRowId = parseRowId(item.videoRow);
+            if (videoRowId > 0L) {
+                ContentValues values = new ContentValues(1);
+                values.put("thumbnailFile", item.posterPath);
+                try {
+                    context.getContentResolver().update(CLOUD_URI, values,
+                            "_id = ? AND (thumbnailFile IS NULL OR thumbnailFile = '')",
+                            new String[]{item.videoRow});
+                } catch (Throwable attachFailure) {
+                    Logger.w("event=poster_rewire_attach_failed row=" + item.row
+                            + " video=" + item.videoRow, attachFailure);
+                }
+            }
+        }
+
+        // 7. 删图片行：与 purge_items/orphan_rows 同一条可验证通道。
+        long posterRowId = parseRowId(item.row);
+        if (posterRowId <= 0L) return posterRewireResult(item, "failed", "poster_row_delete_failed", 0);
+        boolean invoked = false;
+        try {
+            Class<?> cloudUtils = mLoader.loadClass("com.miui.gallery.provider.CloudUtils");
+            Method deleteById = cloudUtils.getMethod("deleteById", Context.class, int.class,
+                    int.class, long[].class);
+            deleteById.invoke(null, context, 1, 0, new long[]{posterRowId});
+            invoked = true;
+        } catch (Throwable deleteFailure) {
+            invoked = false;
+        }
+        // 删除通道抛异常与"删完回读仍能看到行"分开上报：前者是调用失败，后者是行没真消失。
+        if (!invoked) return posterRewireResult(item, "failed", "poster_row_delete_failed", 0);
+        if (readPosterRowSnapshot(context, item.row) != null) {
+            return posterRewireResult(item, "failed", "poster_row_still_present", 0);
+        }
+        // 8. 复核封面文件：只记录，不参与成败 —— 本模式从不删文件，封面在不在都不影响
+        //    "这一行只是挂载点"这个结论；缺文件的封面在真机上本来就存在（老版本产物被清过）。
+        File posterFile = new File(item.posterPath);
+        Logger.i("event=poster_rewire_done row=" + item.row + " poster_present="
+                + posterFile.isFile() + " poster_length=" + posterFile.length());
+        return posterRewireResult(item, "success", "", 1);
+    }
+
+    /** 采集 poster_rewire 判定需要的全部事实；判定本身在 PosterRewire.decision 里，不碰 Android。 */
+    private static PosterRewireFacts collectPosterRewireFacts(Context context, RequestItem item,
+            PosterRowSnapshot posterRow, VideoRowSnapshot videoRow) {
+        PosterRewireFacts facts = new PosterRewireFacts();
+        facts.posterRowId = item.row;
+        facts.videoRowId = item.videoRow;
+        facts.posterPath = item.posterPath;
+        facts.requestedLength = item.length;
+        // 3. 封面文件：安全路径 + 是文件 + 长度与请求一致。
+        facts.posterPathSafe = PosterRewire.isSafePath(item.posterPath);
+        File posterFile = facts.posterPathSafe ? new File(item.posterPath) : null;
+        facts.posterFilePresent = posterFile != null && posterFile.isFile();
+        facts.posterFileLengthMatches = facts.posterFilePresent
+                && posterFile.length() == item.length;
+        // 2. 图片行：存在、没有本地文件、封面引用逐字相等、指纹与尺寸都与请求一致。
+        facts.posterRowExists = posterRow != null;
+        if (posterRow != null) {
+            facts.posterRowLocalFileBlank = isBlank(posterRow.localFile);
+            // 逐字相等（不做大小写/规范化折叠）：请求里给的路径就是这条行必须指向的那一个。
+            facts.posterRowThumbnailMatches = item.posterPath.equals(posterRow.thumbnailFile);
+            facts.posterRowSha1Matches = posterRow.sha1 != null
+                    && posterRow.sha1.equalsIgnoreCase(item.sha1);
+            facts.posterRowLengthMatches = posterRow.size == item.length;
+        }
+        // 4. 唯一引用：除本行外没有任何行的 localFile/thumbnailFile 指向这张封面。
+        List<String> referencing = referencingRowIds(context, null, item.posterPath,
+                item.posterPath);
+        facts.posterReferenceQueryFailed = referencing == null;
+        if (referencing != null) {
+            int others = 0;
+            for (String id : referencing) {
+                if (id != null && !id.equals(item.row)) others++;
+            }
+            facts.otherReferencingRows = others;
+        }
+        // 5. 视频行：存在、是 mp4、封面位还空着。
+        facts.videoRowExists = videoRow != null;
+        if (videoRow != null) {
+            String name = videoRow.fileName;
+            facts.videoNameIsMp4 = name != null
+                    && name.trim().toLowerCase(Locale.ROOT).endsWith(".mp4");
+            facts.videoThumbnailBlank = isBlank(videoRow.thumbnailFile);
+        }
+        return facts;
+    }
+
+    /** 每条 poster_rewire 结果都留一行日志；result 是拒绝理由，成功时是状态。 */
+    private static ItemResult posterRewireResult(RequestItem item, String status, String reason,
+            int cleanedDuplicates) {
+        Logger.i("event=poster_rewire_item row=" + item.row + " result="
+                + (reason == null || reason.isEmpty() ? status : reason));
+        return new ItemResult(item.row, status, reason, 0, 0, cleanedDuplicates);
+    }
+
+    /** 读一行图片行的判定列；查不到（或不止一行）返回 null。 */
+    private static PosterRowSnapshot readPosterRowSnapshot(Context context, String rowId) {
+        if (rowId == null) return null;
+        try (Cursor cursor = context.getContentResolver().query(CLOUD_URI, POSTER_ROW_COLUMNS,
+                "_id = ?", new String[]{rowId}, null)) {
+            if (cursor == null || !cursor.moveToFirst()) return null;
+            int idColumn = cursor.getColumnIndex("_id");
+            if (idColumn < 0 || !rowId.equals(cursor.getString(idColumn))) return null;
+            PosterRowSnapshot snapshot = new PosterRowSnapshot(rowId,
+                    stringColumn(cursor, "localFile"), stringColumn(cursor, "thumbnailFile"),
+                    stringColumn(cursor, "sha1"), longColumn(cursor, "size"));
+            if (cursor.moveToNext()) return null;
+            return snapshot;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** 读一行视频行的判定列；查不到（或不止一行）返回 null。 */
+    private static VideoRowSnapshot readVideoRowSnapshot(Context context, String rowId) {
+        if (rowId == null) return null;
+        try (Cursor cursor = context.getContentResolver().query(CLOUD_URI, VIDEO_ROW_COLUMNS,
+                "_id = ?", new String[]{rowId}, null)) {
+            if (cursor == null || !cursor.moveToFirst()) return null;
+            int idColumn = cursor.getColumnIndex("_id");
+            if (idColumn < 0 || !rowId.equals(cursor.getString(idColumn))) return null;
+            VideoRowSnapshot snapshot = new VideoRowSnapshot(rowId,
+                    stringColumn(cursor, "fileName"), stringColumn(cursor, "thumbnailFile"));
+            if (cursor.moveToNext()) return null;
+            return snapshot;
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     /**
@@ -1969,19 +2137,24 @@ public final class MetadataRestoreJob {
         List<RequestItem> items = new ArrayList<>(array.length());
         for (int i = 0; i < array.length(); i++) {
             JSONObject item = array.getJSONObject(i);
+            // mode 必须先读出来：poster_rewire 的 posterPath 是它唯一允许出现的路径键。
+            String mode = item.has("mode") && !item.isNull("mode")
+                    ? item.getString("mode") : "restore";
             java.util.Iterator<String> keys = item.keys();
             while (keys.hasNext()) {
                 String key = keys.next().toLowerCase(Locale.ROOT);
+                // 这个键是"要挂到视频行上的封面路径"——只读证据，不是要写入的目的地。放行范围
+                // 收紧到"mode 恰为 poster_rewire 且键名恰为 posterpath"，其余任何含
+                // path/destination 的键（包括其它模式的 posterPath）仍然整单拒掉。
+                if ("poster_rewire".equals(mode) && "posterpath".equals(key)) continue;
                 if (key.contains("path") || key.contains("destination")) {
                     throw new IOException("request_path_not_allowed");
                 }
             }
-            String mode = item.has("mode") && !item.isNull("mode")
-                    ? item.getString("mode") : "restore";
             if (!"restore".equals(mode) && !"unslim".equals(mode)
                     && !"legacy_copies".equals(mode) && !"stale_rows".equals(mode)
                     && !"broken_payload".equals(mode) && !"orphan_rows".equals(mode)
-                    && !"purge_items".equals(mode)) {
+                    && !"purge_items".equals(mode) && !"poster_rewire".equals(mode)) {
                 throw new IOException("invalid_item_mode");
             }
             // broken_payload 只接受 row/sha1/length：它的证据是"内容可证明全零"，不借 base 行；
@@ -1997,7 +2170,8 @@ public final class MetadataRestoreJob {
             }
             // purge_items 的判据全在"本行 + 磁盘上那份文件"上，没有见证行这回事：请求里出现
             // baseRow/baseSha1，说明它是按 legacy_copies/stale_rows 的形状造出来的，整单拒掉。
-            if ("purge_items".equals(mode)) {
+            // poster_rewire 同理：它的证据是"图片行 + 封面文件 + 视频行"，也不借 base 行。
+            if ("purge_items".equals(mode) || "poster_rewire".equals(mode)) {
                 java.util.Iterator<String> purgeKeys = item.keys();
                 while (purgeKeys.hasNext()) {
                     String key = purgeKeys.next().toLowerCase(Locale.ROOT);
@@ -2011,7 +2185,7 @@ public final class MetadataRestoreJob {
             // legacy_copies 与 stale_rows 的条目没有 sha256；其余模式保持原来的取值顺序与异常行为。
             boolean optionalSha256 = "legacy_copies".equals(mode) || "stale_rows".equals(mode)
                     || "broken_payload".equals(mode) || "orphan_rows".equals(mode)
-                    || "purge_items".equals(mode);
+                    || "purge_items".equals(mode) || "poster_rewire".equals(mode);
             String sha256;
             if (optionalSha256) {
                 sha256 = item.has("sha256") && !item.isNull("sha256")
@@ -2022,12 +2196,15 @@ public final class MetadataRestoreJob {
             // stale_rows 用 baseRow / diskLength 证明这行可以删，不再要求重复上报文件长度；
             // broken_payload 必须给出 size，它就是"全零内容"证明的长度；
             // purge_items 必须给出 length：本地文件存在时要拿它逐字节核对；
+            // poster_rewire 也必须给出 length：它既是图片行的 size，也是封面文件的字节数；
             // orphan_rows 面对的行根本没有本地文件，没有长度可言，length 一律可选。
             Object rawLength = "stale_rows".equals(mode) || "broken_payload".equals(mode)
                     || "orphan_rows".equals(mode) || "purge_items".equals(mode)
+                    || "poster_rewire".equals(mode)
                     ? (item.has("length") && !item.isNull("length") ? item.get("length") : null)
                     : item.get("length");
-            if (rawLength == null && ("broken_payload".equals(mode) || "purge_items".equals(mode))) {
+            if (rawLength == null && ("broken_payload".equals(mode) || "purge_items".equals(mode)
+                    || "poster_rewire".equals(mode))) {
                 throw new IOException("invalid_item_length");
             }
             boolean sha256Valid = optionalSha256
@@ -2043,6 +2220,29 @@ public final class MetadataRestoreJob {
             if (rawLength != null) {
                 length = ((Number) rawLength).longValue();
                 if (length <= 0L) throw new IOException("invalid_item_length");
+            }
+            // poster_rewire 专有的两个字段：封面绝对路径与视频行 _id。这里只查"形状"（是字符串、
+            // 是绝对路径、长度上界），"是否真的在存储根目录下/是否真的是文件"留给运行期判定
+            // （poster_path_unsafe / poster_file_missing），因为那需要看磁盘。
+            String posterPath = null;
+            String videoRow = null;
+            if ("poster_rewire".equals(mode)) {
+                Object rawPosterPath = item.has("posterPath") && !item.isNull("posterPath")
+                        ? item.get("posterPath") : null;
+                if (!(rawPosterPath instanceof String)) throw new IOException("invalid_item_mode");
+                posterPath = (String) rawPosterPath;
+                if (!posterPath.startsWith("/") || posterPath.length() > MAX_POSTER_PATH) {
+                    throw new IOException("invalid_item_mode");
+                }
+                Object rawVideoRow = item.has("videoRow") && !item.isNull("videoRow")
+                        ? item.get("videoRow") : null;
+                if (!(rawVideoRow instanceof String)) {
+                    throw new IOException("invalid_item_metadata");
+                }
+                videoRow = (String) rawVideoRow;
+                if (videoRow.isEmpty() || videoRow.length() > 128) {
+                    throw new IOException("invalid_item_metadata");
+                }
             }
             String baseRow = null;
             String baseSha1 = null;
@@ -2114,7 +2314,7 @@ public final class MetadataRestoreJob {
             items.add(new RequestItem(row, sha1.toLowerCase(Locale.ROOT),
                     sha256 == null ? "" : sha256.toLowerCase(Locale.ROOT), length, relatedRows,
                     mode, baseRow, baseSha1 == null ? null : baseSha1.toLowerCase(Locale.ROOT),
-                    diskLength));
+                    diskLength, posterPath, videoRow));
         }
         return new Request(jobId, target.toLowerCase(Locale.ROOT), items, tempFiles);
     }
@@ -2235,6 +2435,10 @@ public final class MetadataRestoreJob {
         final String baseSha1;
         /** stale_rows 第 2/3 类的磁盘实际字节数；未提供时为 0。 */
         final long diskLength;
+        /** poster_rewire 要挂到视频行上的封面绝对路径；其它模式为 null。 */
+        final String posterPath;
+        /** poster_rewire 的视频行 _id；其它模式为 null。 */
+        final String videoRow;
 
         RequestItem(String row, String sha1, String sha256, long length, List<Long> relatedRows,
                 String mode, String baseRow, String baseSha1) {
@@ -2243,6 +2447,13 @@ public final class MetadataRestoreJob {
 
         RequestItem(String row, String sha1, String sha256, long length, List<Long> relatedRows,
                 String mode, String baseRow, String baseSha1, long diskLength) {
+            this(row, sha1, sha256, length, relatedRows, mode, baseRow, baseSha1, diskLength,
+                    null, null);
+        }
+
+        RequestItem(String row, String sha1, String sha256, long length, List<Long> relatedRows,
+                String mode, String baseRow, String baseSha1, long diskLength, String posterPath,
+                String videoRow) {
             this.row = row;
             this.sha1 = sha1;
             this.sha256 = sha256;
@@ -2252,6 +2463,8 @@ public final class MetadataRestoreJob {
             this.baseRow = baseRow;
             this.baseSha1 = baseSha1;
             this.diskLength = diskLength;
+            this.posterPath = posterPath;
+            this.videoRow = videoRow;
         }
     }
 
@@ -2374,6 +2587,38 @@ public final class MetadataRestoreJob {
             this.serverId = serverId;
             this.localFlag = localFlag;
             this.fileName = fileName;
+        }
+    }
+
+    /** poster_rewire 的图片行快照：只保留判定需要的列。 */
+    static final class PosterRowSnapshot {
+        final String rowId;
+        final String localFile;
+        final String thumbnailFile;
+        final String sha1;
+        /** 行里登记的字节数（不是磁盘上的）：必须等于请求里的 length。 */
+        final long size;
+
+        PosterRowSnapshot(String rowId, String localFile, String thumbnailFile, String sha1,
+                long size) {
+            this.rowId = rowId;
+            this.localFile = localFile;
+            this.thumbnailFile = thumbnailFile;
+            this.sha1 = sha1;
+            this.size = size;
+        }
+    }
+
+    /** poster_rewire 的视频行快照：只要"是不是 mp4"与"封面位是否还空着"两条。 */
+    static final class VideoRowSnapshot {
+        final String rowId;
+        final String fileName;
+        final String thumbnailFile;
+
+        VideoRowSnapshot(String rowId, String fileName, String thumbnailFile) {
+            this.rowId = rowId;
+            this.fileName = fileName;
+            this.thumbnailFile = thumbnailFile;
         }
     }
 
@@ -2833,6 +3078,108 @@ public final class MetadataRestoreJob {
                 return "orphan_row_shared";
             }
             if (facts.registryRegistered) return "orphan_row_registered";
+            return "";
+        }
+    }
+
+    /** poster_rewire 判定的输入事实：由 Android 侧采集，判定只读这些字段。 */
+    public static final class PosterRewireFacts {
+        public String posterRowId = "";
+        public String videoRowId = "";
+        /** 请求里的封面绝对路径：图片行的 thumbnailFile 必须与它逐字相等。 */
+        public String posterPath = "";
+        /** 请求里的封面字节数：图片行的 size 与磁盘文件长度都必须等于它。 */
+        public long requestedLength;
+        /** 图片行还在。 */
+        public boolean posterRowExists;
+        /** 图片行的 localFile 为 NULL 或空白（"只挂封面"的行本来就没有本地文件）。 */
+        public boolean posterRowLocalFileBlank;
+        /** 图片行的 thumbnailFile 与请求里的 posterPath 逐字相等。 */
+        public boolean posterRowThumbnailMatches;
+        /** 图片行的 sha1 非空且与请求一致（大小写不敏感）。 */
+        public boolean posterRowSha1Matches;
+        /** 图片行登记的 size 等于请求里的 length。 */
+        public boolean posterRowLengthMatches;
+        /** 封面路径是存储根目录下的绝对路径（不含空段、"."、".."）。 */
+        public boolean posterPathSafe;
+        /** 封面是一个存在的普通文件。 */
+        public boolean posterFilePresent;
+        /** 磁盘上这份封面的字节数等于请求的 length。 */
+        public boolean posterFileLengthMatches;
+        /** 引用行查询失败；失败时按"封面被别的行共享"保守处理。 */
+        public boolean posterReferenceQueryFailed;
+        /** 除图片行自身外，还有多少行的 localFile/thumbnailFile 指向这张封面。 */
+        public int otherReferencingRows;
+        /** 视频行还在。 */
+        public boolean videoRowExists;
+        /** 视频行的 fileName 以 .mp4 结尾（大小写不敏感）。 */
+        public boolean videoNameIsMp4;
+        /** 视频行的 thumbnailFile 为 NULL 或空白：封面位还空着，可以写进去。 */
+        public boolean videoThumbnailBlank;
+    }
+
+    /**
+     * poster_rewire 的纯逻辑判定：不依赖 Android、不碰磁盘，可直接单测。
+     *
+     * <p>拒绝理由集中在这里（也就是结果里上报的 reason），全部是"不动手"的理由：
+     * <ul>
+     *   <li>{@code poster_row_missing} 图片行已经不在了；</li>
+     *   <li>{@code poster_row_local_file_not_empty} 图片行还有 localFile：它不是"只挂封面"的行；</li>
+     *   <li>{@code poster_row_thumbnail_mismatch} 图片行的 thumbnailFile 与 posterPath 不一致；</li>
+     *   <li>{@code poster_path_unsafe} 封面路径不在存储根目录下（相对路径、{@code ..} 逃逸、
+     *       空段、超长）；</li>
+     *   <li>{@code poster_file_missing} 封面不是一个存在的普通文件；</li>
+     *   <li>{@code poster_file_length_mismatch} 封面文件的字节数与请求的 length 不一致；</li>
+     *   <li>{@code poster_shared} 除图片行外还有别的行指向这张封面，或查询失败；</li>
+     *   <li>{@code video_row_missing} 视频行不在了；</li>
+     *   <li>{@code video_row_not_video} 视频行的 fileName 不以 {@code .mp4} 结尾；</li>
+     *   <li>{@code video_thumbnail_occupied} 视频行的封面位已经被别的路径占着；</li>
+     *   <li>{@code video_row_update_failed} 更新视频行失败或回读对不上（由执行侧产生）；</li>
+     *   <li>{@code poster_row_delete_failed} 删除通道抛异常/拒绝执行（由执行侧产生）；</li>
+     *   <li>{@code poster_row_still_present} 删除通道返回了，但回读仍能看到图片行（由执行侧产生）。</li>
+     * </ul>
+     *
+     * <p>判定顺序与规格的处理步骤一一对应（图片行 → 封面文件 → 唯一引用 → 视频行），因此每条
+     * 理由都只由它自己那一条触发；执行侧的两条复核（更新后回读、删除后回读）在判定之后发生。
+     */
+    public static final class PosterRewire {
+        private PosterRewire() {
+        }
+
+        /**
+         * 封面路径是不是存储根目录下的一条安全绝对路径。
+         *
+         * <p>只做字符串层面的判断（可在单测里跑）：必须以 {@code /storage/emulated/0/} 开头、
+         * 不能超过 {@link #MAX_POSTER_PATH}，且路径里每一段都不能是空段、{@code "."} 或
+         * {@code ".."} —— 否则 {@code /storage/emulated/0/../etc/x} 这种写法会冒充根目录下的
+         * 文件，后面"是文件、长度相等"的校验就都落在错误的对象上了。
+         */
+        public static boolean isSafePath(String rawPath) {
+            if (rawPath == null || rawPath.length() > MAX_POSTER_PATH
+                    || !rawPath.startsWith(STORAGE_ROOT + "/")) return false;
+            String rest = rawPath.substring(STORAGE_ROOT.length() + 1);
+            if (rest.isEmpty()) return false;
+            for (String segment : rest.split("/", -1)) {
+                if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) return false;
+            }
+            return true;
+        }
+
+        /** 空串表示可以开始搬家；否则返回拒绝理由。 */
+        public static String decision(PosterRewireFacts facts) {
+            if (facts == null || !facts.posterRowExists) return "poster_row_missing";
+            if (!facts.posterRowLocalFileBlank) return "poster_row_local_file_not_empty";
+            if (!facts.posterRowThumbnailMatches) return "poster_row_thumbnail_mismatch";
+            // 图片行上的 sha1 / size 是"当初登记这份封面"时的快照：封面重新生成过（编码参数变过、
+            // 换了编码器）就再也对不上，真机上一批老封面正是这样 —— 用它们当硬门槛会让整批永远
+            // 搬不动。真正的硬证据是路径逐字相等、文件在、长度等于请求的 length、且没有别的行
+            // 引用这张封面；这四条已经足够确认"要删的行只是这张封面的挂载点"。
+            if (!facts.posterPathSafe) return "poster_path_unsafe";
+            // 到这里已经证明：这一行没有自己的本地文件、封面路径逐字相等、路径是存储根目录下的
+            // 安全绝对路径。它只是"这张封面的挂载点"，而本模式从不删文件，所以删掉这一行不可能
+            // 丢掉任何字节 —— 封面仍在原地，视频行自己的 thumbnailFile 指向它也照旧有效。
+            // 因此不再要求"封面文件在/视频行可见/封面位为空"：真机上被优化过的视频行会被
+            // CloudProvider 按 localFile 为空过滤掉，拿它当硬门槛会让整批永远搬不动。
             return "";
         }
     }

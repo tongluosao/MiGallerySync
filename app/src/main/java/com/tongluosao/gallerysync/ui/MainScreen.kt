@@ -26,9 +26,9 @@ private const val TAB_SLIM = 1
 private const val TAB_SETTINGS = 2
 
 /**
- * 模块的主界面：底栏在「上传下载」「空间优化」「设置」之间切换。
+ * 模块的主界面：底栏在「设置」「上传下载」「空间优化」之间切换。
  *
- * 「设置」是落地页 —— 从相册设置页跳进来的人多半是来改配置的，先给进度页等于每次都要多点一下。
+ * 「设置」既是第一位也是落地页 —— 从相册设置页跳进来的人多半是来改配置的，先给进度页等于每次都要多点一下。
  *
  * 主题控制器、顶栏与底栏都提到这一层，页面只交出滚动区：放在页里的话每次切页都会
  * 重建底栏，能看见它闪一下，而且滚动位置与顶栏的收缩状态也会丢。
@@ -79,6 +79,12 @@ fun MainScreen(
             bottomBar = {
                 NavigationBar {
                     NavigationBarItem(
+                        selected = tab == TAB_SETTINGS,
+                        onClick = { tab = TAB_SETTINGS },
+                        icon = MiuixIcons.Settings,
+                        label = stringResource(R.string.tab_settings)
+                    )
+                    NavigationBarItem(
                         selected = tab == TAB_UPLOAD_DOWNLOAD,
                         onClick = { tab = TAB_UPLOAD_DOWNLOAD },
                         icon = MiuixIcons.Backup,
@@ -89,12 +95,6 @@ fun MainScreen(
                         onClick = { tab = TAB_SLIM },
                         icon = MiuixIcons.Delete,
                         label = stringResource(R.string.tab_slim)
-                    )
-                    NavigationBarItem(
-                        selected = tab == TAB_SETTINGS,
-                        onClick = { tab = TAB_SETTINGS },
-                        icon = MiuixIcons.Settings,
-                        label = stringResource(R.string.tab_settings)
                     )
                 }
             }
