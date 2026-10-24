@@ -39,8 +39,10 @@ public final class WebDavVideoSource implements AutoCloseable {
     private static final int MAX_LINE_BYTES = 4 * 1024;
     private static final int LOCAL_READ_TIMEOUT_MS = 15_000;
     private static final long IDLE_EXPIRY_MS = TimeUnit.MINUTES.toMillis(30);
-    private static final long MAX_LIFETIME_MS = TimeUnit.HOURS.toMillis(4);
+    private static final long WARMUP_BUDGET_MS = 8_000L;    private static final long MAX_LIFETIME_MS = TimeUnit.HOURS.toMillis(4);
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static volatile WebDavClient sSharedClient;
+    private static volatile String sSharedClientKey;
 
     private final Set<Socket> mLocalSockets = ConcurrentHashMap.newKeySet();
     private final Set<WebDavClient.RangeCall> mActiveCalls = ConcurrentHashMap.newKeySet();
@@ -60,6 +62,28 @@ public final class WebDavVideoSource implements AutoCloseable {
     private volatile String mPlaybackUrl;
 
     public WebDavVideoSource() { }
+
+    /**
+     * Reuse one client per target: a fresh client per playback means a fresh TLS handshake, and
+     * that delay is charged to the player's very first byte.
+     */
+    private static WebDavClient sharedClient(Config config) {
+        String key = config.getBaseUrl() + "\n" + config.getUsername();
+        WebDavClient client = sSharedClient;
+        if (client != null && key.equals(sSharedClientKey)) {
+            return client;
+        }
+        synchronized (WebDavVideoSource.class) {
+            if (sSharedClient != null && key.equals(sSharedClientKey)) {
+                return sSharedClient;
+            }
+            WebDavClient created = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                    config.getPassword());
+            sSharedClientKey = key;
+            sSharedClient = created;
+            return created;
+        }
+    }
 
     WebDavVideoSource(WebDavClient client, String remotePath, long originalLength) {
         mClient = client;
@@ -87,13 +111,42 @@ public final class WebDavVideoSource implements AutoCloseable {
             throw new IOException("video record belongs to a different WebDAV target");
         }
 
-        WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
-                config.getPassword());
+        WebDavClient client = sharedClient(config);
         mClient = client;
         mRemotePath = record.remotePath;
         mOriginalLength = record.originalLength;
         mMimeType = mimeTypeFor(record.remotePath);
-        return start();
+        String url = start();
+        warmUp();
+        return url;
+    }
+
+    /**
+     * Fetch one byte before handing the URL to the player. A cold handshake plus the server's 302
+     * redirect can outlast the player's first-frame timeout, so pay it here and fail fast instead.
+     */
+    private void warmUp() throws IOException {
+        WebDavClient client = mClient;
+        String remotePath = mRemotePath;
+        if (client == null || remotePath == null || remotePath.isEmpty()) {
+            return;
+        }
+        long startedAt = System.currentTimeMillis();
+        WebDavClient.RangeCall call = client.newRangeCall(remotePath, 0L, 0L);
+        try (WebDavClient.RangeResponse response = call.open()) {
+            if (response.body().read() < 0) {
+                throw new IOException("remote video is empty");
+            }
+        } finally {
+            call.close();
+        }
+        long elapsed = System.currentTimeMillis() - startedAt;
+        Logger.i("event=video_relay_warmed elapsed=" + elapsed + " path=" + remotePath);
+        if (elapsed > WARMUP_BUDGET_MS) {
+            // The player gives up quickly when the first byte stalls; a slow upstream is better
+            // served by the full-restore path, which shows the gallery's own download state.
+            throw new IOException("video upstream is too slow: " + elapsed + "ms");
+        }
     }
 
     synchronized String start() throws IOException {

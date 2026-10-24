@@ -61,6 +61,8 @@ final class OriginalRestoreHook {
     private volatile Method mDownloadOriginMethod;
     private volatile Object mOriginDownloadType;
     private volatile Method mPlayDifferentVideoMethod;
+    private volatile Method mInitGalleryStateMethod;
+    private volatile java.lang.reflect.Constructor<?> mVideoPreviewManagerConstructor;
     private volatile boolean mOriginHookReady;
     private volatile boolean mImageLoaderHookReady;
     private volatile boolean mVideoPlaybackHookReady;
@@ -200,6 +202,35 @@ final class OriginalRestoreHook {
             handleOnlineRequest.setAccessible(true);
             onUnSelected.setAccessible(true);
             downloadOrigin.setAccessible(true);
+            try {
+                Class<?> previewManagerType = null;
+                for (Class<?> inner : videoItem.getDeclaredClasses()) {
+                    if ("VideoPreviewManager".equals(inner.getSimpleName())) {
+                        previewManagerType = inner;
+                        break;
+                    }
+                }
+                if (previewManagerType != null) {
+                    Method initGalleryState = previewManagerType.getDeclaredMethod(
+                            "initGalleryState", boolean.class);
+                    initGalleryState.setAccessible(true);
+                    mInitGalleryStateMethod = initGalleryState;
+                    for (java.lang.reflect.Constructor<?> constructor
+                            : previewManagerType.getDeclaredConstructors()) {
+                        if (constructor.getParameterCount() == 2) {
+                            constructor.setAccessible(true);
+                            mVideoPreviewManagerConstructor = constructor;
+                            break;
+                        }
+                    }
+                    Logger.i("event=hook_video_gallery_state_ready"
+                            + " method=VideoPreviewManager.initGalleryState(boolean)");
+                }
+            } catch (Throwable t) {
+                mInitGalleryStateMethod = null;
+                mVideoPreviewManagerConstructor = null;
+                Logger.w("event=managed_video_gallery_state_missing", t);
+            }
             mXposed.hook(handleOnlineRequest).setId("gallery_managed_video_playback_restore")
                     .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
                     .intercept(chain -> {
@@ -371,17 +402,53 @@ final class OriginalRestoreHook {
             closeVideoSource(source);
             return;
         }
+        playback.streamSource = source;
+        if (startGalleryOnlinePlay(playback, url)) {
+            Logger.i("event=managed_video_stream_started row=" + playback.record.rowId);
+            return;
+        }
         try {
             Method play = mPlayDifferentVideoMethod;
             if (play == null) throw new NoSuchMethodException("native video player entry missing");
-            playback.streamSource = source;
             play.invoke(playback.playManager, playback.item, url, null, null, null, null);
-            Logger.i("event=managed_video_stream_started row=" + playback.record.rowId);
+            Logger.i("event=managed_video_stream_started_legacy row=" + playback.record.rowId);
         } catch (Throwable t) {
             closeVideoSource(source);
             Logger.w("event=managed_video_stream_start_failed row="
                     + playback.record.rowId, t);
             startFullVideoRestore(playback, t);
+        }
+    }
+
+    /**
+     * Mirrors {@code PhotoPageVideoItem.lambda$handleFileNotExisting$12}: the photo page keeps the
+     * remote URL in {@code mOnlineUrl} and lets {@code VideoPreviewManager.initGalleryState(true)}
+     * create the xiaomi gallery player. Calling {@code VideoPlayManager.doPlayDifferentVideo}
+     * instead only reaches {@code clickPauseOrPlayButton}, which silently returns when the gallery
+     * player state was never created, so the user sees no spinner and no playback.
+     */
+    private boolean startGalleryOnlinePlay(VideoPlaybackRequest playback, String url) {
+        Method initGalleryState = mInitGalleryStateMethod;
+        if (initGalleryState == null) return false;
+        try {
+            Object video = playback.video;
+            setField(video, "mOnlineUrl", url);
+            optionalSetField(video, "mIsShowPlayIcon", Boolean.FALSE);
+            optionalSetField(video, "postMeta", null);
+            optionalSetField(video, "recordKey", null);
+            optionalSetField(video, "recordIv", null);
+            Object previewManager = field(video, "mPreviewManager");
+            if (previewManager == null) {
+                if (mVideoPreviewManagerConstructor == null) return false;
+                previewManager = mVideoPreviewManagerConstructor.newInstance(video, null);
+                setField(video, "mPreviewManager", previewManager);
+            }
+            initGalleryState.invoke(previewManager, Boolean.TRUE);
+            return true;
+        } catch (Throwable t) {
+            Logger.w("event=managed_video_gallery_state_failed row="
+                    + playback.record.rowId, t);
+            return false;
         }
     }
 
@@ -886,6 +953,28 @@ final class OriginalRestoreHook {
             } catch (NoSuchFieldException ignored) { type = type.getSuperclass(); }
         }
         return null;
+    }
+
+    private static void setField(Object target, String name, Object value) throws Exception {
+        if (target == null) throw new IllegalArgumentException("missing field target " + name);
+        Class<?> type = target.getClass();
+        while (type != null) {
+            try {
+                Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                field.set(target, value);
+                return;
+            } catch (NoSuchFieldException ignored) { type = type.getSuperclass(); }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
+    private static void optionalSetField(Object target, String name, Object value) {
+        try {
+            setField(target, name, value);
+        } catch (Throwable ignored) {
+            // Field names differ between Gallery builds; only the URL is required.
+        }
     }
 
     private static Object call(Object target, String name) throws Exception {
