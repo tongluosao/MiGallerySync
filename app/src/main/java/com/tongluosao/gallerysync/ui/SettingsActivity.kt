@@ -11,6 +11,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 
 /**
  * 模块配置界面。全限定名必须保持不变：相册进程内的 UiMaskHook 用
@@ -27,6 +29,14 @@ class SettingsActivity : ComponentActivity() {
     private val progress = ProgressModel()
 
     /**
+     * 空间优化的进度。
+     *
+     * 与 [progress] 同理挂在 onStart/onStop：底栏切到「空间优化」时这一页在主界面里，
+     * receiver 若只注册在 SlimActivity，从底栏进来就永远收不到帧 —— 那正是这次要修的问题。
+     */
+    private val slim = SlimModel()
+
+    /**
      * 媒体读取权限。用 launcher 而不是 ActivityCompat.requestPermissions：
      * 项目没引 androidx.core，这个回调形态也不需要额外的兼容层。
      */
@@ -41,13 +51,22 @@ class SettingsActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             ApplySystemBarStyle(this, isDarkTheme())
-            MainScreen(model, progress, onRequestMediaPermission = ::requestMediaPermission)
+            val slimState by slim.state.collectAsState()
+            MainScreen(
+                settings = model,
+                progress = progress,
+                slim = slimState,
+                onRequestMediaPermission = ::requestMediaPermission,
+                onSlimStart = { concurrency -> slim.requestStart(this, concurrency) },
+                onSlimStop = { slim.requestStop(this) }
+            )
         }
     }
 
     override fun onStart() {
         super.onStart()
         progress.attach(this)
+        slim.start(this)
         // 授权对话框、以及去系统设置里改过权限，都可能改变结果，每次回前台都重新判定
         progress.refreshMediaPermission(this)
     }
@@ -55,6 +74,7 @@ class SettingsActivity : ComponentActivity() {
     override fun onStop() {
         // 界面不可见就不再收帧：后台收广播只会白耗电，而且回到前台时数据本来就会刷新
         progress.detach(this)
+        slim.stop(this)
         super.onStop()
     }
 

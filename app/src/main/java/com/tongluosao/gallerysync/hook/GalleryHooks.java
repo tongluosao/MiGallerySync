@@ -102,6 +102,8 @@ public final class GalleryHooks {
         hooks.installUploadOutletHook();
         hooks.installAppStartHook();
         hooks.installDirtyCountHook();
+        hooks.installSyncDoneTextHook();
+        hooks.installBackupListHook();
         hooks.installOriginalRestoreHook();
         hooks.installSlimHook();
         hooks.installNativeDownloadHook();
@@ -428,6 +430,70 @@ public final class GalleryHooks {
             return null;
         }
         return queue.queuedCounts();
+    }
+
+    /**
+     * 全部传完之后界面上那句文字。
+     *
+     * <p>{@link #installDirtyCountHook()} 只是把 N 换成本模块队列的真实积压数，传完就是 0；
+     * 而 {@code SyncTextLine.onSyncStatusChange} 的 SYNCING 分支对 0 不做特殊处理，
+     * 于是页面停在"正在同步0个照片和视频"。这里把那一句换成相册自己的完成态文案
+     * （见 {@link SyncTextHook}），只改文字，不动 SyncStatus，也不影响调度。
+     */
+    private void installSyncDoneTextHook() {
+        new SyncTextHook(mXposed, this::queueIdle).install();
+    }
+
+    /**
+     * 界面完成态判定：替换模式 + 队列已建 + 队列里一张都没剩。
+     *
+     * <p>在传的项本来就留在 {@link UploadQueue#queuedCounts()} 里，所以 0 就意味着
+     * "既没排队也没在传"。非替换模式一律 false —— 原链路自己在跑，界面也该跟着它。
+     */
+    private boolean queueIdle() {
+        Config config = mConfig;
+        if (config == null || !config.isReplace()) {
+            return false;
+        }
+        UploadQueue queue = mQueue;
+        if (queue == null) {
+            return false;
+        }
+        int[] counts = queue.queuedCounts();
+        return counts[0] == 0 && counts[1] == 0;
+    }
+
+    /**
+     * 接管相册"云同步列表"页（{@code BackupDetailActivity} + {@code BackupDetailFragment}）的列表口径。
+     *
+     * <p>那一页列的是"相册自己认为还没传上去"的行（{@code localFlag != 0} 且
+     * {@code alias_sync_state = 3}），在替换模式下与本模块完全脱钩：真机实测同一时刻页面有
+     * 1.3 万项、模块队列 pending 却是空数组。{@link BackupListHook} 把页面的选择条件收窄成
+     * 队列里待上传的那些 cloud 行号，口径与上面 {@link #overrideDirtyCount()} 那句数字一致。
+     */
+    private void installBackupListHook() {
+        try {
+            new BackupListHook(mXposed, mClassLoader, this::pendingRowIds).install();
+        } catch (Throwable t) {
+            Logger.e("event=backup_list_hook_failed", t);
+        }
+    }
+
+    /**
+     * 该页要收窄到哪些 cloud 行号。
+     *
+     * @return null 表示这次别接管（非替换模式 / 队列没建 / 读不出来）；空数组表示队列是空的
+     */
+    private String[] pendingRowIds() {
+        Config config = mConfig;
+        if (config == null || !config.isReplace()) {
+            return null;
+        }
+        UploadQueue queue = mQueue;
+        if (queue == null) {
+            return null;
+        }
+        return BackupListHook.pendingRowIds(queue);
     }
 
     /**

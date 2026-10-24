@@ -9,7 +9,31 @@ import com.tongluosao.gallerysync.core.ProgressProtocol
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
 import org.json.JSONObject
+
+/**
+ * 分项进度里的一行：一张照片从"开始处理"到"做完/失败"。
+ *
+ * 字段就是广播里那份 JSON 数组的元素（见 [ProgressProtocol.EXTRA_ITEMS]），
+ * 顺序由发送端给：最新在前，所以列表直接按 [SlimState.items] 的顺序渲染即可。
+ */
+data class SlimItem(
+    val id: String,
+    val name: String,
+    val state: String,
+    /** 单项耗时（毫秒）。进行中的项是 0 */
+    val ms: Long,
+    /** 失败/跳过的原因。做完的项是 null；界面据此决定第二行写"已优化"还是"失败：…" */
+    val reason: String?
+) {
+    val running: Boolean get() = state == ProgressProtocol.ITEM_RUNNING
+
+    val failed: Boolean get() = state == ProgressProtocol.ITEM_FAILED
+
+    /** 列表里那一行的显示名。取不到文件名时退回 id，别留一行空白 */
+    val displayName: String get() = name.ifEmpty { "#$id" }
+}
 
 /**
  * 「空间优化」进度的一帧。
@@ -25,6 +49,10 @@ data class SlimState(
     val failed: Int = 0,
     val saved: Long = 0L,
     val current: String? = null,
+    /** 本轮开始时刻。界面用它算速率与剩余时间；老版本载荷没有这个字段，值为 0 时就不显示速率 */
+    val startedAt: Long = 0L,
+    /** 逐项进度，最新在前。老版本载荷里没有这个键时保持上一帧的列表（通常是空表） */
+    val items: List<SlimItem> = emptyList(),
     val updatedAt: Long = 0L
 ) {
 
@@ -40,6 +68,34 @@ data class SlimState(
 
     /** 右上角百分比。总数未知时为 null，那时进度条走不确定态、也不显示数字 */
     val percent: Int? = if (total <= 0) null else (fraction * 100f).toInt()
+
+    /** 还没出结果的项数（含正在处理的）。界面用它算剩余时间 */
+    val remaining: Int get() = (total - done - failed).coerceAtLeast(0)
+
+    /**
+     * 平均速率（项/秒）。没在跑、或算不出正向时长时为 null ——
+     * 宁可少显示一个数字，也不要给出一个看着像实时的假速率。
+     */
+    fun rate(now: Long): Double? {
+        if (!running || startedAt <= 0L) return null
+        val elapsedSec = (now - startedAt) / 1000.0
+        if (elapsedSec < 1.0) return null
+        val processed = done + failed
+        if (processed <= 0) return null
+        return processed / elapsedSec
+    }
+
+    /**
+     * 剩余时间（毫秒）。速率未知或已经没剩几项时为 null。
+     *
+     * 用"已处理 / 已耗时"的平局值外推；并发路数会变，所以这只能说是个估计，
+     * 界面上也写成"约"。
+     */
+    fun etaMs(now: Long): Long? {
+        val rate = rate(now) ?: return null
+        if (remaining <= 0 || rate <= 0.0) return null
+        return (remaining / rate * 1000.0).toLong().coerceAtLeast(0L)
+    }
 }
 
 /**
@@ -52,10 +108,15 @@ data class SlimState(
  * 上报载荷（JSON）：
  * ```
  * {"v":1,"state":"running","total":40,"done":12,"failed":1,
- *  "saved":1331691520,"current":"IMG_20260101_120000.heic","updatedAt":1760000000000}
+ *  "saved":1331691520,"current":"IMG_20260101_120000.heic",
+ *  "startedAt":1760000000000,"updatedAt":1760000000000}
  * ```
  * - 必填：`v`、`state`、`total`、`done`
- * - 选填：`failed`、`saved`、`cur`、`ts`（`running` 也接受，缺省由 `state` 推出来）
+ * - 选填：`failed`、`saved`、`current`、`startedAt`、`updatedAt`（`running` 也接受，缺省由 `state` 推出来）
+ *
+ * 分项流水走**另一个** extra：[ProgressProtocol.EXTRA_ITEMS]，一个 JSON 数组串，
+ * 元素 `{"id","name","state","ms","reason"}`、最新在前、最多 [ProgressProtocol.ITEMS_MAX] 条。
+ * 它缺席时（老版本相册进程）界面沿用上一帧的列表，而不是把已显示的行清空。
  *
  * 反方向的命令不走这里：[ProgressProtocol.ACTION_COMMAND] 是**已有的**命令通道，
  * 命令串与参数也复用它的常量（见 [SlimModel.requestStart]），别另造一套。
@@ -110,6 +171,14 @@ object SlimProtocol {
     const val KEY_CURRENT = "current"
     const val KEY_TIMESTAMP = "updatedAt"
 
+    /**
+     * 本轮开始时刻（毫秒时间戳）。
+     *
+     * 界面用 `已完成 / (现在 - 开始时刻)` 估速率与剩余时间。老版本载荷里没有这个键，
+     * 解析成 0 —— 那时就不显示速率，而不是从"收到第一帧的时刻"硬算出一个假速度。
+     */
+    const val KEY_STARTED_AT = "startedAt"
+
     /** 认识的状态值。别的一律当坏帧 */
     fun isKnownState(state: String): Boolean =
         state == STATE_RUNNING || state == STATE_STOPPING ||
@@ -157,11 +226,61 @@ fun parse(payload: String?): SlimState? {
             saved = root.optLong(SlimProtocol.KEY_SAVED, 0L).coerceAtLeast(0L),
             // 空文件名当"没有当前项"，省得界面显示一行空占位
             current = root.optString(SlimProtocol.KEY_CURRENT, "").takeIf { it.isNotEmpty() },
+            // 老载荷没带开始时刻：0 表示"不知道"，界面据此不显示速率/剩余时间
+            startedAt = root.optLong(SlimProtocol.KEY_STARTED_AT, 0L).coerceAtLeast(0L),
             // 没带时间戳就拿收到它的时刻：这一帧确实是现在到的，不能算成"从未上报"
             updatedAt = root.optLong(SlimProtocol.KEY_TIMESTAMP, System.currentTimeMillis())
         )
     } catch (t: Throwable) {
         // 载荷是另一个进程拼的，格式永远可能不对；解析失败就当没收到，不要冒泡到主线程
+        null
+    }
+}
+
+/**
+ * 解析分项列表（[ProgressProtocol.EXTRA_ITEMS]，一个 JSON 数组串）。
+ *
+ * 返回 null 与空表的含义不同，调用方必须分开处理：
+ * - `null` —— 这一个 extra 根本没有/整串解析失败，说明发送端是老版本，界面应**沿用上一帧的列表**；
+ * - `emptyList()` —— 老版本发送端有时会发 "[]"，表示"本轮还没开始"，此时清空是对的。
+ *
+ * 单行字段缺了/类型不对只是那一行退回默认值，不让整批分项消失：分项是给人看的辅助信息，
+ * 它坏掉不该连带把总进度也弄丢。
+ */
+fun parseItems(payload: String?): List<SlimItem>? {
+    if (payload.isNullOrBlank()) {
+        return null
+    }
+    return try {
+        val array = JSONArray(payload)
+        val out = ArrayList<SlimItem>(minOf(array.length(), ProgressProtocol.ITEMS_MAX))
+        for (index in 0 until array.length()) {
+            if (out.size >= ProgressProtocol.ITEMS_MAX) {
+                break
+            }
+            val row = array.optJSONObject(index) ?: continue
+            val id = row.optString(ProgressProtocol.ITEM_KEY_ID, "")
+                .takeIf { it.isNotEmpty() }
+                // 没有 id 的行没法去重也没法点，用下标占位总比丢掉整行好
+                ?: "#$index"
+            val rawState = row.optString(ProgressProtocol.ITEM_KEY_STATE, ProgressProtocol.ITEM_RUNNING)
+            out += SlimItem(
+                id = id,
+                name = row.optString(ProgressProtocol.ITEM_KEY_NAME, ""),
+                // 不认识的状态按"进行中"画：宁可显示成还没做完，也别让它错画成已完成
+                state = when (rawState) {
+                    ProgressProtocol.ITEM_DONE,
+                    ProgressProtocol.ITEM_FAILED,
+                    ProgressProtocol.ITEM_RUNNING -> rawState
+                    else -> ProgressProtocol.ITEM_RUNNING
+                },
+                ms = row.optLong(ProgressProtocol.ITEM_KEY_MS, 0L).coerceAtLeast(0L),
+                reason = row.optString(ProgressProtocol.ITEM_KEY_REASON, "")
+                    .takeIf { it.isNotEmpty() }
+            )
+        }
+        out
+    } catch (t: Throwable) {
         null
     }
 }
@@ -209,7 +328,9 @@ class SlimModel {
                 return
             }
             val frame = parse(intent.getStringExtra(SlimProtocol.EXTRA)) ?: return
-            mutable.value = frame
+            // 分项单独解析：extra 缺席（老发送端）时沿用上一帧，别因为这一帧没带就把列表清空
+            val items = parseItems(intent.getStringExtra(ProgressProtocol.EXTRA_ITEMS))
+            mutable.value = if (items == null) frame else frame.copy(items = items)
         }
     }
 

@@ -11,6 +11,7 @@ import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.ProgressProtocol;
 
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -66,6 +67,15 @@ public final class SlimWorker {
     /** 进度广播的最小间隔：一张一张刷会让接收端每秒重建几十次界面。 */
     private static final long PROGRESS_INTERVAL_MS = 200L;
 
+    /** 分项原因最长的字符数：异常消息可能很长，界面一行放不下，广播也不该被它撑大。 */
+    private static final int REASON_MAX_CHARS = 160;
+
+    /** "这张不归模块管"在分项里的原因串：与失败区分开，界面据此说"已跳过"而不是"失败" */
+    private static final String REASON_SKIPPED = "skipped";
+
+    /** 取不到条目（行没了/被相册改过/查询被拦）时的原因串 */
+    private static final String REASON_RESOLVE_FAILED = "resolve_failed";
+
     private static final String STATE_RUNNING = "running";
     private static final String STATE_STOPPING = "stopping";
     private static final String STATE_DONE = "done";
@@ -92,6 +102,20 @@ public final class SlimWorker {
     private String mCurrent = "";
     private long mUpdatedAt;
     private long mLastProgressAt;
+
+    /**
+     * 本轮开始时刻（epoch ms），随每帧发出去，界面据此算速率与剩余时间。
+     * 界面自己没有"这一轮从哪开始"的锚点：它可能在轮次中间才被打开。
+     */
+    private long mStartedAt;
+
+    /**
+     * 本轮的逐项流水，**最新在前**、最多 {@link ProgressProtocol#ITEMS_MAX} 条。
+     * 与 {@link #mTally} 一样只在这把锁后面改；收尾会原地更新同一行（不重排），
+     * 否则一项做完就跳到列表最前面，看着像凭空多出来一行。
+     */
+    private final ArrayDeque<ItemRow> mItems = new ArrayDeque<>();
+
     private int mActiveThreads;
     private Cursor mCursor = new Cursor(Collections.emptyList());
     private ExecutorService mExecutor;
@@ -154,6 +178,9 @@ public final class SlimWorker {
             mCurrent = "";
             mUpdatedAt = System.currentTimeMillis();
             mLastProgressAt = 0L;
+            mStartedAt = mUpdatedAt;
+            // 新一轮一开始就把上一轮的分项清掉：界面上不该混着两次优化的行
+            mItems.clear();
             mActiveThreads = width;
             mCursor = new Cursor(planned);
             mExecutor = Executors.newFixedThreadPool(width, new WorkerThreadFactory());
@@ -227,12 +254,16 @@ public final class SlimWorker {
                 }
                 if (item == null) {
                     // 取不到条目（行没了、被相册改过、或查询被拦）不算错，跳过并记账
-                    failed(id);
+                    failed(id, "", elapsedMs(stepStart), REASON_RESOLVE_FAILED);
                     continue;
                 }
+                String name = fileNameOf(item);
                 synchronized (mLock) {
-                    mCurrent = fileNameOf(item);
+                    mCurrent = name;
+                    // 先落一行"进行中"再广播：界面能立刻看到这一项，而不是等它做完才出现
+                    beginItemLocked(id, name);
                 }
+                publish(false);
                 long resolveMs = (System.nanoTime() - stepStart) / 1000000L;
                 long slimStart = System.nanoTime();
                 long saved;
@@ -240,17 +271,17 @@ public final class SlimWorker {
                     saved = hook.runSlim(item);
                 } catch (Throwable t) {
                     Logger.e("event=slim_worker_item_failed id=" + id, t);
-                    failed(id);
+                    failed(id, name, elapsedMs(stepStart), reasonOf(t));
                     continue;
                 }
                 if (saved == SlimHook.PASSTHROUGH) {
                     // 这张不归模块管：runSlim 内部已经按原样打过 slim_skipped
-                    completed(id, 0L);
+                    completed(id, name, 0L, elapsedMs(stepStart), REASON_SKIPPED);
                     continue;
                 }
                 long slimMs = (System.nanoTime() - slimStart) / 1000000L;
                 Logger.i("event=slim_worker_step id=" + id + " resolve=" + resolveMs + " slim=" + slimMs);
-                completed(id, saved);
+                completed(id, name, saved, elapsedMs(stepStart), null);
             }
         } finally {
             onWorkerExit();
@@ -346,23 +377,148 @@ public final class SlimWorker {
         return slash < 0 ? item.path : item.path.substring(slash + 1);
     }
 
-    private void completed(long id, long saved) {
+    private void completed(long id, String name, long saved, long ms, String reason) {
         long savedBytes = Math.max(0L, saved);
         synchronized (mLock) {
             mTally.recordSaved(savedBytes);
             mUpdatedAt = System.currentTimeMillis();
+            finishItemLocked(id, name, true, ms, reason);
         }
-        Logger.i("event=slim_worker_item id=" + id + " saved=" + savedBytes);
+        Logger.i("event=slim_worker_item id=" + id + " saved=" + savedBytes + " ms=" + ms);
         publish(false);
     }
 
-    private void failed(long id) {
+    private void failed(long id, String name, long ms, String reason) {
         synchronized (mLock) {
             mTally.recordFailed();
             mUpdatedAt = System.currentTimeMillis();
+            finishItemLocked(id, name, false, ms, reason);
         }
-        Logger.w("event=slim_worker_item_failed id=" + id);
+        Logger.w("event=slim_worker_item_failed id=" + id + " ms=" + ms + " reason=" + reason);
         publish(false);
+    }
+
+    private static long elapsedMs(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1000000L;
+    }
+
+    /**
+     * 把异常压成一行可读的原因。
+     *
+     * <p>相册进程里抛上来的东西五花八门（反射的 {@code InvocationTargetException}、provider 的
+     * {@code IllegalArgumentException} 等），界面上只需要"哪儿错了"这一个线索；类名 + message
+     * 足够，堆栈留在日志里。
+     */
+    private static String reasonOf(Throwable t) {
+        if (t == null) {
+            return "";
+        }
+        String name = t.getClass().getSimpleName();
+        Throwable cause = t.getCause();
+        if (cause != null && cause != t) {
+            // 反射调用失败时真正的异常在 cause 里，包在外面的那个名字没有信息量
+            name = cause.getClass().getSimpleName();
+            t = cause;
+        }
+        String message = t.getMessage();
+        return message == null || message.isEmpty() ? name : name + ": " + message;
+    }
+
+    // ---------------------------------------------------------------- 分项流水
+
+    /**
+     * 一项开始：插到队首（最新在前）。同一 id 已经有行（重试/重复入队）就原地重置。
+     * 调用方必须持有 {@link #mLock}。
+     */
+    private void beginItemLocked(long id, String name) {
+        for (ItemRow row : mItems) {
+            if (row.id == id) {
+                row.name = name == null ? "" : name;
+                row.state = ProgressProtocol.ITEM_RUNNING;
+                row.ms = 0L;
+                row.reason = null;
+                return;
+            }
+        }
+        mItems.addFirst(new ItemRow(id, name));
+        trimItemsLocked();
+    }
+
+    /**
+     * 一项收尾：原地改成 done/failed 并记下耗时与原因。
+     *
+     * <p>找不到那一行时要补插一条：开始那一帧可能正好落在 200ms 节流窗口里没发出去，
+     * 否则界面上这一项会"凭空出现"在别的位置。调用方必须持有 {@link #mLock}。
+     */
+    private void finishItemLocked(long id, String name, boolean ok, long ms, String reason) {
+        ItemRow target = null;
+        for (ItemRow row : mItems) {
+            if (row.id == id) {
+                target = row;
+                break;
+            }
+        }
+        if (target == null) {
+            target = new ItemRow(id, name);
+            mItems.addFirst(target);
+            trimItemsLocked();
+        }
+        target.state = ok ? ProgressProtocol.ITEM_DONE : ProgressProtocol.ITEM_FAILED;
+        target.ms = Math.max(0L, ms);
+        target.reason = reason;
+    }
+
+    private void trimItemsLocked() {
+        while (mItems.size() > ProgressProtocol.ITEMS_MAX) {
+            mItems.removeLast();
+        }
+    }
+
+    /** 分项列表的 JSON 数组串；空列表发 `[]`（合法载荷，接收端据此知道是"这一轮还没开始"）。 */
+    private String itemsJsonLocked() {
+        StringBuilder out = new StringBuilder(mItems.size() * 96 + 2);
+        out.append('[');
+        boolean first = true;
+        for (ItemRow row : mItems) {
+            if (!first) {
+                out.append(',');
+            }
+            first = false;
+            out.append('{')
+                    .append('"').append(ProgressProtocol.ITEM_KEY_ID).append("\":\"").append(row.id).append('"')
+                    .append(",\"").append(ProgressProtocol.ITEM_KEY_NAME).append("\":\"")
+                    .append(escape(row.name)).append('"')
+                    .append(",\"").append(ProgressProtocol.ITEM_KEY_STATE).append("\":\"").append(row.state).append('"')
+                    .append(",\"").append(ProgressProtocol.ITEM_KEY_MS).append("\":").append(row.ms)
+                    .append(",\"").append(ProgressProtocol.ITEM_KEY_REASON).append("\":\"")
+                    .append(escape(clipReason(row.reason))).append('"')
+                    .append('}');
+        }
+        out.append(']');
+        return out.toString();
+    }
+
+    private static String clipReason(String reason) {
+        if (reason == null || reason.isEmpty()) {
+            return "";
+        }
+        return reason.length() <= REASON_MAX_CHARS
+                ? reason
+                : reason.substring(0, REASON_MAX_CHARS - 3) + "...";
+    }
+
+    /** 一帧分项进度里的一行。字段名与 {@link ProgressProtocol} 的 {@code ITEM_KEY_*} 一一对应。 */
+    private static final class ItemRow {
+        final long id;
+        String name;
+        String state = ProgressProtocol.ITEM_RUNNING;
+        long ms;
+        String reason;
+
+        ItemRow(long id, String name) {
+            this.id = id;
+            this.name = name == null ? "" : name;
+        }
     }
 
     private void onWorkerExit() {
@@ -396,12 +552,14 @@ public final class SlimWorker {
 
     private void publish(boolean force) {
         String json;
+        String items;
         synchronized (mLock) {
             long now = System.currentTimeMillis();
             if (!force && now - mLastProgressAt < PROGRESS_INTERVAL_MS) return;
             mLastProgressAt = now;
             mUpdatedAt = now;
             json = snapshotJsonLocked(now);
+            items = itemsJsonLocked();
         }
         try {
             Context context = HostContext.get(sClassLoader);
@@ -409,6 +567,8 @@ public final class SlimWorker {
             Intent intent = new Intent(ACTION_SLIM);
             intent.setPackage(ProgressProtocol.MODULE_PACKAGE);
             intent.putExtra(ProgressProtocol.EXTRA_PAYLOAD, json);
+            // 分项走独立的 extra：老接收端不认识这个键，照样按帧显示总进度，不会整帧弃用
+            intent.putExtra(ProgressProtocol.EXTRA_ITEMS, items);
             context.sendBroadcast(intent);
         } catch (Throwable t) {
             // 无接收者 / 系统拦了隐性广播，都属正常：进度丢了不影响已经删掉的原图
@@ -424,6 +584,8 @@ public final class SlimWorker {
                 + ",\"failed\":" + mTally.failed()
                 + ",\"saved\":" + mTally.saved()
                 + ",\"current\":\"" + escape(mCurrent) + '"'
+                // 本轮开始时刻：界面靠它算速率与剩余时间，自己在半路打开时也能对得上账
+                + ",\"startedAt\":" + mStartedAt
                 + ",\"updatedAt\":" + now
                 + '}';
     }

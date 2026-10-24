@@ -30,6 +30,38 @@ public final class ProgressProtocol {
     public static final String EXTRA_PAYLOAD = "payload";
 
     /**
+     * 分项进度的 extra：一个 JSON **数组**字符串（不是帧里的字段），与 {@link #EXTRA_PAYLOAD}
+     * 同一次广播一起发。
+     *
+     * <p>为什么单独一个 extra 而不是塞进帧里：帧的字段名（{@code active}/{@code pl}）已经被
+     * 上传进度页用满，而分项是"逐项从开始到结束的流水"这种完全不同形状的数据；单独一个
+     * extra 让老的接收端（不认识这个键）照常读帧，不会因为多一个字段就整帧弃用。
+     *
+     * <p>数组元素：{@code {"id":"…","name":"…","state":"running|done|failed","ms":1234,"reason":"…"}}，
+     * 最新在前、最多 {@link #ITEMS_MAX} 条。缺字段/多字段都由接收端容错，不认识的键直接忽略。
+     */
+    public static final String EXTRA_ITEMS = "items";
+
+    /** 分项列表最多带几条：界面只看最近一屏，再多只是白扛 JSON */
+    public static final int ITEMS_MAX = 200;
+
+    /** 分项状态：正在处理这一项 */
+    public static final String ITEM_RUNNING = "running";
+
+    /** 分项状态：这一项处理完了 */
+    public static final String ITEM_DONE = "done";
+
+    /** 分项状态：这一项失败/跳过了（原因在 {@link #ITEM_KEY_REASON}） */
+    public static final String ITEM_FAILED = "failed";
+
+    /** 分项元素的字段名 */
+    public static final String ITEM_KEY_ID = "id";
+    public static final String ITEM_KEY_NAME = "name";
+    public static final String ITEM_KEY_STATE = "state";
+    public static final String ITEM_KEY_MS = "ms";
+    public static final String ITEM_KEY_REASON = "reason";
+
+    /**
      * 反向命令广播的 action：模块 App → 相册进程。
      *
      * <p>方向与 {@link #ACTION} 相反。相册进程里那条指令（重置已上传标记）必须由**相册
