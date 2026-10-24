@@ -71,6 +71,12 @@ public final class UploadProgressPublisher {
         /** 还没轮到的项的总字节 */
         long pendingBytes();
 
+        /** 还没轮到的图片数（与 {@link #pendingCount()} 同口径，不含正在传的） */
+        int pendingPhotos();
+
+        /** 还没轮到的视频数（与 {@link #pendingCount()} 同口径，不含正在传的） */
+        int pendingVideos();
+
         /**
          * 整个队列按插入序的前 [limit] 项，**含正在传的几项**。
          *
@@ -335,10 +341,14 @@ public final class UploadProgressPublisher {
         }
         int pendingCount = 0;
         long pendingBytes = 0;
+        int pendingPhotos = 0;
+        int pendingVideos = 0;
         boolean healthy = true;
         for (QueueView view : views) {
             pendingCount += view.pendingCount();
             pendingBytes += view.pendingBytes();
+            pendingPhotos += view.pendingPhotos();
+            pendingVideos += view.pendingVideos();
             // 队列还没接线时按"健康"处理：宁可显示正常，也不要凭空吓用户一跳
             healthy = healthy && view.healthy();
         }
@@ -382,6 +392,9 @@ public final class UploadProgressPublisher {
         root.put("state", state);
         root.put("active", activeArray);
         root.put("pending", pendingCount);
+        // 队列里图片/视频各占多少：界面拿它把"还剩 N 项"说成人话
+        root.put("ph", pendingPhotos);
+        root.put("pv", pendingVideos);
         // 排队列表：只在队列增删过、或隔几秒兜一次底的时候才重新序列化。整张列表十几 KB，
         // 2Hz 地发等于把 Binder 当水管用；平时这一项就省掉了，客户端沿用上一份
         JSONArray pendingArray = pendingArrayFor(views);

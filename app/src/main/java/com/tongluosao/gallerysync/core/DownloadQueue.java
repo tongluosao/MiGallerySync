@@ -485,6 +485,22 @@ public final class DownloadQueue {
         }
     }
 
+    /**
+     * 用扩展名判断下载项是不是视频。
+     *
+     * <p>下载队列的 {@link Pending} 不带类型标记（远端只给了路径），进度页要把它分成
+     * "图片/视频"两档，只能靠名字后缀。判错最多让统计偏一项，不影响调度。
+     */
+    private static boolean isVideoFileName(String name) {
+        if (name == null) {
+            return false;
+        }
+        String lower = name.toLowerCase(java.util.Locale.US);
+        return lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".m4v")
+                || lower.endsWith(".mkv") || lower.endsWith(".avi") || lower.endsWith(".3gp")
+                || lower.endsWith(".webm") || lower.endsWith(".ts") || lower.endsWith(".flv");
+    }
+
     public void addQueueView(UploadProgressPublisher publisher) {
         if (publisher == null) {
             return;
@@ -509,6 +525,36 @@ public final class DownloadQueue {
                         total += Math.max(pending.size, 0L);
                     }
                     return total;
+                }
+            }
+
+            @Override
+            public int pendingPhotos() {
+                synchronized (mLock) {
+                    int count = 0;
+                    for (Pending pending : mPending) {
+                        if (mInflight.contains(pending.remotePath)
+                                || isVideoFileName(pending.relativePath)) {
+                            continue;
+                        }
+                        count++;
+                    }
+                    return count;
+                }
+            }
+
+            @Override
+            public int pendingVideos() {
+                synchronized (mLock) {
+                    int count = 0;
+                    for (Pending pending : mPending) {
+                        if (mInflight.contains(pending.remotePath)
+                                || !isVideoFileName(pending.relativePath)) {
+                            continue;
+                        }
+                        count++;
+                    }
+                    return count;
                 }
             }
 

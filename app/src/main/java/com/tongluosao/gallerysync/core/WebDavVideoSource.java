@@ -1,5 +1,6 @@
 package com.tongluosao.gallerysync.core;
 
+import com.tongluosao.gallerysync.core.Logger;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.EOFException;
@@ -225,6 +226,8 @@ public final class WebDavVideoSource implements AutoCloseable {
                 return;
             }
             touch();
+            Logger.d("event=video_relay_request method=" + request.method
+                    + " range=" + request.range + " length=" + mOriginalLength);
             if (!"GET".equals(request.method) && !"HEAD".equals(request.method)) {
                 writeError(output, 405, "Method Not Allowed", "Allow: GET, HEAD\r\n");
                 return;
@@ -284,6 +287,11 @@ public final class WebDavVideoSource implements AutoCloseable {
                         || upstream.resourceLength != mOriginalLength
                         || bodyLength != expectedLength
                         || (!partial && bodyLength != mOriginalLength)) {
+                    Logger.w("event=video_relay_range_mismatch status=" + upstream.statusCode
+                            + " want=" + range.start + "-" + range.end
+                            + " got=" + upstream.rangeStart + "-" + upstream.rangeEnd
+                            + " remoteLength=" + upstream.resourceLength
+                            + " expectedLength=" + mOriginalLength);
                     throw new IOException("remote server did not return the requested range");
                 }
                 String contentRange = upstream.contentRange;
@@ -314,6 +322,8 @@ public final class WebDavVideoSource implements AutoCloseable {
                 mActiveRanges.remove(upstream);
             }
         } catch (IOException | RuntimeException e) {
+            Logger.w("event=video_relay_failed responseStarted=" + responseStarted
+                    + " kind=" + e.getClass().getSimpleName() + " message=" + e.getMessage());
             // Request URLs, credentials, and signed redirect locations must never enter logs.
             try {
                 if (!responseStarted && !socket.isClosed() && !socket.isOutputShutdown()) {

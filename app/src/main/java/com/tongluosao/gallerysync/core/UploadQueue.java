@@ -442,6 +442,42 @@ public final class UploadQueue {
             }
 
             @Override
+            public int pendingPhotos() {
+                synchronized (mLock) {
+                    int count = 0;
+                    for (Task task : mPending.values()) {
+                        if (task.video) {
+                            continue;
+                        }
+                        String key = task.key();
+                        if (mInflight.contains(key) || mVerifying.contains(key)) {
+                            continue;
+                        }
+                        count++;
+                    }
+                    return count;
+                }
+            }
+
+            @Override
+            public int pendingVideos() {
+                synchronized (mLock) {
+                    int count = 0;
+                    for (Task task : mPending.values()) {
+                        if (!task.video) {
+                            continue;
+                        }
+                        String key = task.key();
+                        if (mInflight.contains(key) || mVerifying.contains(key)) {
+                            continue;
+                        }
+                        count++;
+                    }
+                    return count;
+                }
+            }
+
+            @Override
             public List<UploadProgressPublisher.PendingItem> pendingItems(int limit) {
                 synchronized (mLock) {
                     List<UploadProgressPublisher.PendingItem> out =

@@ -282,8 +282,12 @@ private fun TotalProgressCard(state: ProgressUiState, stale: Boolean) {
                 text = stringResource(
                     R.string.progress_bytes,
                     formatBytes(state.doneBytes),
-                    formatBytes(state.totalBytes),
-                    state.pending
+                    formatBytes(state.totalBytes)
+                ) + "  ·  " + stringResource(
+                    R.string.progress_queue,
+                    state.pending,
+                    state.pendingPhotos,
+                    state.pendingVideos
                 ),
                 style = MiuixTheme.textStyles.footnote1,
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary
