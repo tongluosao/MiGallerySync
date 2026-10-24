@@ -31,6 +31,8 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -109,6 +111,19 @@ public final class WebDavClient {
      */
     private static final int RESOLVE_ATTEMPTS = 3;
     private static final long RESOLVE_RETRY_DELAY = 700L;
+    /**
+     * 302 直链缓存的存活时间。
+     *
+     * <p>OpenList 这类服务端对每个 Range 请求都先回一次 302 跳转到对象存储的签名直链。手机上
+     * 这一跳要额外做一次 DNS + TCP + TLS，播放时的"第一个字节"几乎全花在这上面（实测 4.4 秒）。
+     * 直链本身带上签名与过期时间，短时间内重复使用是安全的；过期或被拒时下面会把缓存踢掉，
+     * 下一次请求自然退回服务器换新直链。
+     */
+    private static final long DIRECT_URL_TTL_MS = TimeUnit.MINUTES.toMillis(3);
+    /** 请求地址（baseUrl + path）→ {直链, 过期时刻}。 */
+    private static final Map<String, String[]> sDirectUrls = new ConcurrentHashMap<>();
+    /** 直链 → 它最初来自哪个请求地址，用于失效时反查。 */
+    private static final Map<String, String> sDirectSources = new ConcurrentHashMap<>();
     /**
      * 目录列表（PROPFIND Depth 1）响应体的上限。
      *
@@ -253,7 +268,73 @@ public final class WebDavClient {
         if (!("http".equalsIgnoreCase(protocol) || "https".equalsIgnoreCase(protocol))) {
             throw new IOException("unsupported WebDAV URL scheme");
         }
+        String cached = cachedDirectUrl(url.toString());
+        if (cached != null) {
+            try {
+                URL direct = new URL(cached);
+                String directProtocol = direct.getProtocol();
+                if ("http".equalsIgnoreCase(directProtocol)
+                        || "https".equalsIgnoreCase(directProtocol)) {
+                    String origin = directProtocol + "://" + direct.getAuthority();
+                    // 签名直链自带授权，不能再带 WebDAV 的凭据（跨域，带了反而会被拒）。
+                    WebDavClient directClient = new WebDavClient(origin, null);
+                    return new RangeCall(directClient, direct, start, endInclusive);
+                }
+            } catch (IOException ignored) {
+                // 地址坏了就当没缓存
+            }
+            invalidateDirectUrl(cached);
+        }
         return new RangeCall(isolated, url, start, endInclusive);
+    }
+
+    /** 记住一次 302 跳转的目的地址，供后续 Range 请求直接复用。 */
+    static void cacheDirectUrl(String requestUrl, String directUrl) {
+        if (requestUrl == null || directUrl == null || requestUrl.equals(directUrl)) {
+            return;
+        }
+        long expiresAt = System.currentTimeMillis() + DIRECT_URL_TTL_MS;
+        sDirectUrls.put(requestUrl, new String[] {directUrl, Long.toString(expiresAt)});
+        sDirectSources.put(directUrl, requestUrl);
+    }
+
+    /** 取仍然有效的直链；没有或已过期返回 null。 */
+    static String cachedDirectUrl(String requestUrl) {
+        if (requestUrl == null) {
+            return null;
+        }
+        String[] entry = sDirectUrls.get(requestUrl);
+        if (entry == null || entry.length < 2) {
+            return null;
+        }
+        long expiresAt;
+        try {
+            expiresAt = Long.parseLong(entry[1]);
+        } catch (NumberFormatException e) {
+            sDirectUrls.remove(requestUrl);
+            return null;
+        }
+        if (System.currentTimeMillis() >= expiresAt) {
+            sDirectUrls.remove(requestUrl);
+            sDirectSources.remove(entry[0]);
+            return null;
+        }
+        return entry[0];
+    }
+
+    /** 直链失效（过期签名、被拒）时同时清掉正反两张表。 */
+    static void invalidateDirectUrl(String url) {
+        if (url == null) {
+            return;
+        }
+        String source = sDirectSources.remove(url);
+        if (source != null) {
+            sDirectUrls.remove(source);
+        }
+        String[] entry = sDirectUrls.remove(url);
+        if (entry != null && entry.length > 0) {
+            sDirectSources.remove(entry[0]);
+        }
     }
 
     private RangeResponse streamRange(URL url, String authorization, long start,
@@ -281,6 +362,7 @@ public final class WebDavClient {
                 }
                 URL next = downloadRedirect(url, head.location);
                 String nextAuthorization = sameOrigin(url, next) ? authorization : null;
+                cacheDirectUrl(url.toString(), next.toString());
                 close(); // The redirect body is intentionally discarded.
                 String origin = next.getProtocol() + "://" + next.getAuthority();
                 WebDavClient redirected = new WebDavClient(origin, nextAuthorization);
@@ -288,6 +370,8 @@ public final class WebDavClient {
                         redirectsLeft - 1, call);
             }
             if (head.code != 206) {
+                // 直链过期/被拒时把缓存踢掉，下一次请求退回服务器换新直链。
+                invalidateDirectUrl(url.toString());
                 throw new IOException("range request failed code=" + head.code);
             }
             ContentRange parsed = null;

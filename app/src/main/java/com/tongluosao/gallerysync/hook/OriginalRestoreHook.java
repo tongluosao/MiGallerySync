@@ -301,6 +301,21 @@ final class OriginalRestoreHook {
                     });
             mVideoPlaybackHookReady = true;
             Logger.i("event=hook_registered method=PhotoPageVideoItem.handleOnlineRequest()");
+            try {
+                Method onSelected = videoItem.getDeclaredMethod("doOnSelected", boolean.class,
+                        boolean.class, boolean.class);
+                onSelected.setAccessible(true);
+                mXposed.hook(onSelected).setId("gallery_managed_video_prewarm")
+                        .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                        .intercept(chain -> {
+                            prewarmVideoItemAsync(chain.getThisObject());
+                            return chain.proceed();
+                        });
+                Logger.i("event=hook_registered method=PhotoPageVideoItem.doOnSelected(ZZZ)V");
+            } catch (Throwable t) {
+                Logger.w("event=managed_video_prewarm_hook_missing"
+                        + " method=PhotoPageVideoItem.doOnSelected(ZZZ)V", t);
+            }
             mXposed.hook(onUnSelected).setId("gallery_managed_video_stream_page_exit_cleanup")
                     .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
                     .intercept(chain -> {
@@ -763,6 +778,44 @@ final class OriginalRestoreHook {
             }
         }
         return true;
+    }
+
+    /**
+     * 视频页面一展示就开始预热：把 302 换直链和两次 TLS 握手都赶在用户按下播放之前做完。
+     * 失败完全无害 —— 播放时还会照常再试一次。
+     */
+    private void prewarmVideoItemAsync(Object item) {
+        try {
+            Config config = mConfig;
+            OriginalStore store = store();
+            if (item == null || config == null || store == null || !config.isReady()) {
+                return;
+            }
+            OriginalStore.Record record = recordForItem(item, store, config);
+            if (record == null || record.remotePath == null || record.remotePath.isEmpty()) {
+                return;
+            }
+            mVideoSourceWorker.execute(() -> prewarmVideoRecord(config, record));
+        } catch (Throwable t) {
+            Logger.w("event=video_prewarm_skip", t);
+        }
+    }
+
+    private void prewarmVideoRecord(Config config, OriginalStore.Record record) {
+        long startedAt = System.currentTimeMillis();
+        com.tongluosao.gallerysync.core.WebDavClient client =
+                new com.tongluosao.gallerysync.core.WebDavClient(config.getBaseUrl(),
+                        config.getUsername(), config.getPassword());
+        try (com.tongluosao.gallerysync.core.WebDavClient.RangeResponse response =
+                     client.newRangeCall(record.remotePath, 0L, 0L).open()) {
+            response.body().read();
+            Logger.i("event=video_prewarm_ok elapsed="
+                    + (System.currentTimeMillis() - startedAt) + " row=" + record.rowId);
+        } catch (Throwable t) {
+            Logger.w("event=video_prewarm_failed row=" + record.rowId, t);
+        } finally {
+            client.close();
+        }
     }
 
     private OriginalStore.Record recordForItem(Object item, OriginalStore store, Config config)
