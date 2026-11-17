@@ -6,6 +6,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 
 import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.hook.gallery.Profiles;
 
 /**
  * 反射驱动相册自己的同步状态机，让原生界面显示真实进度。
@@ -26,6 +27,10 @@ import com.tongluosao.gallerysync.core.Logger;
  * </ol>
  *
  * <p>全部反射且失败即吞：界面显示不出来只该是显示问题，不能反过来影响上传本身。
+ *
+ * <p>下面这几个类名是<b>新版（4.3.x）</b>的：旧版 3.6.2.10 把它们放在
+ * {@code com.miui.gallery.cloud.*} 下。实际用哪个由当前版本档案决定（{@link Profiles#resolveClass}），
+ * 档案缺失时才回落到这里的字符串 —— 手机上两者是同一个类，行为与改造前逐字一致。
  */
 public final class HostSyncState {
 
@@ -76,7 +81,7 @@ public final class HostSyncState {
         Constructor<?> requestCtor = null;
         Object powerForce = null;
         try {
-            Class<?> ctrlCls = loader.loadClass(CLS_UPLOAD_STATUS);
+            Class<?> ctrlCls = hostClass(loader, CLS_UPLOAD_STATUS);
             controller = ctrlCls.getMethod("getInstance").invoke(null);
             start = ctrlCls.getMethod("startUpload");
             end = ctrlCls.getMethod("endUpload");
@@ -85,7 +90,7 @@ public final class HostSyncState {
             controller = null;
         }
         try {
-            Class<?> mgrCls = loader.loadClass(CLS_SYNC_STATE_MANAGER);
+            Class<?> mgrCls = hostClass(loader, CLS_SYNC_STATE_MANAGER);
             manager = mgrCls.getMethod("getInstance").invoke(null);
             trigger = mgrCls.getMethod("triggerMediaChanged");
         } catch (Throwable t) {
@@ -93,13 +98,13 @@ public final class HostSyncState {
             manager = null;
         }
         try {
-            Class<?> typeCls = loader.loadClass(CLS_SYNC_TYPE);
+            Class<?> typeCls = hostClass(loader, CLS_SYNC_TYPE);
             powerForce = typeCls.getField("POWER_FORCE").get(null);
-            Class<?> requestCls = loader.loadClass(CLS_SYNC_REQUEST);
+            Class<?> requestCls = hostClass(loader, CLS_SYNC_REQUEST);
             // 直接拿构造器，省掉 SyncRequest.Builder 那一串：签名是
             // (SyncType, long syncReason, boolean delayUpload, boolean manual)
             requestCtor = requestCls.getConstructor(typeCls, long.class, boolean.class, boolean.class);
-            Class<?> utilCls = loader.loadClass(CLS_SYNC_UTIL);
+            Class<?> utilCls = hostClass(loader, CLS_SYNC_UTIL);
             requestSync = utilCls.getMethod("requestSync", Context.class, requestCls);
         } catch (Throwable t) {
             Logger.w("event=sync_state_unavailable target=SyncUtil", t);
@@ -119,6 +124,19 @@ public final class HostSyncState {
 
     public static HostSyncState create(ClassLoader loader) {
         return new HostSyncState(loader);
+    }
+
+    /**
+     * 类查找：当前版本档案优先，档案缺失时回落写死的（新版）类名。
+     * 两处都没有就抛 {@link ClassNotFoundException}，让上面各个 try 块照旧吞掉并降级。
+     */
+    private static Class<?> hostClass(ClassLoader loader, String hardcodedName)
+            throws ClassNotFoundException {
+        Class<?> clazz = Profiles.resolveClass(loader, hardcodedName);
+        if (clazz == null) {
+            throw new ClassNotFoundException(hardcodedName);
+        }
+        return clazz;
     }
 
     /**

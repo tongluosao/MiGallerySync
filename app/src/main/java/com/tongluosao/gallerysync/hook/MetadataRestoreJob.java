@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.os.StatFs;
 
 import com.tongluosao.gallerysync.core.Config;
+import com.tongluosao.gallerysync.core.InplaceSlimPolicy;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
 import com.tongluosao.gallerysync.core.RemoteSuppress;
@@ -21,11 +22,13 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -43,6 +46,8 @@ public final class MetadataRestoreJob {
     private static final String RESULT_NAME = "metadata-restore-result.json";
     private static final String DIRECTORY_NAME = "webdav_sync";
     private static final String STORAGE_ROOT = "/storage/emulated/0";
+    /** 老侧车目录名：历史数据把预览写在 {@code <相册>/.gallerysync-slim/<随机名>.<ext>} 里。 */
+    private static final String SLIM_DIRECTORY_NAME = ".gallerysync-slim";
     private static final long MAX_REQUEST_BYTES = 1024L * 1024L;
     private static final long SPACE_RESERVE_BYTES = 128L * 1024L * 1024L;
     private static final int MAX_ITEMS = 5000;
@@ -63,6 +68,11 @@ public final class MetadataRestoreJob {
             "thumbnailFile"};
     /** poster_rewire 里封面路径的最大长度（与 tempFiles 的路径上限一致）。 */
     private static final int MAX_POSTER_PATH = 4096;
+    /** reconcile_inplace 里照片绝对路径的最大长度（与 tempFiles 的路径上限一致）。 */
+    private static final int MAX_RECONCILE_PATH = 4096;
+    /** reconcile_inplace 的 keeper 行要看的列：路径、预览位、指纹、远端状态与登记尺寸。 */
+    private static final String[] RECONCILE_KEEPER_COLUMNS = new String[]{"_id", "localFile",
+            "thumbnailFile", "sha1", "serverId", "size"};
 
     /** 单元测试的 JVM 里没有 Android 实现；解析失败时退化成 null（设备上不会发生）。 */
     private static Uri cloudUri() {
@@ -183,7 +193,10 @@ public final class MetadataRestoreJob {
         }
         boolean stoppedForSpace = false;
         boolean cancelled = false;
-        for (int index = 0; index < request.items.size(); index++) {
+        // 整批只落盘一次：逐项保存会把数 MB 的注册表重写 N 次（三千项约 16 GB 写入）。
+        store.beginBatch();
+        try {
+            for (int index = 0; index < request.items.size(); index++) {
             RequestItem item = request.items.get(index);
             if (!isCurrent(target)) {
                 cancelled = true;
@@ -206,6 +219,12 @@ public final class MetadataRestoreJob {
                     result = purgeItemsOne(context, config, store, target, item);
                 } else if ("poster_rewire".equals(item.mode)) {
                     result = posterRewireOne(context, config, store, target, item);
+                } else if ("migrate_inplace".equals(item.mode)) {
+                    result = migrateInplaceOne(context, config, store, target, item, request.dryRun);
+                } else if ("repair_state".equals(item.mode)) {
+                    result = repairStateOne(context, config, store, target, item);
+                } else if ("reconcile_inplace".equals(item.mode)) {
+                    result = reconcileInplaceOne(context, config, store, target, item);
                 } else {
                     result = restoreOne(context, config, store, target, item);
                 }
@@ -233,6 +252,9 @@ public final class MetadataRestoreJob {
                 addRemaining(results, request.items, index + 1, "cancelled", "job_stopped");
                 break;
             }
+        }
+        } finally {
+            store.endBatch();
         }
         if (!cancelled && !request.tempFiles.isEmpty()) {
             for (int index = 0; index < request.tempFiles.size(); index++) {
@@ -349,6 +371,12 @@ public final class MetadataRestoreJob {
                 || record.originalLength != item.length) {
             return new ItemResult(item.row, "failed", "registry_metadata_mismatch");
         }
+        // 原地模式：归属路径上现在是预览、完整原图只在远端。老逻辑会在下面的
+        // isOriginalVerified 处把它当成"原图不存在"拒掉（original_missing），
+        // 于是这行永远撤不掉瘦身；这里先把原图从远端回填，再收回状态与行。
+        if (record.getLocalState() == OriginalStore.LocalState.INPLACE_PREVIEW) {
+            return unslimInplace(context, config, store, target, item, record);
+        }
         String originalCanonical = canonicalGalleryPath(record.originalLocalPath);
         File original = safeOriginalFile(record.originalLocalPath);
         if (original == null || originalCanonical == null) {
@@ -397,6 +425,48 @@ public final class MetadataRestoreJob {
         if (!legacyFailure.isEmpty()) return unslimFailure(item, legacyFailure, state, "failed");
         if (!isCurrent(target)) return unslimFailure(item, "job_stopped", state, "cancelled");
         return new ItemResult(item.row, "success", "", 0, state.clearedRows, state.deletedCopies);
+    }
+
+    /**
+     * unslim 的原地分支：把完整原图从远端回填到归属路径（覆盖那里的原地预览），
+     * 状态回落到 {@code ORIGINAL}，再把相册行的 thumbnailFile 清空。
+     *
+     * <p>顺序固定为“先落字节、后改状态、最后改行”：任何一步失败都只留下可重试的中间态，
+     * 绝不会出现“行已经指向原路径、而原路径上还是预览”这种上传侧会误判的组合。
+     */
+    private ItemResult unslimInplace(Context context, Config config, OriginalStore store,
+            String target, RequestItem item, OriginalStore.Record record) throws Exception {
+        File original = safeOriginalFile(record.originalLocalPath);
+        if (original == null) return new ItemResult(item.row, "failed", "unsafe_original_path");
+        // 这一步要真的从远端取原图：空间不够时宁可整项失败，也不留下半写的原路径。
+        if (!hasRequiredSpace(record.originalLength)) {
+            return new ItemResult(item.row, "failed", "needs_space");
+        }
+        if (!isCurrent(target)) return new ItemResult(item.row, "cancelled", "job_stopped");
+        // restoreOriginal 认得“目标上就是登记的派生预览”这种快照，因此可以安全地覆盖它。
+        File restored = store.restoreOriginal(config, record, original);
+        if (restored == null || !restored.isFile()
+                || restored.length() != record.originalLength) {
+            return new ItemResult(item.row, "failed", "restore_verification_failed");
+        }
+        OriginalStore.Record latest = store.find(config, item.row, item.sha1);
+        if (latest == null || latest.getLocalState() != OriginalStore.LocalState.ORIGINAL) {
+            return new ItemResult(item.row, "failed", "restore_verification_failed");
+        }
+        int clearedRows = 0;
+        String thumbnail = readThumbnailPath(context, item.row);
+        if (!isBlank(thumbnail)) {
+            Method saveToDb = slimSaveToDbMethod();
+            if (saveToDb == null) {
+                return new ItemResult(item.row, "failed", "thumbnail_clear_failed");
+            }
+            String failure = clearThumbnailRow(context, saveToDb, record, item.row);
+            if (failure != null) return new ItemResult(item.row, "failed", failure);
+            clearedRows = 1;
+        }
+        Logger.i("event=unslim_inplace_done row=" + item.row
+                + " bytes=" + record.originalLength);
+        return new ItemResult(item.row, "success", "", 0, clearedRows, 0);
     }
 
     /**
@@ -1698,31 +1768,564 @@ public final class MetadataRestoreJob {
         return new ItemResult(item.row, status, reason, 0, state.clearedRows, state.deletedCopies);
     }
 
+    // --------------------------------------------------------------- 原地覆盖迁移（第 5 波）
+
+    /**
+     * migrate_inplace：把老侧车预览 {@code <相册>/.gallerysync-slim/<随机名>.<ext>} 搬回
+     * {@code <相册>/<行 fileName>}，让这一行从“侧车预览”变成“原地预览”。
+     *
+     * <p>判定与执行分两层：行形状/扩展名家族/目标占用全部由 {@link Migration} 的纯逻辑给出
+     * 结论（也就是结果里上报的 reason），这里只负责按结论动手，并且每动一步都留下可回滚的
+     * 中间态。{@code dryRun} 时连一次 rename 都不做，只回报 planned。
+     */
+    private ItemResult migrateInplaceOne(Context context, Config config, OriginalStore store,
+            String target, RequestItem item, boolean dryRun) throws Exception {
+        if (!isCurrent(target)) {
+            return migrationResult(item, "cancelled", "job_stopped", null, 0L, false, false);
+        }
+        MigrationRow row = readMigrationRow(context, item.row, item.sha1);
+        if (row == null) {
+            return migrationResult(item, "failed", "migrate_row_missing", null, 0L, false, false);
+        }
+        OriginalStore.Record record = store.find(config, item.row, item.sha1);
+        MigrationFacts facts = new MigrationFacts();
+        facts.rowExists = true;
+        facts.localFile = row.localFile;
+        facts.thumbnailFile = row.thumbnailFile;
+        facts.fileName = row.fileName;
+        facts.rowSize = row.size;
+        // 行形状先判：侧车形态与文件名都不需要看磁盘，先拒掉能避免把 IO 噪声当成拒绝理由。
+        String rowReason = Migration.rowOnlyReason(facts);
+        if (!rowReason.isEmpty()) {
+            // “不是侧车行”是本来就不该迁移，算跳过；“没有原名”是数据坏了，必须算失败。
+            String status = Migration.isSkipReason(rowReason) ? "skipped" : "failed";
+            return migrationResult(item, status, rowReason, null, 0L, false, false);
+        }
+        File preview = safeStoragePath(row.thumbnailFile);
+        if (preview == null) {
+            return migrationResult(item, "failed", "migrate_path_unsafe", null, 0L, false, false);
+        }
+        facts.previewExists = preview.isFile();
+        facts.previewLength = facts.previewExists ? preview.length() : 0L;
+        facts.previewFormat = record != null && !isBlank(record.getPreviewFormat())
+                ? record.getPreviewFormat() : Migration.previewFormatOf(row.thumbnailFile);
+        facts.originalSha256 = record == null ? null : record.sha256;
+        if (facts.previewExists) {
+            String album = Migration.slimAlbumDirectory(row.thumbnailFile);
+            String targetPath = Migration.migrationTargetPath(row.thumbnailFile, row.fileName);
+            File targetFile = safeStoragePath(targetPath);
+            File albumDirectory = safeStoragePath(album);
+            File slimDirectory = safeStoragePath(album == null ? null
+                    : album + "/" + SLIM_DIRECTORY_NAME);
+            // 三条硬条件：相册目录真实存在、目标路径落在根目录内、预览确实就在那个侧车目录里。
+            // 缺任何一条都说明这条行描述的不是“相册 + .gallerysync-slim + 预览”这个形状。
+            if (targetFile == null || albumDirectory == null || slimDirectory == null
+                    || !albumDirectory.isDirectory()
+                    || !sameCanonical(slimDirectory.getPath(),
+                            preview.getParentFile().getPath())) {
+                return migrationResult(item, "failed", "migrate_path_unsafe", null, 0L,
+                        false, false);
+            }
+            facts.targetExists = targetFile.isFile();
+            facts.targetLength = facts.targetExists ? targetFile.length() : 0L;
+            facts.targetSha256 = facts.targetExists ? sha256(targetFile) : null;
+        }
+        MigrationDecision decision = Migration.decision(facts);
+        if (!decision.reason.isEmpty()) {
+            String status = Migration.isSkipReason(decision.reason) ? "skipped" : "failed";
+            return migrationResult(item, status, decision.reason, decision.action,
+                    facts.previewLength, false, false);
+        }
+        if (dryRun) {
+            Logger.i("event=migrate_inplace_planned row=" + item.row
+                    + " bytes=" + facts.previewLength + " dryRun=true");
+            return migrationResult(item, "planned", "", decision.action,
+                    facts.previewLength, false, true);
+        }
+        if (!isCurrent(target)) {
+            return migrationResult(item, "cancelled", "job_stopped", decision.action,
+                    facts.previewLength, false, false);
+        }
+        String targetPath = Migration.migrationTargetPath(row.thumbnailFile, row.fileName);
+        File targetFile = safeStoragePath(targetPath);
+        if (targetFile == null) {
+            return migrationResult(item, "failed", "migrate_path_unsafe", decision.action,
+                    facts.previewLength, false, false);
+        }
+        // 5a：目标上已经是完整原图（长度等于行 size、摘要等于注册表原文摘要）时不再搬文件，
+        // 只把行修回原路径 —— 这时路径上的字节就是原图，状态该回落 ORIGINAL 而不是
+        // INPLACE_PREVIEW，否则上传分类会把一张真原图永久当成预览。
+        if (decision.repairOnly) {
+            int updated = updateMigratedRow(context, item.row, row.sha1, targetFile);
+            if (updated != 1) {
+                return migrationResult(item, "failed", "migrate_db_update_failed",
+                        decision.action, 0L, false, false);
+            }
+            String failure = markOriginalAtPath(config, store, record, targetFile);
+            if (!failure.isEmpty()) {
+                Logger.w("event=migrate_inplace_registry_warn row=" + item.row + " reason=" + failure);
+            }
+            deleteEmptySlimDirectory(preview);
+            Logger.i("event=migrate_inplace_done row=" + item.row + " bytes=" + facts.previewLength
+                    + " dryRun=false");
+            return migrationResult(item, "success", "", decision.action, facts.previewLength,
+                    true, false);
+        }
+        String previewSha256;
+        try {
+            previewSha256 = sha256(preview);
+        } catch (Throwable failure) {
+            return migrationResult(item, "failed", "migrate_hash_failed", decision.action,
+                    facts.previewLength, false, false);
+        }
+        // 5b：同卷原子改名。FUSE 上 ATOMIC_MOVE 可能不支持，退回普通 move（源已消失时它在
+        // 目标已存在这一点上会失败，因此不会静默覆盖别的东西）。
+        try {
+            Files.move(preview.toPath(), targetFile.toPath(), StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            try {
+                Files.move(preview.toPath(), targetFile.toPath());
+            } catch (Throwable failure) {
+                return migrationResult(item, "failed", "migrate_move_failed", decision.action,
+                        facts.previewLength, false, false);
+            }
+        } catch (Throwable failure) {
+            return migrationResult(item, "failed", "migrate_move_failed", decision.action,
+                    facts.previewLength, false, false);
+        }
+        // 5c：长度必须原样；摘要前后各算一次，既证明搬动没改字节，也是注册表要记的 previewSha256。
+        if (!targetFile.isFile() || targetFile.length() != facts.previewLength) {
+            rollbackMigrationMove(targetFile, preview);
+            return migrationResult(item, "failed", "migrate_verify_failed", decision.action,
+                    facts.previewLength, false, false);
+        }
+        String movedSha256;
+        try {
+            movedSha256 = sha256(targetFile);
+        } catch (Throwable failure) {
+            rollbackMigrationMove(targetFile, preview);
+            return migrationResult(item, "failed", "migrate_hash_failed", decision.action,
+                    facts.previewLength, false, false);
+        }
+        if (!movedSha256.equalsIgnoreCase(previewSha256)) {
+            rollbackMigrationMove(targetFile, preview);
+            return migrationResult(item, "failed", "migrate_verify_failed", decision.action,
+                    facts.previewLength, false, false);
+        }
+        // 5d：行改成“本地就在原路径、不再有缩略图侧车”。按 _id + sha1 双条件写，0 行说明
+        // 行在迁移期间被改过，必须把文件搬回隐藏目录，不能留下无主预览。
+        int updated = updateMigratedRow(context, item.row, row.sha1, targetFile);
+        if (updated != 1) {
+            rollbackMigrationMove(targetFile, preview);
+            return migrationResult(item, "failed", "migrate_db_update_failed", decision.action,
+                    facts.previewLength, false, false);
+        }
+        // 5e：注册表登记“原路径上的字节是预览”。找不到记录只告警，不回滚 —— 文件与行已经
+        // 一致，回滚只会把一次成功的迁移再拆掉。
+        if (record == null) {
+            Logger.w("event=migrate_inplace_registry_warn row=" + item.row + " reason=no_record");
+        } else {
+            OriginalStore.Record committed = store.markInplaceCommitted(config, record,
+                    facts.previewLength, previewSha256, facts.previewFormat);
+            if (committed == null) {
+                Logger.w("event=migrate_inplace_registry_warn row=" + item.row
+                        + " reason=mark_failed");
+            }
+        }
+        // 5f：只删空目录；里面还有转码/侧车保留的预览时什么都不做。
+        deleteEmptySlimDirectory(preview);
+        Logger.i("event=migrate_inplace_done row=" + item.row + " bytes=" + facts.previewLength
+                + " dryRun=false");
+        return migrationResult(item, "success", "", decision.action, facts.previewLength,
+                true, false);
+    }
+
+    /** 把行改成“本地在 {@code targetFile}、没有缩略图侧车”；影响行数由调用者校验。 */
+    private static int updateMigratedRow(Context context, String rowId, String sha1, File targetFile) {
+        ContentValues values = new ContentValues(2);
+        values.put("localFile", targetFile.getPath());
+        values.put("thumbnailFile", "");
+        try {
+            return context.getContentResolver().update(CLOUD_URI, values,
+                    "_id = ? AND sha1 = ?", new String[]{rowId, sha1});
+        } catch (Throwable failure) {
+            return 0;
+        }
+    }
+
+    /**
+     * 迁移失败时把文件搬回隐藏目录。
+     *
+     * <p>搬不回去只记日志：下一次 dry-run 会看到“目标已存在”并给出 migrate_target_exists，
+     * 人可以从那个理由倒推出磁盘上的中间态。
+     */
+    private static void rollbackMigrationMove(File moved, File preview) {
+        try {
+            File parent = preview.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            Files.move(moved.toPath(), preview.toPath(), StandardCopyOption.ATOMIC_MOVE);
+        } catch (Throwable atomicFailure) {
+            try {
+                Files.move(moved.toPath(), preview.toPath());
+            } catch (Throwable ignored) {
+                Logger.w("event=migrate_inplace_rollback_failed path=" + moved.getPath());
+            }
+        }
+    }
+
+    /** 侧车目录空了才删；里面有没迁移的预览时保持原样。 */
+    private static void deleteEmptySlimDirectory(File preview) {
+        File directory = preview.getParentFile();
+        if (directory == null) return;
+        try {
+            String[] remaining = directory.list();
+            if (remaining != null && remaining.length == 0 && !directory.delete()) {
+                Logger.d("event=migrate_inplace_directory_keep path=" + directory.getPath());
+            }
+        } catch (Throwable ignored) {
+            Logger.d("event=migrate_inplace_directory_keep path=" + directory.getPath());
+        }
+    }
+
+    /**
+     * 把“归属路径上已经是完整原图”这件事落盘：非空 sha256 走 {@code restoreOriginal} 的
+     * 快照分支（目标字节就是登记的原文，于是只调 {@code withRestoredLocal}，不发网络请求）。
+     * 摘要未知时退回 {@code registerUploadedOriginal}：它按本次核过的长度/摘要把记录重建为
+     * {@code ORIGINAL}，这是公开 API 里唯一不改字节就能把状态写回原图的路径。
+     */
+    private static String markOriginalAtPath(Config config, OriginalStore store,
+            OriginalStore.Record record, File targetFile) {
+        if (record == null) return "no_record";
+        try {
+            if (!isBlank(record.sha256)) {
+                File restored = store.restoreOriginal(config, record, targetFile);
+                return restored != null && restored.isFile() ? "" : "state_not_updated";
+            }
+            store.registerUploadedOriginal(config, record.remotePath, targetFile, record.rowId,
+                    record.sha1, sha256(targetFile), targetFile.length(),
+                    targetFile.lastModified());
+            return "";
+        } catch (Throwable failure) {
+            return "state_not_updated";
+        }
+    }
+
+    /**
+     * repair_state：只修注册表状态，不动相册行、不删文件。
+     *
+     * <p>{@code PENDING_INPLACE}（进程死在第 6 步之前）与 {@code DAMAGED} 都靠它回到一个能判断
+     * 的状态：本地字节证明是原图就回 {@code ORIGINAL}，证明是预览就记成原地预览，都不是才
+     * 重新从远端取。判定顺序见 {@link RepairState#decision}。
+     */
+    private ItemResult repairStateOne(Context context, Config config, OriginalStore store,
+            String target, RequestItem item) throws Exception {
+        if (!isCurrent(target)) return repairResult(item, "cancelled", "job_stopped");
+        OriginalStore.Record record = store.find(config, item.row, item.sha1);
+        if (record == null) return repairResult(item, "failed", "no_registry_record");
+        File destination = safeOriginalFile(record.originalLocalPath);
+        if (destination == null) return repairResult(item, "failed", "repair_path_unsafe");
+        RepairFacts facts = new RepairFacts();
+        facts.recordExists = true;
+        facts.alreadyOriginal = record.getLocalState() == OriginalStore.LocalState.ORIGINAL;
+        facts.targetPresent = destination.isFile();
+        facts.originalLength = record.originalLength;
+        facts.originalSha256 = record.sha256;
+        facts.previewLength = record.getPreviewLength();
+        facts.previewSha256 = record.getPreviewSha256();
+        if (facts.targetPresent) {
+            facts.targetLength = destination.length();
+            facts.targetSha256 = sha256(destination);
+        }
+        RepairDecision decision = RepairState.decision(facts);
+        if (!decision.reason.isEmpty()) {
+            String status = "repair_already_original".equals(decision.reason) ? "success"
+                    : "repair_missing".equals(decision.reason) ? "skipped" : "failed";
+            return repairResult(item, status, decision.reason);
+        }
+        switch (decision.action) {
+            case RepairState.ACTION_RESTORE_LOCAL: {
+                String failure = persistRestoredState(config, store, record, destination,
+                        facts.targetSha256);
+                if (!failure.isEmpty()) return repairResult(item, "failed", failure);
+                Logger.i("event=repair_state_done row=" + item.row
+                        + " reason=repair_original_restored");
+                return repairResult(item, "success", "repair_original_restored");
+            }
+            case RepairState.ACTION_CONFIRM_PREVIEW: {
+                OriginalStore.Record committed = store.markInplaceCommitted(config, record,
+                        facts.previewLength, facts.previewSha256, record.getPreviewFormat());
+                if (committed == null) return repairResult(item, "failed", "repair_failed");
+                Logger.i("event=repair_state_done row=" + item.row
+                        + " reason=repair_preview_confirmed");
+                return repairResult(item, "success", "repair_preview_confirmed");
+            }
+            default: {
+                if (!hasRequiredSpace(record.originalLength)) {
+                    return repairResult(item, "skipped", "needs_space");
+                }
+                try {
+                    File restored = store.restoreOriginal(config, record, destination);
+                    if (restored != null && restored.isFile()
+                            && restored.length() == record.originalLength) {
+                        Logger.i("event=repair_state_done row=" + item.row
+                                + " reason=repair_restored_from_remote");
+                        return repairResult(item, "success", "repair_restored_from_remote");
+                    }
+                } catch (Throwable failure) {
+                    Logger.w("event=repair_state_restore_failed row=" + item.row);
+                }
+                store.markDamaged(config, record, "repair_failed");
+                return repairResult(item, "failed", "repair_failed");
+            }
+        }
+    }
+
+    /** 本地字节已经是完整原图：按 withRestoredLocal 的路径把状态写回 ORIGINAL。 */
+    private static String persistRestoredState(Config config, OriginalStore store,
+            OriginalStore.Record record, File destination, String digest) {
+        try {
+            if (!isBlank(record.sha256)) {
+                File restored = store.restoreOriginal(config, record, destination);
+                return restored != null && restored.isFile()
+                        && restored.length() == record.originalLength
+                        ? "" : "repair_failed";
+            }
+            store.registerUploadedOriginal(config, record.remotePath, destination, record.rowId,
+                    record.sha1, digest, destination.length(), destination.lastModified());
+            return "";
+        } catch (Throwable failure) {
+            Logger.w("event=repair_state_persist_failed row=" + record.rowId);
+            return "repair_failed";
+        }
+    }
+
+    // ------------------------------------------------- 原地迁移后的重复行收拾（reconcile_inplace）
+
+    /**
+     * reconcile_inplace：原地迁移把 {@code .gallerysync-slim/<原名>} 改名回相册原路径之后，
+     * 相册扫描器会把这个“新出现的文件”再插一行（{@code _id} 更大）。于是同一 localFile 上有两行：
+     * 幽灵行记着原图大小（几 MB）、keeper 行记着预览大小（几百 KB）。两行都没有 serverId，
+     * 所以删幽灵行不影响云端。
+     *
+     * <p>证据链（任一不成立就拒，绝不删行）：路径在存储根内且是普通文件 → 行按 _id 存在 →
+     * 行是幽灵形状（localFile 逐字相符、thumbnailFile 空、serverId 空）→ 行 size 与文件真实
+     * 大小不同 → 同路径恰好还有 1 行，且它的 size 就是文件真实大小、无 serverId、无缩略图。
+     * 删除后回读确认行真的没了，最后把注册表里指向这张照片的记录改绑到 keeper 行。
+     */
+    private ItemResult reconcileInplaceOne(Context context, Config config, OriginalStore store,
+            String target, RequestItem item) {
+        if (!isCurrent(target)) return reconcileResult(item, "cancelled", "job_stopped", "");
+        // a. 路径闸门：根目录内、规范化后仍在根内、是普通文件。
+        File file = reconcileTarget(item.path);
+        if (file == null) return reconcileResult(item, "failed", "reconcile_path_unsafe", "");
+        if (!isCurrent(target)) return reconcileResult(item, "cancelled", "job_stopped", "");
+        // b–e. 取行、采事实、纯逻辑判定。判定层不碰 Android，单测直接钉它的每一条拒绝理由。
+        CloudRow ghost = readCloudRow(context, item.row, null, null);
+        ReconcileFacts facts = collectReconcileFacts(context, item, file, ghost);
+        String failure = Reconcile.decision(facts);
+        if (!failure.isEmpty()) return reconcileResult(item, "failed", failure, "");
+        long ghostId = parseRowId(item.row);
+        if (ghostId <= 0L) return reconcileResult(item, "failed", "reconcile_row_missing", "");
+        if (!isCurrent(target)) return reconcileResult(item, "cancelled", "job_stopped", "");
+        // f. 与其余删除通道同一套可验证判据：API 抛异常或删完回读仍能看到行都算失败。
+        boolean invoked = false;
+        try {
+            Class<?> cloudUtils = mLoader.loadClass("com.miui.gallery.provider.CloudUtils");
+            Method deleteById = cloudUtils.getMethod("deleteById", Context.class, int.class,
+                    int.class, long[].class);
+            deleteById.invoke(null, context, 1, 0, new long[]{ghostId});
+            invoked = true;
+        } catch (Throwable deleteFailure) {
+            invoked = false;
+        }
+        if (!invoked || readCloudRow(context, item.row, null, null) != null) {
+            return reconcileResult(item, "failed", "reconcile_delete_failed", "");
+        }
+        // g. 注册表改绑。找不到记录不是失败：行已经收拾干净，只是没有该照片的登记可改。
+        boolean rebound = false;
+        try {
+            rebound = store.bindRowForLocalPath(config, file, facts.keeperRowId, facts.keeperSha1);
+        } catch (Throwable bindFailure) {
+            rebound = false;
+        }
+        Logger.i("event=reconcile_inplace_done row=" + item.row + " keeper="
+                + facts.keeperRowId + " path=" + item.path + " rebound=" + rebound);
+        return reconcileResult(item, "success", "", "rebound=" + rebound);
+    }
+
+    /**
+     * reconcile_inplace 的路径闸门：复用 {@link #safeStoragePath}（根内 + 非符号链接），
+     * 另外要求它确实是一个普通文件。不合法一律回 null。
+     */
+    static File reconcileTarget(String rawPath) {
+        File file = safeStoragePath(rawPath);
+        return file != null && file.isFile() ? file : null;
+    }
+
+    /** 采集判定需要的全部事实（幽灵行 + 磁盘长度 + 同路径的 keeper 行）；判定本身在 Reconcile。 */
+    private static ReconcileFacts collectReconcileFacts(Context context, RequestItem item,
+            File file, CloudRow ghost) {
+        ReconcileFacts facts = new ReconcileFacts();
+        facts.rowExists = ghost != null;
+        if (ghost == null) return facts;
+        facts.localFile = ghost.localFile;
+        // “逐字等于 path”是硬条件：Gallery 会对路径做自己的规范化，大小写/相对写法不同就说明
+        // 这一行不是我们迁移后留下的那一行，删它可能毁掉别的照片的登记。
+        facts.localFileMatches = item.path.equals(ghost.localFile);
+        facts.thumbnailEmpty = isBlank(ghost.thumbnailFile);
+        facts.serverIdEmpty = isBlank(ghost.serverId);
+        facts.fileLength = file.length();
+        facts.rowSize = ghost.size;
+        // 只有 localFile 逐字相符时才去查同路径的其它行：否则这一行根本不归本项管。
+        if (!facts.localFileMatches) return facts;
+        List<ReconcileRow> keepers = readReconcileKeepers(context, ghost.localFile, item.row);
+        facts.keeperCount = keepers.size();
+        if (keepers.size() == 1) {
+            ReconcileRow keeper = keepers.get(0);
+            facts.keeperRowId = keeper.rowId;
+            facts.keeperSha1 = keeper.sha1;
+            facts.keeperSize = keeper.size;
+            facts.keeperSizeMatches = keeper.size == facts.fileLength;
+            facts.keeperServerIdEmpty = isBlank(keeper.serverId);
+            facts.keeperThumbnailEmpty = isBlank(keeper.thumbnailFile);
+        }
+        return facts;
+    }
+
+    /**
+     * 查同一 localFile 上的其它行（{@code _id != 幽灵行}）。
+     *
+     * <p>查询失败按“没有 keeper”处理：证据缺失时宁可拒掉这一项，也不能把行删掉。
+     */
+    private static List<ReconcileRow> readReconcileKeepers(Context context, String localFile,
+            String ghostId) {
+        List<ReconcileRow> rows = new ArrayList<>();
+        if (isBlank(localFile)) return rows;
+        try (Cursor cursor = context.getContentResolver().query(CLOUD_URI,
+                RECONCILE_KEEPER_COLUMNS, "localFile = ? AND _id != ?",
+                new String[]{localFile, ghostId}, null)) {
+            if (cursor == null) return rows;
+            while (cursor.moveToNext()) {
+                String rowId = stringColumn(cursor, "_id");
+                // selection 已经排除幽灵行；provider 忽略 selection 时这里再兜底一次。
+                if (rowId == null || rowId.equals(ghostId)) continue;
+                rows.add(new ReconcileRow(rowId, stringColumn(cursor, "localFile"),
+                        stringColumn(cursor, "thumbnailFile"), stringColumn(cursor, "sha1"),
+                        stringColumn(cursor, "serverId"), longColumn(cursor, "size")));
+            }
+        } catch (Throwable ignored) {
+            rows.clear();
+        }
+        return rows;
+    }
+
+    /** reconcile_inplace 的一条结果：row 恒为幽灵行 _id，message 只在成功时写 rebound。 */
+    private static ItemResult reconcileResult(RequestItem item, String status, String reason,
+            String message) {
+        return new ItemResult(item.row, status, reason, 0, 0, 0, null, null, 0L, false, false,
+                message);
+    }
+
+    /** 每一条 migrate_inplace 结果都带 mode/action/bytes，跳过与 dry-run 不算失败。 */
+    private static ItemResult migrationResult(RequestItem item, String status, String reason,
+            InplaceSlimPolicy.MigrationAction action, long bytes, boolean migrated,
+            boolean planned) {
+        return new ItemResult(item.row, status, reason, 0, 0, 0, "migrate_inplace",
+                migrationOutcomeName(action), bytes, migrated, planned);
+    }
+
+    private static ItemResult repairResult(RequestItem item, String status, String reason) {
+        return new ItemResult(item.row, status, reason, 0, 0, 0, "repair_state", null, 0L,
+                false, false);
+    }
+
+    /** 结果 JSON / 日志里的迁移动作名；null 回空串。 */
+    static String migrationOutcomeName(InplaceSlimPolicy.MigrationAction action) {
+        if (action == null) return "";
+        switch (action) {
+            case RENAME: return "rename";
+            case TRANSCODE: return "transcode";
+            case SIDECAR: return "sidecar";
+            case SKIP: return "skip";
+            default: return "";
+        }
+    }
+
+    /**
+     * 只接受共享存储根目录内的普通路径：规范化后再比对前缀，符号链接指向根目录之外时
+     * 规范化结果会露馅，直接拒绝。{@code null}/空串/根目录之外/符号链接一律回 null。
+     */
+    private static File safeStoragePath(String rawPath) {
+        if (rawPath == null || rawPath.trim().isEmpty()) return null;
+        try {
+            File root = new File(STORAGE_ROOT).getCanonicalFile();
+            File candidate = new File(rawPath).getCanonicalFile();
+            if (!candidate.getPath().startsWith(root.getPath() + File.separator)) return null;
+            if (Files.isSymbolicLink(candidate.toPath())) return null;
+            return candidate;
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    /** 迁移要看的行事实：两个路径字段、文件名、登记字节数、sha1 与 serverType。 */
+    private static MigrationRow readMigrationRow(Context context, String rowId, String sha1) {
+        try (Cursor cursor = context.getContentResolver().query(CLOUD_URI,
+                new String[]{"_id", "sha1", "localFile", "thumbnailFile", "fileName", "size",
+                        "serverType"},
+                "_id = ?", new String[]{rowId}, null)) {
+            if (cursor == null || !cursor.moveToFirst()) return null;
+            String storedRowId = stringColumn(cursor, "_id");
+            String storedSha1 = stringColumn(cursor, "sha1");
+            if (storedRowId == null || !storedRowId.equals(rowId)
+                    || storedSha1 == null || !storedSha1.equalsIgnoreCase(sha1)) {
+                return null;
+            }
+            MigrationRow row = new MigrationRow(storedRowId, stringColumn(cursor, "localFile"),
+                    stringColumn(cursor, "thumbnailFile"), stringColumn(cursor, "fileName"),
+                    stringColumn(cursor, "sha1"), longColumn(cursor, "size"),
+                    stringColumn(cursor, "serverType"));
+            if (cursor.moveToNext()) return null;
+            return row;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 读一行相册云行。{@code sha1} 传 null 表示调用方不校验指纹（reconcile_inplace 的幽灵行
+     * 只按 {@code _id} 精确匹配）；{@code record} 传 null 时不要求路径属于某条注册表记录。
+     */
     private static CloudRow readCloudRow(Context context, String rowId, String sha1,
             OriginalStore.Record record) {
         try (Cursor cursor = context.getContentResolver().query(CLOUD_URI,
                 new String[]{"_id", "sha1", "localFile", "thumbnailFile", "dateTaken",
-                        "mixedDateTime", "dateModified", "realDateModified"},
+                        "mixedDateTime", "dateModified", "realDateModified", "size", "serverId"},
                 "_id = ?", new String[]{rowId}, null)) {
             if (cursor == null || !cursor.moveToFirst()) return null;
             int idColumn = cursor.getColumnIndex("_id");
             int shaColumn = cursor.getColumnIndex("sha1");
             int localColumn = cursor.getColumnIndex("localFile");
             int thumbnailColumn = cursor.getColumnIndex("thumbnailFile");
-            if (idColumn < 0 || shaColumn < 0 || localColumn < 0
-                    || !rowId.equals(cursor.getString(idColumn))
-                    || !sha1.equalsIgnoreCase(cursor.getString(shaColumn))) return null;
-            String gallerySha1 = cursor.getString(shaColumn);
+            if (idColumn < 0 || localColumn < 0 || !rowId.equals(cursor.getString(idColumn))) {
+                return null;
+            }
+            if (sha1 != null && (shaColumn < 0
+                    || !sha1.equalsIgnoreCase(cursor.getString(shaColumn)))) return null;
+            String gallerySha1 = shaColumn < 0 || cursor.isNull(shaColumn)
+                    ? null : cursor.getString(shaColumn);
             boolean localNull = cursor.isNull(localColumn);
             String local = localNull ? null : cursor.getString(localColumn);
             String thumbnail = thumbnailColumn < 0 || cursor.isNull(thumbnailColumn)
                     ? null : cursor.getString(thumbnailColumn);
             Map<String, Long> dates = readPositiveDates(cursor);
             if (cursor.moveToNext()) return null;
-            if (!isRegisteredPath(local, record) && !isRegisteredPath(thumbnail, record)) {
+            if (record != null && !isRegisteredPath(local, record)
+                    && !isRegisteredPath(thumbnail, record)) {
                 return null;
             }
-            return new CloudRow(gallerySha1, local, localNull, dates);
+            return new CloudRow(gallerySha1, local, localNull, dates, thumbnail,
+                    stringColumn(cursor, "serverId"), longColumn(cursor, "size"));
         } catch (Throwable ignored) {
             return null;
         }
@@ -2116,6 +2719,9 @@ public final class MetadataRestoreJob {
             throw new IOException("invalid_job_id");
         }
         if (!target.matches("[0-9a-f]{64}")) throw new IOException("invalid_target");
+        // 请求根上的 dryRun：缺省 false，只接受布尔。它只影响 migrate_inplace，其余模式忽略。
+        boolean dryRun = parseDryRun(root.has("dryRun") && !root.isNull("dryRun")
+                ? root.get("dryRun") : null);
         JSONArray array = root.getJSONArray("items");
         if (array.length() == 0 || array.length() > MAX_ITEMS) {
             throw new IOException("invalid_item_count");
@@ -2147,14 +2753,14 @@ public final class MetadataRestoreJob {
                 // 收紧到"mode 恰为 poster_rewire 且键名恰为 posterpath"，其余任何含
                 // path/destination 的键（包括其它模式的 posterPath）仍然整单拒掉。
                 if ("poster_rewire".equals(mode) && "posterpath".equals(key)) continue;
+                // reconcile_inplace 的 path 是“要收拾的那张照片的绝对路径”——只读证据，不是
+                // 写入目的地：运行期还要过 reconcile_path_unsafe 的根目录/普通文件校验。
+                if ("reconcile_inplace".equals(mode) && "path".equals(key)) continue;
                 if (key.contains("path") || key.contains("destination")) {
                     throw new IOException("request_path_not_allowed");
                 }
             }
-            if (!"restore".equals(mode) && !"unslim".equals(mode)
-                    && !"legacy_copies".equals(mode) && !"stale_rows".equals(mode)
-                    && !"broken_payload".equals(mode) && !"orphan_rows".equals(mode)
-                    && !"purge_items".equals(mode) && !"poster_rewire".equals(mode)) {
+            if (!isSupportedItemMode(mode)) {
                 throw new IOException("invalid_item_mode");
             }
             // broken_payload 只接受 row/sha1/length：它的证据是"内容可证明全零"，不借 base 行；
@@ -2171,7 +2777,9 @@ public final class MetadataRestoreJob {
             // purge_items 的判据全在"本行 + 磁盘上那份文件"上，没有见证行这回事：请求里出现
             // baseRow/baseSha1，说明它是按 legacy_copies/stale_rows 的形状造出来的，整单拒掉。
             // poster_rewire 同理：它的证据是"图片行 + 封面文件 + 视频行"，也不借 base 行。
-            if ("purge_items".equals(mode) || "poster_rewire".equals(mode)) {
+            // 本波的两个新模式只带 row/sha1，同样不接受 base 行。
+            if ("purge_items".equals(mode) || "poster_rewire".equals(mode)
+                    || "reconcile_inplace".equals(mode) || isMigrationMode(mode)) {
                 java.util.Iterator<String> purgeKeys = item.keys();
                 while (purgeKeys.hasNext()) {
                     String key = purgeKeys.next().toLowerCase(Locale.ROOT);
@@ -2180,12 +2788,31 @@ public final class MetadataRestoreJob {
                     }
                 }
             }
+            // 新模式的 row/sha1 缺失必须给出稳定的 reason（parseRequest 的异常消息会进结果根的
+            // reason），不能让它退化成 JSONException 驱动的 internal_error。
+            if (isMigrationMode(mode)) {
+                String invalidItem = newModeItemInvalidReason(mode,
+                        item.has("row") && !item.isNull("row"),
+                        item.has("sha1") && !item.isNull("sha1"));
+                if (!invalidItem.isEmpty()) throw new IOException(invalidItem);
+            }
+            // reconcile_inplace 只需要 row：它按 _id 精确取行，不校验 sha1（幽灵行的 sha1 是
+            // 扫描器给预览文件现算的，与请求侧无关）。缺 row 仍要给稳定 reason。
+            if ("reconcile_inplace".equals(mode) && (!item.has("row") || item.isNull("row"))) {
+                throw new IOException("missing_item_row");
+            }
             String row = item.getString("row");
-            String sha1 = item.getString("sha1");
+            String sha1;
+            if ("reconcile_inplace".equals(mode)) {
+                sha1 = item.has("sha1") && !item.isNull("sha1") ? item.getString("sha1") : "";
+            } else {
+                sha1 = item.getString("sha1");
+            }
             // legacy_copies 与 stale_rows 的条目没有 sha256；其余模式保持原来的取值顺序与异常行为。
             boolean optionalSha256 = "legacy_copies".equals(mode) || "stale_rows".equals(mode)
                     || "broken_payload".equals(mode) || "orphan_rows".equals(mode)
-                    || "purge_items".equals(mode) || "poster_rewire".equals(mode);
+                    || "purge_items".equals(mode) || "poster_rewire".equals(mode)
+                    || "reconcile_inplace".equals(mode) || isMigrationMode(mode);
             String sha256;
             if (optionalSha256) {
                 sha256 = item.has("sha256") && !item.isNull("sha256")
@@ -2197,14 +2824,16 @@ public final class MetadataRestoreJob {
             // broken_payload 必须给出 size，它就是"全零内容"证明的长度；
             // purge_items 必须给出 length：本地文件存在时要拿它逐字节核对；
             // poster_rewire 也必须给出 length：它既是图片行的 size，也是封面文件的字节数；
-            // orphan_rows 面对的行根本没有本地文件，没有长度可言，length 一律可选。
+            // orphan_rows 面对的行根本没有本地文件，没有长度可言，length 一律可选；
+            // 本波两个新模式的长度证据分别来自相册行的 size 与注册表，length 同样可选。
             Object rawLength = "stale_rows".equals(mode) || "broken_payload".equals(mode)
                     || "orphan_rows".equals(mode) || "purge_items".equals(mode)
-                    || "poster_rewire".equals(mode)
+                    || "poster_rewire".equals(mode) || "reconcile_inplace".equals(mode)
+                    || isMigrationMode(mode)
                     ? (item.has("length") && !item.isNull("length") ? item.get("length") : null)
                     : item.get("length");
             if (rawLength == null && ("broken_payload".equals(mode) || "purge_items".equals(mode)
-                    || "poster_rewire".equals(mode))) {
+                    || "poster_rewire".equals(mode) || "reconcile_inplace".equals(mode))) {
                 throw new IOException("invalid_item_length");
             }
             boolean sha256Valid = optionalSha256
@@ -2212,7 +2841,10 @@ public final class MetadataRestoreJob {
                     : sha256 != null && sha256.matches("(?i)[0-9a-f]{64}");
             boolean lengthValid = rawLength == null
                     || rawLength instanceof Integer || rawLength instanceof Long;
-            if (row.isEmpty() || row.length() > 128 || !sha1.matches("(?i)[0-9a-f]{40}")
+            // reconcile_inplace 的 sha1 可以为空（只按 _id 取行）；其余模式必须 40 位十六进制。
+            boolean sha1Valid = sha1.matches("(?i)[0-9a-f]{40}")
+                    || ("reconcile_inplace".equals(mode) && sha1.isEmpty());
+            if (row.isEmpty() || row.length() > 128 || !sha1Valid
                     || !sha256Valid || !lengthValid) {
                 throw new IOException("invalid_item_metadata");
             }
@@ -2282,6 +2914,29 @@ public final class MetadataRestoreJob {
                     throw new IOException("invalid_item_mode");
                 }
             }
+            // reconcile_inplace 专有的两个字段：照片绝对路径（必须给出）与预览真实字节数（可选）。
+            // 这里只查形状（是字符串、以 / 开头、长度上界、正整数），“是否真在存储根内/是不是
+            // 普通文件”留给运行期判定（reconcile_path_unsafe），因为那需要看磁盘。
+            String reconcilePath = null;
+            long previewLength = 0L;
+            if ("reconcile_inplace".equals(mode)) {
+                Object rawPath = item.has("path") && !item.isNull("path") ? item.get("path") : null;
+                if (!(rawPath instanceof String)) throw new IOException("invalid_item_mode");
+                reconcilePath = (String) rawPath;
+                if (!reconcilePath.startsWith("/")
+                        || reconcilePath.length() > MAX_RECONCILE_PATH) {
+                    throw new IOException("invalid_item_mode");
+                }
+                if (item.has("previewLength") && !item.isNull("previewLength")) {
+                    Object rawPreviewLength = item.get("previewLength");
+                    if (!(rawPreviewLength instanceof Integer)
+                            && !(rawPreviewLength instanceof Long)) {
+                        throw new IOException("invalid_item_mode");
+                    }
+                    previewLength = ((Number) rawPreviewLength).longValue();
+                    if (previewLength <= 0L) throw new IOException("invalid_item_mode");
+                }
+            }
             List<Long> relatedRows = new ArrayList<>();
             if (item.has("relatedRows")) {
                 JSONArray related = item.getJSONArray("relatedRows");
@@ -2314,9 +2969,48 @@ public final class MetadataRestoreJob {
             items.add(new RequestItem(row, sha1.toLowerCase(Locale.ROOT),
                     sha256 == null ? "" : sha256.toLowerCase(Locale.ROOT), length, relatedRows,
                     mode, baseRow, baseSha1 == null ? null : baseSha1.toLowerCase(Locale.ROOT),
-                    diskLength, posterPath, videoRow));
+                    diskLength, posterPath, videoRow, reconcilePath, previewLength));
         }
-        return new Request(jobId, target.toLowerCase(Locale.ROOT), items, tempFiles);
+        return new Request(jobId, target.toLowerCase(Locale.ROOT), items, tempFiles, dryRun);
+    }
+
+    /**
+     * 请求根上的 dryRun：缺省（或显式 null）为 false，只接受 JSON 布尔；其它类型整单拒绝。
+     *
+     * <p>抽成 static 纯函数是为了能在 JVM 单测里直接钉住三条分支 —— 这个值决定“要不要真的
+     * 搬文件”，解析错了就是把一次演练变成一次不可撤销的迁移。
+     */
+    static boolean parseDryRun(Object raw) throws IOException {
+        if (raw == null) return false;
+        if (raw instanceof Boolean) return ((Boolean) raw).booleanValue();
+        throw new IOException("invalid_dry_run");
+    }
+
+    /** 请求条目模式白名单：老模式逐条保留，本波新增两个原地迁移模式与重复行收拾模式。 */
+    static boolean isSupportedItemMode(String mode) {
+        return "restore".equals(mode) || "unslim".equals(mode) || "legacy_copies".equals(mode)
+                || "stale_rows".equals(mode) || "broken_payload".equals(mode)
+                || "orphan_rows".equals(mode) || "purge_items".equals(mode)
+                || "poster_rewire".equals(mode) || "migrate_inplace".equals(mode)
+                || "repair_state".equals(mode) || "reconcile_inplace".equals(mode);
+    }
+
+    /** 本波新增的两个模式：都不带 sha256/length，也都需要先按 row/sha1 找记录或相册行。 */
+    static boolean isMigrationMode(String mode) {
+        return "migrate_inplace".equals(mode) || "repair_state".equals(mode);
+    }
+
+    /**
+     * 新模式的条目形状校验：{@code row} 与 {@code sha1} 必须给出。
+     *
+     * <p>返回值直接当 {@code IOException} 的消息用，因此它会成为结果根上的 {@code reason}；
+     * 老模式不走这里，缺 row/sha1 仍然按 JSONException 的原有路径失败（行为不变）。
+     */
+    static String newModeItemInvalidReason(String mode, boolean hasRow, boolean hasSha1) {
+        if (!isMigrationMode(mode)) return "";
+        if (!hasRow) return "missing_item_row";
+        if (!hasSha1) return "missing_item_sha1";
+        return "";
     }
 
     private static void addRemainingTemp(List<ItemResult> results, List<String> tempFiles,
@@ -2335,7 +3029,11 @@ public final class MetadataRestoreJob {
 
     private static boolean hasFailures(List<ItemResult> results) {
         for (ItemResult result : results) {
-            if (!"success".equals(result.status)) return true;
+            // 本波两个模式的“跳过”与 dryRun 的“计划”都不是失败：一次演练跑完 3000 项
+            // 不该把整单报成 partial；真正的失败仍是 failed/partial。
+            boolean tolerated = result.mode != null
+                    && ("skipped".equals(result.status) || "planned".equals(result.status));
+            if (!"success".equals(result.status) && !tolerated) return true;
         }
         return false;
     }
@@ -2360,11 +3058,36 @@ public final class MetadataRestoreJob {
             int repairedCopies = 0;
             int repairedRows = 0;
             int cleanedDuplicates = 0;
+            int migrated = 0;
+            int planned = 0;
+            int migrationSkipped = 0;
+            int migrationFailed = 0;
+            boolean countedMigration = false;
+            Map<String, Integer> reasonCounts = new LinkedHashMap<>();
             for (ItemResult result : results) {
                 JSONObject item = new JSONObject();
                 item.put("row", result.row);
                 item.put("status", result.status);
                 if (!result.reason.isEmpty()) item.put("reason", result.reason);
+                // 只有 reconcile_inplace 成功时会写（rebound=true/false）；老请求的结果 JSON 不变。
+                if (!result.message.isEmpty()) item.put("message", result.message);
+                if (result.mode != null) {
+                    // 只有本波两个模式才写这些键：老请求的结果 JSON 保持逐字不变。
+                    countedMigration = true;
+                    item.put("mode", result.mode);
+                    if (result.action != null && !result.action.isEmpty()) {
+                        item.put("action", result.action);
+                    }
+                    if (result.bytes > 0L) item.put("bytes", result.bytes);
+                    if (result.migrated) migrated++;
+                    if (result.planned) planned++;
+                    if ("skipped".equals(result.status)) migrationSkipped++;
+                    if ("failed".equals(result.status)) migrationFailed++;
+                    if (!result.reason.isEmpty()) {
+                        Integer previous = reasonCounts.get(result.reason);
+                        reasonCounts.put(result.reason, previous == null ? 1 : previous + 1);
+                    }
+                }
                 if (result.repairedCopies > 0) {
                     item.put("repairedCopies", result.repairedCopies);
                 }
@@ -2381,6 +3104,21 @@ public final class MetadataRestoreJob {
             if (repairedCopies > 0) root.put("repairedCopies", repairedCopies);
             if (repairedRows > 0) root.put("repairedRows", repairedRows);
             if (cleanedDuplicates > 0) root.put("cleanedDuplicates", cleanedDuplicates);
+            if (countedMigration) {
+                // 迁移相关的四个计数只在请求里真的出现新模式时写：老请求的结果根保持原样。
+                // dryRun 下 migrated 恒为 0、planned 才是“本会迁移”的项数。
+                root.put("migrated", migrated);
+                root.put("skipped", migrationSkipped);
+                root.put("failed", migrationFailed);
+                if (planned > 0) root.put("planned", planned);
+                if (!reasonCounts.isEmpty()) {
+                    JSONObject reasons = new JSONObject();
+                    for (Map.Entry<String, Integer> entry : reasonCounts.entrySet()) {
+                        reasons.put(entry.getKey(), entry.getValue().intValue());
+                    }
+                    root.put("reasons", reasons);
+                }
+            }
             File temporary = new File(resultFile.getParentFile(), resultFile.getName() + ".tmp");
             try (FileOutputStream output = new FileOutputStream(temporary, false)) {
                 output.write(root.toString().getBytes(StandardCharsets.UTF_8));
@@ -2415,12 +3153,16 @@ public final class MetadataRestoreJob {
         final String target;
         final List<RequestItem> items;
         final List<String> tempFiles;
+        /** 请求根上的 dryRun：只对 migrate_inplace 有意义，缺省 false。 */
+        final boolean dryRun;
 
-        Request(String jobId, String target, List<RequestItem> items, List<String> tempFiles) {
+        Request(String jobId, String target, List<RequestItem> items, List<String> tempFiles,
+                boolean dryRun) {
             this.jobId = jobId;
             this.target = target;
             this.items = items;
             this.tempFiles = tempFiles;
+            this.dryRun = dryRun;
         }
     }
 
@@ -2439,6 +3181,10 @@ public final class MetadataRestoreJob {
         final String posterPath;
         /** poster_rewire 的视频行 _id；其它模式为 null。 */
         final String videoRow;
+        /** reconcile_inplace 的照片绝对路径；其它模式为 null。 */
+        final String path;
+        /** reconcile_inplace 的预览真实字节数（可选提示）；未提供时为 0。 */
+        final long previewLength;
 
         RequestItem(String row, String sha1, String sha256, long length, List<Long> relatedRows,
                 String mode, String baseRow, String baseSha1) {
@@ -2454,6 +3200,13 @@ public final class MetadataRestoreJob {
         RequestItem(String row, String sha1, String sha256, long length, List<Long> relatedRows,
                 String mode, String baseRow, String baseSha1, long diskLength, String posterPath,
                 String videoRow) {
+            this(row, sha1, sha256, length, relatedRows, mode, baseRow, baseSha1, diskLength,
+                    posterPath, videoRow, null, 0L);
+        }
+
+        RequestItem(String row, String sha1, String sha256, long length, List<Long> relatedRows,
+                String mode, String baseRow, String baseSha1, long diskLength, String posterPath,
+                String videoRow, String path, long previewLength) {
             this.row = row;
             this.sha1 = sha1;
             this.sha256 = sha256;
@@ -2465,6 +3218,8 @@ public final class MetadataRestoreJob {
             this.diskLength = diskLength;
             this.posterPath = posterPath;
             this.videoRow = videoRow;
+            this.path = path;
+            this.previewLength = previewLength;
         }
     }
 
@@ -2495,6 +3250,18 @@ public final class MetadataRestoreJob {
         final int repairedCopies;
         final int repairedRows;
         final int cleanedDuplicates;
+        /** 本波两个新模式的名字；老模式为 null，结果 JSON 形状因此逐字不变。 */
+        final String mode;
+        /** 迁移动作名（rename/transcode/sidecar/skip）；非迁移模式为 null。 */
+        final String action;
+        /** 本次迁移搬动的字节数；未知为 0。 */
+        final long bytes;
+        /** 这一项真的把文件搬回原路径了（累计 migrated 用）。 */
+        final boolean migrated;
+        /** dryRun 下“本会迁移”的项（累计 planned 用）。 */
+        final boolean planned;
+        /** 只给 reconcile_inplace 用的附加说明（如 {@code rebound=false}）；其余模式为空串。 */
+        final String message;
 
         ItemResult(String row, String status, String reason) {
             this(row, status, reason, 0, 0);
@@ -2506,12 +3273,32 @@ public final class MetadataRestoreJob {
 
         ItemResult(String row, String status, String reason, int repairedCopies, int repairedRows,
                 int cleanedDuplicates) {
+            this(row, status, reason, repairedCopies, repairedRows, cleanedDuplicates,
+                    null, null, 0L, false, false);
+        }
+
+        ItemResult(String row, String status, String reason, int repairedCopies, int repairedRows,
+                int cleanedDuplicates, String mode, String action, long bytes, boolean migrated,
+                boolean planned) {
+            this(row, status, reason, repairedCopies, repairedRows, cleanedDuplicates, mode,
+                    action, bytes, migrated, planned, "");
+        }
+
+        ItemResult(String row, String status, String reason, int repairedCopies, int repairedRows,
+                int cleanedDuplicates, String mode, String action, long bytes, boolean migrated,
+                boolean planned, String message) {
             this.row = row;
             this.status = status;
             this.reason = reason == null ? "" : reason;
             this.repairedCopies = repairedCopies;
             this.repairedRows = repairedRows;
             this.cleanedDuplicates = cleanedDuplicates;
+            this.mode = mode;
+            this.action = action;
+            this.bytes = bytes;
+            this.migrated = migrated;
+            this.planned = planned;
+            this.message = message == null ? "" : message;
         }
     }
 
@@ -2520,13 +3307,22 @@ public final class MetadataRestoreJob {
         final boolean localFileWasNull;
         final String sha1;
         final Map<String, Long> dates;
+        /** 预览侧车路径；没有侧车时为 null。 */
+        final String thumbnailFile;
+        /** 远端 serverId；纯本地行（含 reconcile 的幽灵行）为 null。 */
+        final String serverId;
+        /** 行登记的字节数。 */
+        final long size;
 
-        CloudRow(String sha1, String localFile, boolean localFileWasNull,
-                Map<String, Long> dates) {
+        CloudRow(String sha1, String localFile, boolean localFileWasNull, Map<String, Long> dates,
+                String thumbnailFile, String serverId, long size) {
             this.sha1 = sha1;
             this.localFile = localFile;
             this.localFileWasNull = localFileWasNull;
             this.dates = dates;
+            this.thumbnailFile = thumbnailFile;
+            this.serverId = serverId;
+            this.size = size;
         }
     }
 
@@ -3181,6 +3977,310 @@ public final class MetadataRestoreJob {
             // 因此不再要求"封面文件在/视频行可见/封面位为空"：真机上被优化过的视频行会被
             // CloudProvider 按 localFile 为空过滤掉，拿它当硬门槛会让整批永远搬不动。
             return "";
+        }
+    }
+
+    /**
+     * 迁移判定要用到的全部事实。字段全部可变是为了让调用方"边读盘边填"，但
+     * {@link Migration} 只看得到这份快照，因此判定本身是纯函数、可以在 JVM 单测里钉住。
+     */
+    static final class MigrationFacts {
+        boolean rowExists;
+        String localFile;
+        String thumbnailFile;
+        String fileName;
+        long rowSize;
+        boolean previewExists;
+        long previewLength;
+        String previewFormat;
+        boolean targetExists;
+        long targetLength;
+        String targetSha256;
+        String originalSha256;
+    }
+
+    static final class MigrationDecision {
+        final String reason;
+        final InplaceSlimPolicy.MigrationAction action;
+        /** 目标上已经是完整原图：只修数据库与状态，不搬文件。 */
+        final boolean repairOnly;
+
+        private MigrationDecision(String reason, InplaceSlimPolicy.MigrationAction action,
+                boolean repairOnly) {
+            this.reason = reason == null ? "" : reason;
+            this.action = action;
+            this.repairOnly = repairOnly;
+        }
+
+        static MigrationDecision reject(String reason, InplaceSlimPolicy.MigrationAction action) {
+            return new MigrationDecision(reason, action, false);
+        }
+
+        static MigrationDecision proceed(InplaceSlimPolicy.MigrationAction action,
+                boolean repairOnly) {
+            return new MigrationDecision("", action, repairOnly);
+        }
+    }
+
+    /**
+     * migrate_inplace 的纯逻辑：行形状、相册目录还原、目标路径、动作映射与拒绝理由。
+     *
+     * <p>这里不碰 Android、不碰磁盘，{@code dryRun} 与真跑走的是同一条判定，所以演练看到的
+     * reason 就是真跑会得到的 reason。
+     */
+    static final class Migration {
+        /** 这些理由只表示"这一项不迁移"，不是失败；其余理由都算失败。 */
+        private static final Set<String> SKIP_REASONS = new HashSet<>(Arrays.asList(
+                "migrate_not_sidecar", "migrate_transcode_deferred", "migrate_sidecar_kept",
+                "migrate_skipped"));
+
+        private Migration() {
+        }
+
+        /** 是不是老侧车形态：本地文件为空，且缩略图落在 {@code <相册>/.gallerysync-slim/} 下。 */
+        static boolean isSidecarRow(String localFile, String thumbnailFile) {
+            return isBlank(localFile) && slimAlbumDirectory(thumbnailFile) != null;
+        }
+
+        /**
+         * 由缩略图路径还原相册目录：{@code <相册>/.gallerysync-slim/<随机名>.<ext>} → {@code <相册>}。
+         * 路径里没有这一段（或这段就在根上）一律回 null，调用方据此判 migrate_not_sidecar。
+         */
+        static String slimAlbumDirectory(String thumbnailFile) {
+            if (isBlank(thumbnailFile)) return null;
+            String normalized = thumbnailFile.trim().replace('\\', '/');
+            int index = normalized.lastIndexOf("/" + SLIM_DIRECTORY_NAME + "/");
+            if (index <= 0) return null;
+            return normalized.substring(0, index);
+        }
+
+        /**
+         * 迁移目标 = 相册目录 + 行上的 fileName。
+         *
+         * <p>fileName 只接受纯文件名：带分隔符或 {@code ..} 的名字可能把目标指到相册外面，
+         * 直接回 null（判定层给 migrate_name_missing 之前先由这里兜底）。
+         */
+        static String migrationTargetPath(String thumbnailFile, String fileName) {
+            String album = slimAlbumDirectory(thumbnailFile);
+            if (album == null || isBlank(fileName)) return null;
+            String name = fileName.trim();
+            if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || "..".equals(name)
+                    || ".".equals(name)) return null;
+            return album + "/" + name;
+        }
+
+        /** 预览的实际编码格式：取扩展名小写；认不出来回 null（交给策略按文件名判断）。 */
+        static String previewFormatOf(String previewPath) {
+            if (isBlank(previewPath)) return null;
+            String name = previewPath.trim().replace('\\', '/');
+            int slash = name.lastIndexOf('/');
+            if (slash >= 0) name = name.substring(slash + 1);
+            int dot = name.lastIndexOf('.');
+            if (dot <= 0 || dot == name.length() - 1) return null;
+            return name.substring(dot + 1).toLowerCase(Locale.ROOT);
+        }
+
+        /** 只看行、不看磁盘的拒绝理由：行不存在 / 不是侧车形态 / 没有原名。 */
+        static String rowOnlyReason(MigrationFacts facts) {
+            if (facts == null || !facts.rowExists) return "migrate_row_missing";
+            if (!isSidecarRow(facts.localFile, facts.thumbnailFile)) return "migrate_not_sidecar";
+            if (isBlank(facts.fileName)) return "migrate_name_missing";
+            return "";
+        }
+
+        /**
+         * 迁移结论。返回空 reason 表示可以搬，{@code repairOnly} 表示目标已是原图只修 DB。
+         *
+         * <p>顺序：先判"值不值得动"（{@link InplaceSlimPolicy#migrationAction} 的 SKIP），
+         * 再按动作分流；RENAME 时还要回答"目标被占了吗"，只有"占着的就是原图"才放行。
+         */
+        static MigrationDecision decision(MigrationFacts facts) {
+            String rowReason = rowOnlyReason(facts);
+            if (!rowReason.isEmpty()) {
+                return MigrationDecision.reject(rowReason, null);
+            }
+            // rowSize 未知（0）时无法证明"预览更小"，按策略的保守分支走 SKIP，绝不在没有
+            // 长度证据的情况下把预览搬到原路径上。
+            boolean previewSmaller = facts.rowSize > 0L && facts.previewLength < facts.rowSize;
+            InplaceSlimPolicy.MigrationAction action = InplaceSlimPolicy.migrationAction(
+                    facts.fileName, facts.thumbnailFile, facts.previewFormat,
+                    facts.previewExists, previewSmaller);
+            switch (action) {
+                case RENAME:
+                    if (!facts.targetExists) {
+                        return MigrationDecision.proceed(action, false);
+                    }
+                    // 目标已存在：只有当它就是登记过的完整原图（长度等于行 size、摘要等于
+                    // 注册表原文摘要）时才继续 —— 这时路径上的字节本来就是对的，只需修 DB。
+                    if (facts.targetLength == facts.rowSize && facts.rowSize > 0L
+                            && !isBlank(facts.originalSha256) && facts.targetSha256 != null
+                            && facts.targetSha256.equalsIgnoreCase(facts.originalSha256)) {
+                        return MigrationDecision.proceed(action, true);
+                    }
+                    return MigrationDecision.reject("migrate_target_exists", action);
+                case TRANSCODE:
+                    // 本波只做同扩展名的原地搬移；转码要重编码，留到下一波。
+                    return MigrationDecision.reject("migrate_transcode_deferred", action);
+                case SIDECAR:
+                    return MigrationDecision.reject("migrate_sidecar_kept", action);
+                case SKIP:
+                default:
+                    return MigrationDecision.reject("migrate_skipped", action);
+            }
+        }
+
+        static boolean isSkipReason(String reason) {
+            return reason != null && SKIP_REASONS.contains(reason);
+        }
+    }
+
+    static final class MigrationRow {
+        final String rowId, localFile, thumbnailFile, fileName, sha1, serverType;
+        final long size;
+
+        MigrationRow(String rowId, String localFile, String thumbnailFile, String fileName,
+                String sha1, long size, String serverType) {
+            this.rowId = rowId;
+            this.localFile = localFile;
+            this.thumbnailFile = thumbnailFile;
+            this.fileName = fileName;
+            this.sha1 = sha1;
+            this.size = size;
+            this.serverType = serverType;
+        }
+    }
+
+    /** reconcile_inplace 要看的同路径行：keeper 的身份、登记尺寸与两个“不是远端行”的标记。 */
+    static final class ReconcileRow {
+        final String rowId;
+        final String localFile;
+        final String thumbnailFile;
+        final String sha1;
+        final String serverId;
+        final long size;
+
+        ReconcileRow(String rowId, String localFile, String thumbnailFile, String sha1,
+                String serverId, long size) {
+            this.rowId = rowId;
+            this.localFile = localFile;
+            this.thumbnailFile = thumbnailFile;
+            this.sha1 = sha1;
+            this.serverId = serverId;
+            this.size = size;
+        }
+    }
+
+    /** reconcile_inplace 判定要用到的事实：幽灵行形状、磁盘真实长度、同路径 keeper 行。 */
+    static final class ReconcileFacts {
+        boolean rowExists;
+        String localFile;
+        boolean localFileMatches;
+        boolean thumbnailEmpty;
+        boolean serverIdEmpty;
+        /** 磁盘上的真实字节数。 */
+        long fileLength;
+        /** 幽灵行登记的 size（旧原图大小）。 */
+        long rowSize;
+        int keeperCount;
+        String keeperRowId;
+        String keeperSha1;
+        long keeperSize;
+        boolean keeperSizeMatches;
+        boolean keeperServerIdEmpty;
+        boolean keeperThumbnailEmpty;
+    }
+
+    /**
+     * reconcile_inplace 的纯逻辑：返回空串才允许删幽灵行，返回的字符串就是结果里的 reason。
+     *
+     * <p>顺序按“证据强度”排：行都不在就没得删；行形状不对说明它根本不是迁移后留下的那一行；
+     * 行 size 与磁盘一致说明它记的就是现在这份文件（不能删）；最后才要求同路径上有唯一的
+     * keeper 行接住这份文件。
+     */
+    static final class Reconcile {
+        private Reconcile() {
+        }
+
+        static String decision(ReconcileFacts facts) {
+            if (facts == null || !facts.rowExists) return "reconcile_row_missing";
+            if (!facts.localFileMatches || !facts.thumbnailEmpty || !facts.serverIdEmpty) {
+                return "reconcile_row_not_ghost";
+            }
+            if (facts.fileLength == facts.rowSize) return "reconcile_size_matches";
+            if (facts.keeperCount <= 0) return "reconcile_keeper_missing";
+            if (facts.keeperCount > 1) return "reconcile_keeper_ambiguous";
+            if (!facts.keeperSizeMatches || !facts.keeperServerIdEmpty
+                    || !facts.keeperThumbnailEmpty) {
+                return "reconcile_keeper_missing";
+            }
+            return "";
+        }
+    }
+
+    /** repair_state 判定要用到的事实：注册表状态 + 磁盘上那份文件的长度与摘要。 */
+    static final class RepairFacts {
+        boolean recordExists;
+        boolean alreadyOriginal;
+        boolean targetPresent;
+        long targetLength;
+        String targetSha256;
+        long originalLength;
+        String originalSha256;
+        long previewLength;
+        String previewSha256;
+    }
+
+    static final class RepairDecision {
+        final String reason;
+        final String action;
+
+        private RepairDecision(String reason, String action) {
+            this.reason = reason == null ? "" : reason;
+            this.action = action;
+        }
+
+        static RepairDecision reason(String reason) {
+            return new RepairDecision(reason, null);
+        }
+
+        static RepairDecision action(String action) {
+            return new RepairDecision("", action);
+        }
+    }
+
+    /**
+     * repair_state 的纯逻辑：判定顺序就是"先信状态、再信字节、最后才走网络"。
+     *
+     * <p>每一步都比上一步贵：状态是本地字符串，字节要多算一次摘要，远端回填要下载整个原图。
+     */
+    static final class RepairState {
+        static final String ACTION_RESTORE_LOCAL = "restore_local";
+        static final String ACTION_CONFIRM_PREVIEW = "confirm_preview";
+        static final String ACTION_RESTORE_REMOTE = "restore_remote";
+
+        private RepairState() {
+        }
+
+        static RepairDecision decision(RepairFacts facts) {
+            if (facts == null || !facts.recordExists) return RepairDecision.reason("no_registry_record");
+            // 状态已经是 ORIGINAL：没有可修的东西，重复执行必须幂等。
+            if (facts.alreadyOriginal) return RepairDecision.reason("repair_already_original");
+            // 目标不存在：不能凭空判定，保留状态等下载；这里不动注册表。
+            if (!facts.targetPresent) return RepairDecision.reason("repair_missing");
+            // 字节证明是原图：长度对上、登记摘要为空或摘要一致 → 只把状态回落 ORIGINAL。
+            if (facts.originalLength > 0L && facts.targetLength == facts.originalLength
+                    && (isBlank(facts.originalSha256) || (facts.targetSha256 != null
+                    && facts.targetSha256.equalsIgnoreCase(facts.originalSha256)))) {
+                return RepairDecision.action(ACTION_RESTORE_LOCAL);
+            }
+            // 字节证明是预览：长度与摘要都对上登记的预览 → 记成原地预览。
+            if (facts.previewLength > 0L && facts.targetLength == facts.previewLength
+                    && !isBlank(facts.previewSha256) && facts.targetSha256 != null
+                    && facts.targetSha256.equalsIgnoreCase(facts.previewSha256)) {
+                return RepairDecision.action(ACTION_CONFIRM_PREVIEW);
+            }
+            // 两种都不认识：只能重新从远端取原图。
+            return RepairDecision.action(ACTION_RESTORE_REMOTE);
         }
     }
 

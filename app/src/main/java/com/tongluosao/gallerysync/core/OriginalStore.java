@@ -19,6 +19,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -59,6 +60,8 @@ public final class OriginalStore {
     private final LinkedHashMap<String, Record> mRecords = new LinkedHashMap<>();
     /** A corrupt registry disables uploads until it can be inspected or repaired. */
     private boolean mHealthy = true;
+    private int mBatchDepth;
+    private boolean mBatchDirty;
 
     private OriginalStore(Context context) {
         File dir = new File(context.getApplicationContext().getFilesDir(), DIR);
@@ -100,7 +103,83 @@ public final class OriginalStore {
                 + safe(config.getRemoteRoot())).getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Immutable metadata returned to hook code. */
+    /**
+     * 归属路径上这份文件当前装的是什么。
+     *
+     * <p>引入它是因为“空间优化”从“隐藏目录侧车预览”改成了“原地同名同扩展名覆盖”：
+     * 同一个路径在不同阶段可能是完整原图、也可能是已经被替换掉的预览，光看路径分不出来，
+     * 只能把状态显式记进注册表，让上传/恢复两侧都能按状态做判定。
+     *
+     * <p>JSON 里用 {@link #wire()} 的小写下划线写法；旧版本 JSON 没有这个键，读出来按
+     * {@link #ORIGINAL}（当时只有“本地即原图”这一种可能）。
+     */
+    public enum LocalState {
+        /** 本地就是远端完整原图：老数据的缺省值，也是唯一能靠长度/摘要判定上传的状态。 */
+        ORIGINAL("original"),
+        /** 原地模式：原路径上现在是预览，完整原图只在远端。 */
+        INPLACE_PREVIEW("inplace_preview"),
+        /** 原地覆盖写到一半（进程死在发布之前）：下一步是重做覆盖，绝不能当原图上传。 */
+        PENDING_INPLACE("pending_inplace"),
+        /** 老模式：预览放在 {@code <相册>/.gallerysync-slim/} 侧车目录，等待迁移成原地覆盖。 */
+        SIDECAR_PREVIEW("sidecar_preview"),
+        /** 本地字节对不上任何已知副本：不许上传，等人工确认。 */
+        DAMAGED("damaged");
+
+        private final String mWire;
+
+        LocalState(String wire) {
+            mWire = wire;
+        }
+
+        /** JSON / 日志里的写法：小写下划线，跨版本稳定。 */
+        public String wire() {
+            return mWire;
+        }
+
+        /**
+         * 解析 JSON 里的状态。缺失、空串、{@code "null"}、认不出来的值一律回落到
+         * {@link #ORIGINAL}：旧 JSON 没有这个键，少读一个键不能变成“这份文件不可用”，
+         * 更不能抛异常把整张注册表打成不健康。
+         */
+        public static LocalState fromWire(String raw) {
+            String value = normalizeWire(raw);
+            if (value != null) {
+                for (LocalState state : values()) {
+                    if (state.mWire.equals(value)) {
+                        return state;
+                    }
+                }
+            }
+            return ORIGINAL;
+        }
+
+        private static String normalizeWire(String raw) {
+            if (raw == null) {
+                return null;
+            }
+            String value = raw.trim().toLowerCase(Locale.US).replace('-', '_');
+            if (value.isEmpty() || "null".equals(value)) {
+                return null;
+            }
+            return value;
+        }
+    }
+
+    /**
+     * Immutable metadata returned to hook code.
+     *
+     * <p>语义约定（2026-11 起，原地覆盖模式）：
+     * <ul>
+     *   <li>{@link #originalLength} / {@link #sha256} 永远是<b>远端完整原图</b>的真相，
+     *       不管归属路径上现在装的是什么；</li>
+     *   <li>{@link #originalLocalPath} 降级为“归属路径”：它只说明这个相册项属于哪个本地文件，
+     *       文件内容可能是原图、也可能是原地预览，由 {@link #localState} 决定；</li>
+     *   <li>{@link #previewLocalPath} 在原地模式下恒为 null（预览就写在归属路径上），
+     *       只有老侧车模式才有值；</li>
+     *   <li>{@link #previewLength} / {@link #previewSha256} / {@link #previewFormat} 描述
+     *       “写在归属路径上的那份预览”，旧数据全为 0 / null。</li>
+     * </ul>
+     */
     public static final class Record {
         public final String target;
         public final String remotePath;
@@ -114,10 +193,22 @@ public final class OriginalStore {
         public final Set<String> derivedPaths;
         /** SHA-256 and byte length of generated copies, catching copied/renamed previews too. */
         public final Map<String, Long> derivedHashes;
+        /** 归属路径上这份文件装的是什么；永远非 null，旧数据为 {@link LocalState#ORIGINAL}。 */
+        public final LocalState localState;
+        /** 原地预览的字节数；没有预览（含旧数据）时为 0。 */
+        public final long previewLength;
+        /** 原地预览的 SHA-256；未知时为 null。 */
+        public final String previewSha256;
+        /** 原地预览的编码格式（如 {@code heic} / {@code jpg}）；未知时为 null。 */
+        public final String previewFormat;
         private final Set<String> identities;
         private final Set<String> localAliases;
 
-        private Record(String target, String remotePath, long originalLength, String sha256,
+        /**
+         * 包级可见：单测要能直接构造一条记录来验证 {@link #withLocalState} / {@link #withPreview}
+         * 只动自己那几个字段。生产代码一律经由 {@link #load()} 或注册入口构造。
+         */
+        Record(String target, String remotePath, long originalLength, String sha256,
                 String originalLocalPath, String previewLocalPath, String rowId, String sha1,
                 long originalLocalMtime, Set<String> derivedPaths) {
             this(target, remotePath, originalLength, sha256, originalLocalPath, previewLocalPath,
@@ -130,6 +221,16 @@ public final class OriginalStore {
                 String originalLocalPath, String previewLocalPath, String rowId, String sha1,
                 long originalLocalMtime, Set<String> derivedPaths, Set<String> identities,
                 Set<String> localAliases, Map<String, Long> derivedHashes) {
+            this(target, remotePath, originalLength, sha256, originalLocalPath, previewLocalPath,
+                    rowId, sha1, originalLocalMtime, derivedPaths, identities, localAliases,
+                    derivedHashes, LocalState.ORIGINAL, 0L, null, null);
+        }
+
+        private Record(String target, String remotePath, long originalLength, String sha256,
+                String originalLocalPath, String previewLocalPath, String rowId, String sha1,
+                long originalLocalMtime, Set<String> derivedPaths, Set<String> identities,
+                Set<String> localAliases, Map<String, Long> derivedHashes, LocalState localState,
+                long previewLength, String previewSha256, String previewFormat) {
             this.target = target;
             this.remotePath = remotePath;
             this.originalLength = originalLength;
@@ -151,6 +252,10 @@ public final class OriginalStore {
             allAliases.addAll(paths);
             this.localAliases = Collections.unmodifiableSet(allAliases);
             this.derivedHashes = Collections.unmodifiableMap(new LinkedHashMap<>(derivedHashes));
+            this.localState = localState == null ? LocalState.ORIGINAL : localState;
+            this.previewLength = Math.max(0L, previewLength);
+            this.previewSha256 = clean(previewSha256);
+            this.previewFormat = clean(previewFormat);
         }
 
         private static Set<String> initialIdentities(String rowId, String sha1) {
@@ -181,7 +286,8 @@ public final class OriginalStore {
             return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
                     previewLocalPath, rowId == null ? clean(nextRowId) : rowId,
                     sha1 == null ? clean(nextSha1) : sha1, originalLocalMtime,
-                    derivedPaths, aliases, localAliases, derivedHashes);
+                    derivedPaths, aliases, localAliases, derivedHashes, localState,
+                    previewLength, previewSha256, previewFormat);
         }
 
         private Record withRenamedDerivedAlias(String path, String nextRowId, String nextSha1) {
@@ -193,7 +299,19 @@ public final class OriginalStore {
             addIdentity(allIdentities, nextRowId, nextSha1);
             return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
                     previewLocalPath, rowId, sha1, originalLocalMtime, paths, allIdentities,
-                    aliases, derivedHashes);
+                    aliases, derivedHashes, localState, previewLength, previewSha256,
+                    previewFormat);
+        }
+
+        /**
+         * 把行身份整体换成另一个相册行（keeper）：{@code rowId/sha1} 覆盖成新值，旧 identity
+         * 一并丢弃 —— 被删掉的那条幽灵行不该再被 {@code find} 命中。其余字段原样保留。
+         */
+        private Record withReboundIdentity(String nextRowId, String nextSha1) {
+            return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
+                    previewLocalPath, clean(nextRowId), clean(nextSha1), originalLocalMtime,
+                    derivedPaths, Collections.emptySet(), localAliases, derivedHashes, localState,
+                    previewLength, previewSha256, previewFormat);
         }
 
         private Record withDerivedPath(String path) {
@@ -204,7 +322,8 @@ public final class OriginalStore {
             Map<String, Long> hashes = new LinkedHashMap<>(derivedHashes);
             return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
                     previewLocalPath, rowId, sha1, originalLocalMtime, paths,
-                    identities, aliases, hashes);
+                    identities, aliases, hashes, localState, previewLength, previewSha256,
+                    previewFormat);
         }
 
         private Record withDerivedHash(String hash, long length) {
@@ -212,7 +331,54 @@ public final class OriginalStore {
             hashes.put(hash, length);
             return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
                     previewLocalPath, rowId, sha1, originalLocalMtime, derivedPaths,
-                    identities, localAliases, hashes);
+                    identities, localAliases, hashes, localState, previewLength, previewSha256,
+                    previewFormat);
+        }
+
+        /**
+         * 派生出一条“本地状态是 {@code next}”的记录：只改状态，预览三个字段与其余字段原样保留。
+         * {@code null} 按 {@link LocalState#ORIGINAL} 处理（与反序列化同一套兜底）。
+         */
+        public Record withLocalState(LocalState next) {
+            return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
+                    previewLocalPath, rowId, sha1, originalLocalMtime, derivedPaths,
+                    identities, localAliases, derivedHashes,
+                    next == null ? LocalState.ORIGINAL : next, previewLength, previewSha256,
+                    previewFormat);
+        }
+
+        /**
+         * 派生出一条“原地预览就写在这个路径上”的记录：只改预览三个字段，状态与其余字段原样保留。
+         * 负长度按 0 处理，空串摘要/格式按 null 处理（与写入 JSON 时的兜底一致）。
+         */
+        public Record withPreview(long nextLength, String nextSha256, String nextFormat) {
+            return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
+                    previewLocalPath, rowId, sha1, originalLocalMtime, derivedPaths,
+                    identities, localAliases, derivedHashes, localState, nextLength,
+                    nextSha256, nextFormat);
+        }
+
+        /**
+         * 归属路径上装的是什么。构造期已经兜底，永远非 null；{@code hook/} 与后续波次
+         * 不在这个包里，只能通过访问器读，不能直接读字段。
+         */
+        public LocalState getLocalState() {
+            return localState;
+        }
+
+        /** 原地预览的字节数；没有预览（含旧数据）时为 0。 */
+        public long getPreviewLength() {
+            return previewLength;
+        }
+
+        /** 原地预览的 SHA-256；未知时为 null。 */
+        public String getPreviewSha256() {
+            return previewSha256;
+        }
+
+        /** 原地预览的编码格式（{@code heic} / {@code jpg} 等）；未知时为 null。 */
+        public String getPreviewFormat() {
+            return previewFormat;
         }
 
         private Record withRestoredLocal(File file) throws IOException {
@@ -222,6 +388,7 @@ public final class OriginalStore {
             Set<String> aliases = new LinkedHashSet<>(localAliases);
             aliases.add(path);
             String preview = path.equals(previewLocalPath) ? null : previewLocalPath;
+            // 恢复成功后本地又是完整原图：走默认构造，状态回落 ORIGINAL、预览字段清零
             return new Record(target, remotePath, originalLength, sha256, path, preview,
                     rowId, sha1, originalLocalMtime > 0L ? originalLocalMtime : file.lastModified(),
                     paths, identities, aliases, derivedHashes);
@@ -416,6 +583,40 @@ public final class OriginalStore {
     }
 
     /**
+     * 把登记着这张照片的记录改绑到一个“留下”的相册行上（reconcile_inplace 收尾用）。
+     *
+     * <p>原地迁移后扫描器为同一路径又插了一行，删掉旧行之后注册表里的 {@code rowId/sha1} 指向的
+     * 就是一条已经不存在的行；这里按归属路径（{@code originalLocalPath}）或派生副本路径
+     * （{@code derivedPaths}）命中记录，把行身份整体换成 keeper 行 —— 旧 identity 不保留，
+     * 否则 {@link #find(Config, String, String)} 还会命中那条被删掉的幽灵行。
+     *
+     * <p>注册表里没有这条记录不是错误：返回 false，调用方只把它记进日志。
+     */
+    public boolean bindRowForLocalPath(Config config, File path, String rowId, String sha1)
+            throws IOException {
+        String id = clean(rowId);
+        if (config == null || path == null || id == null) return false;
+        String hash = clean(sha1);
+        String local = canonical(path);
+        String target = targetKey(config);
+        synchronized (mLock) {
+            requireHealthyLocked();
+            for (Map.Entry<String, Record> entry : mRecords.entrySet()) {
+                Record record = entry.getValue();
+                if (!target.equals(record.target)) continue;
+                if (!local.equals(record.originalLocalPath) && !record.derivedPaths.contains(local)) {
+                    continue;
+                }
+                mRecords.put(entry.getKey(), record.withReboundIdentity(id,
+                        hash == null ? null : hash.toLowerCase(Locale.US)));
+                saveLocked();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Register a scanner-renamed file only when it still matches a known derived fingerprint.
      * The record key pins the operation to the captured target, remote path, and original digest.
      */
@@ -506,6 +707,60 @@ public final class OriginalStore {
             }
             return latest;
         }
+    }
+
+    /**
+     * 该 target 下每个已登记 identity 的本地状态快照，键就是记录里的 identity 串
+     * （{@code r:<rowId>} / {@code s:<sha1 小写>}）。
+     *
+     * <p>空间优化候选过滤要逐行判状态，而注册表上限 10 万条：每条候选都调一次
+     * {@link #find(Config, String, String)} 就是 O(候选 x 登记) 的全表扫描。这里一次建表，
+     * 之后逐行 O(1)。同一 identity 命中多条记录时非 ORIGINAL 的状态优先（更保守：
+     * 宁可跳过优化也不要拿预览再压一次）。
+     */
+    public Map<String, LocalState> localStateIndex(Config config) {
+        if (config == null) {
+            return Collections.emptyMap();
+        }
+        String target = targetKey(config);
+        Map<String, LocalState> index = new HashMap<>();
+        synchronized (mLock) {
+            for (Record record : mRecords.values()) {
+                if (!target.equals(record.target)) {
+                    continue;
+                }
+                LocalState state = record.getLocalState();
+                for (String identity : record.identities) {
+                    LocalState known = index.get(identity);
+                    if (known == null || known == LocalState.ORIGINAL) {
+                        index.put(identity, state);
+                    }
+                }
+            }
+        }
+        return index;
+    }
+
+    /**
+     * 在 {@link #localStateIndex(Config)} 的快照里查一行登记的状态：rowId 与 sha1 都试，
+     * 都没有记录时返回 null（调用方按“未登记”处理）。
+     */
+    public static LocalState stateForRow(Map<String, LocalState> index, String rowId, String sha1) {
+        if (index == null || index.isEmpty()) {
+            return null;
+        }
+        String id = clean(rowId);
+        if (id != null) {
+            LocalState byRow = index.get("r:" + id);
+            if (byRow != null) {
+                return byRow;
+            }
+        }
+        String hash = clean(sha1);
+        if (hash != null) {
+            return index.get("s:" + hash.toLowerCase(Locale.US));
+        }
+        return null;
     }
 
     /** Return true only when a registered original still exists remotely at its recorded length. */
@@ -793,6 +1048,132 @@ public final class OriginalStore {
         }
     }
 
+    /**
+     * 原地覆盖前的意图登记：状态切到 {@link LocalState#PENDING_INPLACE}，并记下将要写上去的预览。
+     *
+     * <p>调用方拿到非 null 之后才敢动原路径上的字节：进程若死在第 6 步（原子改名）之后，
+     * 磁盘上这份字节已经是预览，而注册表里也已经写着“它不是原图”，上传侧不会把它当原图传。
+     */
+    public Record markInplacePending(Config config, Record record, long previewLength,
+            String previewSha256, String previewFormat) {
+        return markLocal(config, record, LocalState.PENDING_INPLACE, true, false, previewLength,
+                previewSha256, previewFormat);
+    }
+
+    /**
+     * 原地覆盖成功：状态切成 {@link LocalState#INPLACE_PREVIEW}，并把原路径登记成派生位置、
+     * 把预览指纹写进 {@code derivedHashes}。
+     *
+     * <p>路径与指纹都指向“归属路径上现在这份字节”：上传分类、恢复菜单、下一次优化都靠它
+     * 判断这份文件已经不是原图；没有它，恢复流程会拒绝覆盖自己刚写下的预览。
+     */
+    public Record markInplaceCommitted(Config config, Record record, long previewLength,
+            String previewSha256, String previewFormat) {
+        return markLocal(config, record, LocalState.INPLACE_PREVIEW, true, true, previewLength,
+                previewSha256, previewFormat);
+    }
+
+    /**
+     * 下载链路的原地覆盖成功：语义与 {@link #markInplaceCommitted} <b>完全相同</b>
+     * （同一个 {@link #markLocal} 出口、同一个 {@code INPLACE_PREVIEW} 状态），只是多打一条
+     * {@code event=registry_download_inplace} 日志，便于把“下载下来的预览”与“瘦身留下的预览”
+     * 在设备日志里分开统计。
+     *
+     * <p>为什么不直接在 DownloadQueue 里调 {@code markInplaceCommitted} 再打日志：状态写入点只有
+     * 一个（避免两处 log 与写入顺序不一致），而 {@code markLocal} 找不到记录时静默返回 null，
+     * 调用方拿不到“到底有没有写进去”的事实；这里把这件事和 row 一起记进日志。
+     *
+     * <p>找不到记录、注册表不健康、写盘失败一律返回 null，**不抛**。
+     */
+    public Record markDownloadedInPlace(Config config, Record record, long previewLength,
+            String previewSha256, String previewFormat) {
+        Record updated = markInplaceCommitted(config, record, previewLength, previewSha256,
+                previewFormat);
+        if (updated == null) {
+            Logger.w("event=registry_download_inplace_skipped reason=record_not_found"
+                    + " remote=" + (record == null ? null : safe(record.remotePath)));
+            return null;
+        }
+        Logger.i("event=registry_download_inplace row=" + safe(updated.rowId)
+                + " bytes=" + previewLength + " format=" + safe(previewFormat)
+                + " path=" + safe(updated.originalLocalPath));
+        return updated;
+    }
+
+    /**
+     * 记录损坏：只切状态，原因进日志（不新增字段，JSON 契约不再扩）。
+     *
+     * <p>典型场景是原地覆盖后 DB 没切过来 —— 字节已是合法预览，记录不能再被当原图。
+     */
+    public Record markDamaged(Config config, Record record, String reason) {
+        Record updated = markLocal(config, record, LocalState.DAMAGED, false, false, 0L, null,
+                null);
+        if (updated != null) {
+            Logger.w("event=original_store_mark_damaged reason=" + safe(reason)
+                    + " path=" + safe(updated.originalLocalPath));
+        }
+        return updated;
+    }
+
+    /**
+     * 三个状态变更的唯一实现：找到记录 → 不可变派生 → 原子落盘。
+     *
+     * <p>找不到记录、注册表不健康、写盘失败一律回 {@code null}，**不抛**：调用方已经在
+     * “失败就放弃这次覆盖”的位置，让它再包一层 try/catch 只会把真正的失败原因埋掉。
+     */
+    private Record markLocal(Config config, Record expected, LocalState state,
+            boolean touchPreview, boolean derived, long previewLength, String previewSha256,
+            String previewFormat) {
+        if (config == null || expected == null) {
+            return null;
+        }
+        String target = targetKey(config);
+        try {
+            synchronized (mLock) {
+                if (!mHealthy) {
+                    return null;
+                }
+                Record latest = findForUpdateLocked(target, expected);
+                if (latest == null) {
+                    return null;
+                }
+                Record updated = latest.withLocalState(state);
+                if (touchPreview) {
+                    updated = updated.withPreview(previewLength, previewSha256, previewFormat);
+                }
+                String path = clean(latest.originalLocalPath);
+                String digest = clean(previewSha256);
+                // 路径在登记时就已规范化（构造与 load 都走 canonical），这里不再重复 IO
+                if (derived && path != null && digest != null && previewLength > 0L) {
+                    updated = updated.withDerivedPath(path)
+                            .withDerivedHash(digest.toLowerCase(Locale.US), previewLength);
+                }
+                mRecords.put(recordKey(updated), updated);
+                saveLocked();
+                return updated;
+            }
+        } catch (Throwable t) {
+            Logger.e("event=original_store_mark_failed state=" + state.wire(), t);
+            return null;
+        }
+    }
+
+    /** 优先按身份找；身份缺失（下载映射还没拿到相册行）时退回 target + 远端路径 + 摘要。 */
+    private Record findForUpdateLocked(String target, Record expected) {
+        Record byIdentity = findLocked(target, expected.rowId, expected.sha1);
+        if (byIdentity != null) {
+            return byIdentity;
+        }
+        Record matched = null;
+        for (Record record : mRecords.values()) {
+            if (target.equals(record.target) && record.remotePath.equals(expected.remotePath)
+                    && record.sha256.equals(expected.sha256)) {
+                matched = record;
+            }
+        }
+        return matched;
+    }
+
     /** Read lease held from upload classification until the PUT has finished reading this path. */
     public PathLease lockForUpload(File path) throws IOException {
         if (path == null) throw new IOException("upload path is missing");
@@ -827,6 +1208,13 @@ public final class OriginalStore {
     /**
      * Fail-closed upload classifier. It blocks reserved download mirrors, registered previews,
      * derived paths, and any original path whose bytes changed since the verified upload.
+     *
+     * <p>第 3 波起最前面多一道“本地状态”判据：这条路径登记的状态是原地预览 / 写入中途 /
+     * 侧车预览 / 损坏，或 {@code ORIGINAL} 但本地长度已经和登记的原图长度对不上时，直接按
+     * 受保护返回，不再走到后面的长度/摘要比较。查不到对应记录时保持原有逻辑不变。
+     *
+     * <p>用 {@code File.length()} 拿本地长度，不为判摘要整份哈希：四个调用点（上传队列三处 +
+     * 原生上传出口一处）都只经过这一个函数，改这里就够了。
      */
     public boolean isProtectedUpload(File candidate, String rowId, String sha1) {
         if (candidate == null) {
@@ -843,6 +1231,9 @@ public final class OriginalStore {
         }
         synchronized (mLock) {
             if (!mHealthy) {
+                return true;
+            }
+            if (blockingPreviewStateLocked(path, candidate) != null) {
                 return true;
             }
             for (Record record : mRecords.values()) {
@@ -883,6 +1274,56 @@ public final class OriginalStore {
             }
         }
         return false;
+    }
+
+    /**
+     * 上传被“本地状态”拦下的原因：该路径登记的状态，且只有
+     * {@link PreviewStateRules#blocksUpload} 判真时才返回非 null。
+     *
+     * <p>只读状态与本地长度，不哈希、不读文件内容；没有对应记录、注册表不健康或状态层面
+     * 不拦时返回 null。判定入口仍然是 {@link #isProtectedUpload}，这里只给上传队列记
+     * {@code event=upload_skip_preview_state} 用。
+     */
+    public LocalState blockingUploadState(File candidate) {
+        if (candidate == null) {
+            return null;
+        }
+        String path;
+        try {
+            path = canonical(candidate);
+        } catch (IOException e) {
+            return null;
+        }
+        synchronized (mLock) {
+            return mHealthy ? blockingPreviewStateLocked(path, candidate) : null;
+        }
+    }
+
+    /**
+     * 按路径找到那条登记记录，再用 {@link PreviewStateRules#blocksUpload} 判一次。
+     * 调用方必须已经持有 {@link #mLock} 并确认注册表健康。
+     */
+    private LocalState blockingPreviewStateLocked(String canonicalPath, File candidate) {
+        Record record = recordForLocalPathLocked(canonicalPath);
+        if (record == null) {
+            return null;
+        }
+        long localLength = candidate.isFile() ? candidate.length() : 0L;
+        return PreviewStateRules.blocksUpload(record.getLocalState(), localLength,
+                record.originalLength) ? record.getLocalState() : null;
+    }
+
+    /**
+     * 这条本地路径属于哪条登记记录：原路径、预览路径、派生副本与重命名别名都算。
+     * 调用方必须已经持有 {@link #mLock}。
+     */
+    private Record recordForLocalPathLocked(String canonicalPath) {
+        for (Record record : mRecords.values()) {
+            if (containsLocalPath(record, canonicalPath)) {
+                return record;
+            }
+        }
+        return null;
     }
 
     /**
@@ -951,6 +1392,10 @@ public final class OriginalStore {
 
     /**
      * “下载原图”菜单判据（纯逻辑，单测直接覆盖）：本地这份文件是否还需要从 WebDAV 取回原图。
+     *
+     * <p>第 3 波起读侧（上传拦截 / 恢复菜单 / 候选筛选）统一改用
+     * {@link PreviewStateRules}，按注册表登记的 {@link LocalState} 判；本函数保留下来只为
+     * 兼容旧调用与既有单测，新代码不要再调它。
      *
      * <p>注册表里有记录只说明这张照片做过云备份登记（上传成功即登记），并不表示本地原图被删过；
      * 从未优化过的普通照片，本地文件就是完整原图，必须判成“不需要恢复”，菜单不显示。
@@ -1033,6 +1478,16 @@ public final class OriginalStore {
         if (incoming.previewLocalPath != null) { aliases.add(incoming.previewLocalPath); derived.add(incoming.previewLocalPath); }
         Map<String, Long> hashes = new LinkedHashMap<>(old.derivedHashes);
         hashes.putAll(incoming.derivedHashes);
+        // 状态与预览字段：新登记里“没有信息”的取值（ORIGINAL / 0 / null）不能覆盖已登记的原状态，
+        // 否则一次普通重登记就会把“原路径上已经是预览”这件事抹掉，上传侧随即会把预览当原图。
+        LocalState state = incoming.localState == LocalState.ORIGINAL
+                ? old.localState : incoming.localState;
+        long previewLength = incoming.previewLength > 0L
+                ? incoming.previewLength : old.previewLength;
+        String previewSha256 = incoming.previewSha256 == null
+                ? old.previewSha256 : incoming.previewSha256;
+        String previewFormat = incoming.previewFormat == null
+                ? old.previewFormat : incoming.previewFormat;
         return new Record(incoming.target, incoming.remotePath, incoming.originalLength,
                 incoming.sha256, incoming.originalLocalPath == null ? old.originalLocalPath
                         : incoming.originalLocalPath,
@@ -1042,13 +1497,55 @@ public final class OriginalStore {
                 incoming.sha1 == null ? old.sha1 : incoming.sha1,
                 incoming.originalLocalMtime == 0L ? old.originalLocalMtime
                         : incoming.originalLocalMtime,
-                derived, identities, aliases, hashes);
+                derived, identities, aliases, hashes, state, previewLength, previewSha256,
+                previewFormat);
     }
 
+    /**
+     * 批量写入：期间所有保存只标记脏，最外层结束时统一落盘一次。
+     *
+     * <p>维护作业逐项更新时，整份注册表（数 MB）逐项重写会让总耗时随条数平方增长，
+     * 调用方应把整批更新包在 {@link #beginBatch()} / {@link #endBatch()} 之间。
+     */
+    public void beginBatch() {
+        synchronized (mLock) {
+            mBatchDepth++;
+        }
+    }
+
+    /** 结束批量；最外层退出时若确实有改动，才真正落盘一次。 */
+    public void endBatch() {
+        boolean flush;
+        synchronized (mLock) {
+            if (mBatchDepth > 0) {
+                mBatchDepth--;
+            }
+            flush = mBatchDepth == 0 && mBatchDirty;
+            if (flush) {
+                mBatchDirty = false;
+            }
+        }
+        if (!flush) {
+            return;
+        }
+        synchronized (mLock) {
+            try {
+                saveLocked();
+            } catch (IOException e) {
+                Logger.w("event=registry_batch_flush_failed", e);
+            }
+        }
+    }
     private void saveLocked() throws IOException {
+        if (mBatchDepth > 0) {
+            mBatchDirty = true;
+            return;
+        }
         try {
             JSONObject root = new JSONObject();
-            root.put("version", 1);
+            // v2 起多出 local_state / preview_length / preview_sha256 / preview_format 四个键。
+            // 读侧对缺键一律走兜底（ORIGINAL / 0 / null），所以 v1 文件不必迁移、直接可读。
+            root.put("version", 2);
             JSONArray records = new JSONArray();
             for (Record record : mRecords.values()) {
                 JSONObject item = new JSONObject();
@@ -1061,6 +1558,10 @@ public final class OriginalStore {
                 item.put("row", nullable(record.rowId));
                 item.put("sha1", nullable(record.sha1));
                 item.put("mtime", record.originalLocalMtime);
+                item.put("local_state", record.localState.wire());
+                item.put("preview_length", record.previewLength);
+                item.put("preview_sha256", nullable(record.previewSha256));
+                item.put("preview_format", nullable(record.previewFormat));
                 JSONArray derived = new JSONArray();
                 for (String path : record.derivedPaths) {
                     derived.put(path);
@@ -1178,12 +1679,22 @@ public final class OriginalStore {
                         }
                     }
                 }
+                // 新字段一律走“缺键就兜底”：旧 v1 JSON 没有这四个键，读出来是
+                // ORIGINAL / 0 / null，行为与升级前完全一致，且解析绝不抛异常。
+                LocalState state = LocalState.fromWire(item.optString("local_state", ""));
+                long previewLength = item.optLong("preview_length", 0L);
+                if (previewLength < 0L) {
+                    previewLength = 0L;
+                }
+                String previewSha256 = clean(item.optString("preview_sha256", ""));
+                String previewFormat = clean(item.optString("preview_format", ""));
                 Record record = new Record(item.optString("target", ""),
                         item.optString("remote", ""), item.optLong("length", 0L),
                         item.optString("sha256", ""), clean(item.optString("original", "")),
                         clean(item.optString("preview", "")),
                         clean(item.optString("row", "")), clean(item.optString("sha1", "")),
-                        item.optLong("mtime", 0L), derived, identities, aliases, hashes);
+                        item.optLong("mtime", 0L), derived, identities, aliases, hashes, state,
+                        previewLength, previewSha256, previewFormat);
                 if (record.target.isEmpty() || record.remotePath.isEmpty()
                         || record.originalLength <= 0 || record.sha256.length() != 64) {
                     throw new IOException("invalid original registry record");

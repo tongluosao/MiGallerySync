@@ -22,6 +22,16 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -201,6 +211,39 @@ public final class UploadQueue {
     /** 名单缓存最多留几个目录：按时间分目录时一个月能跨几十个，不给上限就是慢慢涨 */
     private static final int MAX_CACHED_DIRS = 64;
     /**
+     * 上传前那次远端探测（"这个陌生文件在不在这目录里"）的**硬截止**。
+     *
+     * <p>为什么必须有（2026-11-17 真机，平板 + OpenList/S3 后端）：那台服务器对一个
+     * **不存在的对象**做 Depth 0 PROPFIND 本身就慢（PC 冷启动 6.8 秒），平板上更慢；
+     * 日志停在 {@code upload_phase name=probe_start} 之后再无下文，90 秒没 probe_done、
+     * 没 put_start，远端一个字节都没多 —— 探测把主链路拖死了。
+     *
+     * <p>取 8 秒：正常服务器上这次探测是几十到几百毫秒（命中还能多省一份上行），
+     * 8 秒足够覆盖慢速移动网络上的抖动；再等下去，继续 PUT 的收益永远大于干等 ——
+     * 同路径覆盖写是幂等的，最坏只是白传一份。
+     */
+    private static final long PROBE_DEADLINE_MS = 8_000L;
+    /**
+     * 探测专用执行器：**单线程、daemon、队列有界（1）**。
+     *
+     * <p>单线程是因为探测只在元数据请求上省一次往返，并行没有收益，反而会和上传抢上行。
+     * daemon 是因为它绝不能拖住相册进程退出。
+     *
+     * <p>队列只有 1 个位置、满了直接拒绝（{@link ThreadPoolExecutor.AbortPolicy}）：
+     * 上一项探测在巨大目录上还没跑完时，下一项**绝不许排队等它** —— 排队的等待会重新
+     * 变成"上传链路被探测拖死"，只是拖它的从"自己"换成了"队友"。被拒绝按
+     * {@link ProbeDecision.Outcome#ERROR} 处理，立刻照传。
+     */
+    private static final ExecutorService PROBE_POOL = new ThreadPoolExecutor(
+            1, 1, 30_000L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<Runnable>(1),
+            r -> {
+                Thread thread = new Thread(r, "upload-probe");
+                thread.setDaemon(true);
+                return thread;
+            },
+            new ThreadPoolExecutor.AbortPolicy());
+    /**
      * "按目标分开记录"模式下最多同时留几条记录（见 {@link #mLedgers}）。
      *
      * <p>四条够"家里 NAS / 单位服务器 / 旧账号 / 新账号"这种用法来回切；
@@ -208,6 +251,15 @@ public final class UploadQueue {
      * 那是每次落盘都要序列化的体积。
      */
     private static final int MAX_LEDGERS = 4;
+    /**
+     * 一次进程内最多做几次"账本自检"（done 命中之后去问远端到底还在不在）。
+     *
+     * <p>为什么要有上限：账本脏一次（用户清过远端、换过硬链接之类）就可能上万条 key 都
+     * 命中 done。那种情况下逐条发 PROPFIND 等于用一万次往返把服务器打满，比丢几个文件更糟。
+     * 所以每次进程给一份固定额度，用完就退回老行为（按账本跳过），并留一条
+     * {@code event=enqueue_skip_ledger} 说明"这次没确认"。
+     */
+    private static final int LEDGER_CHECK_BUDGET = 256;
 
     private static volatile UploadQueue sInstance;
 
@@ -287,6 +339,21 @@ public final class UploadQueue {
      */
     private final ArrayDeque<Verify> mVerifyQueue = new ArrayDeque<>();
     /**
+     * 待做"账本自检"的项：入队时 key 命中 done、但远端到底还在不在没确认过。
+     *
+     * <p>为什么要单独一条线程、而不是在 {@link #enqueue} 里顺手问一句：enqueue 是在相册自己的
+     * 同步线程上调用的，而一次 PROPFIND 的读超时预算是 90s、超时还要换连接重试一次
+     * （见 {@code WebDavTimeoutPolicy}）—— 在那里发网络请求，等于让相册的枚举卡上几分钟。
+     * 所以这里只登记，真正的请求交给 {@link #ledgerCheckLoop}。
+     *
+     * <p>受 {@link #mLock} 保护。
+     */
+    private final ArrayDeque<LedgerCheck> mLedgerChecks = new ArrayDeque<>();
+    /** 已经排进自检、或正在自检的键：同一个 key 一批一批地重复交下来也只付一次请求。受 mLock 保护 */
+    private final Set<String> mLedgerChecking = new HashSet<>();
+    /** 本进程还剩几次自检额度，见 {@link #LEDGER_CHECK_BUDGET}。受 mLock 保护 */
+    private int mLedgerCheckBudget = LEDGER_CHECK_BUDGET;
+    /**
      * 当前并行上传路数，取自 {@code upload_concurrency}（1..{@link Config#MAX_UPLOAD_CONCURRENCY}）。
      *
      * <p>可调：用户在设置页改完是跨进程写共享偏好 → 相册进程收到 {@code config_changed} →
@@ -326,6 +393,30 @@ public final class UploadQueue {
     private final WebDavClient[] mVerifyClients = new WebDavClient[VERIFY_THREADS];
     private final String[] mVerifyTargets = new String[VERIFY_THREADS];
     private final Thread[] mVerifiers = new Thread[VERIFY_THREADS];
+    /**
+     * 探测线程自己的一条连接，**必须与上传的 {@link #mClients} 分开**。
+     *
+     * <p>超时之后探测任务允许继续在后台跑完（它的结果只进日志），而那一刻 worker 已经
+     * 接着去 PUT 同一个文件了。共用一条连接的话，两条线程会同时往同一个 socket 里写请求、
+     * 互相把对方的响应读走 —— 轻则探测读到 PUT 的 201，重则 PUT 的收尾响应被探测吞掉，
+     * 于是一个已经落盘的文件被判成失败重传。
+     *
+     * <p>只需要一条：探测跑在单线程执行器上，同一时刻最多只有一个探测在飞
+     * （见 {@link #PROBE_POOL}）。
+     */
+    private WebDavClient mProbeClient;
+    private String mProbeTarget;
+    /** 换目标 / 停机时整理探测连接的锁；与 {@link #mLock} 分开，避免在队列锁里 close */
+    private final Object mProbeLock = new Object();
+    /**
+     * 账本自检线程自己的一条连接。
+     *
+     * <p>同样不能与上传/复核共用：一条连接上并行两个请求会串包，而自检恰好可能在上传正忙时
+     * 发生（那正是"账本说传过、远端却没有"最容易暴露的时刻）。
+     */
+    private WebDavClient mLedgerClient;
+    private String mLedgerClientTarget;
+    private Thread mLedgerChecker;
     private long mLastSave;
     private boolean mSavePending;
     /** 本轮空转之前传上去了几项。3 个 worker 都会加，只有空闲时那个读 */
@@ -509,6 +600,7 @@ public final class UploadQueue {
         });
         startWorkers();
         startVerifiers();
+        startLedgerChecker();
     }
 
     public static UploadQueue get(Context context, Config config) {
@@ -546,6 +638,14 @@ public final class UploadQueue {
             cancelled = new ArrayList<>(mVerifyQueue);
             mVerifyQueue.clear();
             mVerifying.clear();
+            // 还没确认的账本自检一并作废：它们只决定"要不要重新入队"，换代之后新的那份队列
+            // 会按 state.json 重建，届时同一批项还会被相册重新交下来、重新自检一次
+            int droppedChecks = mLedgerChecks.size();
+            mLedgerChecks.clear();
+            mLedgerChecking.clear();
+            if (droppedChecks > 0) {
+                Logger.i("event=queue_shutdown_ledger_dropped count=" + droppedChecks);
+            }
             mLock.notifyAll();
         }
         // 这些项已经 taskStart 过、也 beginUpload 过，得自己把账还回去
@@ -566,6 +666,8 @@ public final class UploadQueue {
         }
         releaseClient();
         releaseVerifyClients();
+        releaseLedgerClient();
+        releaseProbeClient();
         // 心跳线程也得停：它是 daemon 不会拖住进程退出，但留着的话热重载后新旧两条
         // 心跳会一起发帧，客户端收到的进度会在两套数据之间跳
         mPublisher.stop();
@@ -580,6 +682,10 @@ public final class UploadQueue {
             if (verifier != null) {
                 verifier.interrupt();
             }
+        }
+        Thread ledgerChecker = mLedgerChecker;
+        if (ledgerChecker != null) {
+            ledgerChecker.interrupt();
         }
         // 单例也得清掉：worker 已经停了，留着它的话下一次 get() 会拿到一个永远不会动的队列
         synchronized (UploadQueue.class) {
@@ -618,6 +724,19 @@ public final class UploadQueue {
     private void releaseVerifyClients() {
         for (int i = 0; i < VERIFY_THREADS; i++) {
             releaseVerifyClientAt(i);
+        }
+    }
+
+    /** 关掉探测那条连接。后台可能还有探测在用它，关掉的后果只是那次探测白跑（结果本来就只进日志） */
+    private void releaseProbeClient() {
+        WebDavClient client;
+        synchronized (mProbeLock) {
+            client = mProbeClient;
+            mProbeClient = null;
+            mProbeTarget = null;
+        }
+        if (client != null) {
+            client.close();
         }
     }
 
@@ -724,10 +843,15 @@ public final class UploadQueue {
             // 旧连接是对着旧目标建的，keep-alive 留着只会连错地方
             releaseClient();
             releaseVerifyClients();
+            releaseLedgerClient();
+            releaseProbeClient();
             synchronized (mLock) {
                 targetChangedLocked(config);
                 // 缓存里的远端名单也是对旧目标列的，换目标的这一刻一律作废
                 mRemoteNames.clear();
+                // 待自检的项算出来的远端路径也是旧目标的，一并作废（新目标下的项会重新交下来）
+                mLedgerChecks.clear();
+                mLedgerChecking.clear();
             }
         }
         applyConcurrency(config.getUploadConcurrency());
@@ -761,6 +885,11 @@ public final class UploadQueue {
             done = mDone.size();
             mDone.clear();
             mLedgers.clear();
+            // 待自检的项全部作废、额度也还回去：用户点"重置备份状态"意味着"远端缺东西，
+            // 重传一遍"，这时留着"马上要对旧账做确认"的待办只会白付请求
+            mLedgerChecks.clear();
+            mLedgerChecking.clear();
+            mLedgerCheckBudget = LEDGER_CHECK_BUDGET;
             // 退避与失败计数也是对着"上次那批传不动"攒的，一并归零
             mConsecutiveFailures.set(0);
             for (Task task : mPending.values()) {
@@ -774,6 +903,7 @@ public final class UploadQueue {
         // 但重置意味着远端确实缺文件，重新列一次更保险
         releaseClient();
         releaseVerifyClients();
+        releaseProbeClient();
         Logger.i("event=ledger_reset done=" + done + " pending=" + mPending.size());
     }
 
@@ -891,7 +1021,21 @@ public final class UploadQueue {
         return a == null ? b == null : a.equals(b);
     }
 
-    /** 入队：已上传过的直接跳过，暂停中的保留原退避时间 */
+    /**
+     * 入队：已上传过的直接跳过，暂停中的保留原退避时间。
+     *
+     * <p>去重有两条判据，含义完全不同：
+     * <ul>
+     *   <li>命中 {@link #mPending} —— 这一项还在排队/在传，重复入队没有意义；</li>
+     *   <li>命中 {@link #mDone} —— 账本说"传过了"。**账本不是远端存在性的证据**：
+     *       远端那份可能被用户清掉、被服务端重建，账本也可能写脏。所以这里不再无条件跳过，
+     *       而是排一次远端确认（{@link #ledgerCheckLoop}）：确认不存在就重新入队并清掉那条脏账，
+     *       确认存在才真的 skip。</li>
+     * </ul>
+     *
+     * <p>确认不能在这个方法里做：enqueue 跑在相册自己的同步线程上，而一次 PROPFIND 的
+     * 读超时预算就有 90s、超时还会换连接重试一次（{@code WebDavTimeoutPolicy}）。
+     */
     public void enqueue(List<CloudItemReader.Item> items) {
         if (items == null || items.isEmpty()) {
             return;
@@ -899,6 +1043,9 @@ public final class UploadQueue {
         int added = 0;
         int skipped = 0;
         int tooLarge = 0;
+        int ledgerCheck = 0;
+        int pendingCount;
+        int doneCount;
         Config config = mConfig;
         // 上限在入队这一层判，**不是**在 worker 里：这样超限的项一个字节都不会发出去，
         // 也不会占着并发槽位、不会进重试循环（见 Config.KEY_MAX_UPLOAD_BYTES 的实测依据）。
@@ -916,6 +1063,7 @@ public final class UploadQueue {
                 skipped++;
                 Logger.i("event=upload_skip_protected path=" + item.path
                         + " row=" + item.rowId + " sha1=" + item.sha1);
+                logPreviewStateSkip(file, item.rowId, item.path);
                 continue;
             }
             unprotected.add(item);
@@ -939,13 +1087,37 @@ public final class UploadQueue {
                     }
                     continue;
                 }
-                String key = key(item.path, size, file.lastModified());
-                if (mDone.containsKey(key) || mPending.containsKey(key)) {
+                long mtime = file.lastModified();
+                String key = key(item.path, size, mtime);
+                Task task = new Task(item.path, size, mtime, item.video, item.date,
+                        item.rowId, item.sha1);
+                if (mPending.containsKey(key)) {
+                    // 还在队里（可能正被某一代 worker 传着）。这里单独打一条，是为了把
+                    // "在排队所以 skip" 与 "账本说传过了所以 skip" 分开 ——
+                    // 后者才是"远端没有、却永远不再重传"的那个信号
                     skipped++;
+                    Logger.d("event=enqueue_skip_pending path=" + item.path + " size=" + size);
                     continue;
                 }
-                mPending.put(key, new Task(item.path, size, file.lastModified(),
-                        item.video, item.date, item.rowId, item.sha1));
+                if (mDone.containsKey(key)) {
+                    skipped++;
+                    // 账本命中：排一次远端确认，确认结果由 ledgerCheckLoop 定 skip/requeue。
+                    // 额度用完、或目标还没配好时退回老行为（按账本跳过）并留一条日志
+                    String remotePath = (mLedgerCheckBudget > 0 && config != null
+                            && config.isReady())
+                            ? remotePathFor(config, task.path, task.video, task.date) : null;
+                    if (remotePath != null && !mLedgerChecking.contains(key)) {
+                        mLedgerCheckBudget--;
+                        mLedgerChecking.add(key);
+                        mLedgerChecks.addLast(new LedgerCheck(key, task, config, remotePath));
+                        ledgerCheck++;
+                    } else {
+                        Logger.d("event=enqueue_skip_ledger path=" + item.path
+                                + " size=" + size + " reason=unverified_budget_or_config");
+                    }
+                    continue;
+                }
+                mPending.put(key, task);
                 added++;
             }
             if (added > 0) {
@@ -958,12 +1130,47 @@ public final class UploadQueue {
                 writeStateLocked();
                 mLock.notifyAll();
             }
+            if (ledgerCheck > 0) {
+                // 自检线程在 mLock 上等活
+                mLock.notifyAll();
+            }
+            pendingCount = mPending.size();
+            doneCount = mDone.size();
         }
         // too_large 单独报出来：它不进 pending，也不重试，不说明白的话用户只会看到
-        // "相册里的文件没传上去，日志里也没有失败"，那是最难查的一种表现
+        // "相册里的文件没传上去，日志里也没有失败"，那是最难查的一种表现。
+        // ledger_check 是"账本命中、已排进后台确认"的条数（不是"确认通过"的条数）
         Logger.i("event=enqueue added=" + added + " skipped=" + skipped
                 + " too_large=" + tooLarge
-                + " pending=" + mPending.size() + " done=" + mDone.size());
+                + " ledger_check=" + ledgerCheck
+                + " pending=" + pendingCount + " done=" + doneCount);
+    }
+
+    /**
+     * 第 3 波：把一个“被本地状态拦下”的跳过与“被路径/字节判据拦下”的跳过分开记。
+     *
+     * <p>这不是新的判据，只是把 {@link OriginalStore#blockingUploadState(File)} 的结论打出来：
+     * 原地预览 / 写入中途 / 侧车预览 / 损坏这四种状态本来就该拦，但日志里只有一条
+     * {@code upload_skip_protected} 的话，排查时看不出到底是“路径登记过”还是“这份文件不是原图”。
+     * 只打路径、状态与行号，不打凭据，也不读文件内容。
+     */
+    private void logPreviewStateSkip(File file, String rowId, String path) {
+        if (mOriginalStore == null || file == null) {
+            return;
+        }
+        try {
+            OriginalStore.LocalState state = mOriginalStore.blockingUploadState(file);
+            if (state == null) {
+                return;
+            }
+            Logger.i("event=upload_skip_preview_state state=" + state.wire()
+                    + " desc=" + PreviewStateRules.describe(state)
+                    + " path=" + (path == null ? file.getAbsolutePath() : path)
+                    + " row=" + rowId);
+        } catch (Throwable t) {
+            Logger.d("event=upload_skip_preview_state_probe_failed path="
+                    + (path == null ? file.getAbsolutePath() : path) + " detail=" + t);
+        }
     }
 
     private void startWorkers() {
@@ -1130,12 +1337,70 @@ public final class UploadQueue {
         progress.requestSync(mContext);
     }
 
+    /**
+     * 阶段埋点的时间基准。
+     *
+     * <p>用 {@link System#nanoTime()} 而不是 currentTimeMillis：要量的是"过了多久"，
+     * 不是"几点几分"。单调钟不会被校时/时区改动拉成负数。
+     */
+    private static long nowMs() {
+        return System.nanoTime() / 1_000_000L;
+    }
+
+    /**
+     * 上传链路的分阶段埋点（进入阶段）。返回本阶段起点，交给 {@link #phaseDone} 算耗时。
+     *
+     * <p>为什么需要它：真机上出现过"{@code event=upload_begin} 之后一条日志都没有、
+     * 远端 HEAD 404"的情形。这条链路上有三处会长时间静默，而且都不是错误：
+     * <ol>
+     *   <li>{@code resolveCollectionPath} —— 要列远端目录、必要时 MKCOL、再列一次
+     *       （元数据请求的读超时预算单项就有 90 秒，还会换连接重试）；</li>
+     *   <li>远端探测（PROPFIND/HEAD）与 {@code backfillFromRemote} 的整份回读；</li>
+     *   <li>PUT 之后等服务器收尾 —— 后端要收完整份才回响应，大文件能等到十几分钟。</li>
+     * </ol>
+     * 只打 begin/upload_ok 的话，卡住时分不清是哪一处，只能靠改代码去猜。有了这几对
+     * start/done，日志里"最后一个没有配对 done 的 start"就是卡住的那一段。
+     *
+     * <p>格式固定：{@code event=upload_phase name=<阶段> worker=… key=<路径|大小|修改时间> [ms=…] [其它键值]}。
+     * key 就是队列的去重键，拿它可以直接去 state.json 的 done/pending 里对照。
+     * 这里只打路径、大小、耗时与远端路径，不碰账号密码之类的凭据。
+     */
+    private static long phase(String name, int index, Task task) {
+        return phase(name, index, task, null);
+    }
+
+    private static long phase(String name, int index, Task task, String extra) {
+        long at = nowMs();
+        Logger.d("event=upload_phase name=" + name + " worker=" + index + " key=" + task.key()
+                + kvs(extra));
+        return at;
+    }
+
+    /** 阶段结束埋点，附带从 startMs 起算的耗时；返回本次时刻，方便连续阶段串起来 */
+    private static long phaseDone(String name, int index, Task task, long startMs) {
+        return phaseDone(name, index, task, startMs, null);
+    }
+
+    private static long phaseDone(String name, int index, Task task, long startMs, String extra) {
+        long at = nowMs();
+        Logger.d("event=upload_phase name=" + name + " worker=" + index + " key=" + task.key()
+                + " ms=" + (at - startMs) + kvs(extra));
+        return at;
+    }
+
+    private static String kvs(String extra) {
+        return extra == null || extra.isEmpty() ? "" : " " + extra;
+    }
+
     private void upload(Task task, Config config, int index) {
         final String taskKey = task.key();
         OriginalStore.PathLease uploadLease = null;
         // 与 upload_ok 配对，用来核对"同一项只被一个 worker 领走"（verbose 才输出）
         Logger.d("event=upload_begin worker=" + index + " path=" + task.path
                 + " size=" + task.size);
+        // prepare 段：本地文件检查、同路径读租约（可能等空间优化放锁）、取连接、算摘要。
+        // 这一段里唯一会无限等的是 lockForUpload，多打一条 start 就能把它跟网络那几段分开
+        long phaseAt = phase("prepare_start", index, task);
         try {
             File file = new File(task.path);
             if (!file.isFile() || file.length() == 0) {
@@ -1160,6 +1425,7 @@ public final class UploadQueue {
             if (mOriginalStore.isProtectedUpload(file, task.rowId, task.sha1)) {
                 Logger.w("event=upload_skip_protected_before_send path=" + task.path
                         + " row=" + task.rowId + " sha1=" + task.sha1);
+                logPreviewStateSkip(file, task.rowId, task.path);
                 synchronized (mLock) {
                     mPending.remove(taskKey);
                     mPendingVersion++;
@@ -1195,7 +1461,13 @@ public final class UploadQueue {
                 client = clientFor(config, index);
                 // 根目录是手填的，前后斜杠、反斜杠都可能带；直接拼会拼出 // 这种空段
                 String requestedRemoteDir = remoteDirFor(config, task);
+                phaseAt = phaseDone("prepare_done", index, task, phaseAt);
+                // resolve 段：列远端目录、必要时 MKCOL、再列一次。全是元数据请求，
+                // 单次读超时预算 90 秒、超时还会换连接重试 —— 这一段实测最容易长时间静默
+                phaseAt = phase("resolve_start", index, task, "dir=" + requestedRemoteDir);
                 String remoteDir = client.resolveCollectionPath(requestedRemoteDir);
+                phaseAt = phaseDone("resolve_done", index, task, phaseAt,
+                        "remote_dir=" + remoteDir);
                 if (remoteDir == null) {
                     throw new IOException("cannot resolve remote directory path="
                             + requestedRemoteDir);
@@ -1216,26 +1488,66 @@ public final class UploadQueue {
                 }
                 // A name and size match only identifies a candidate. GET and SHA-256 must confirm
                 // byte identity before this shortcut can register or mark the item complete.
-                if (config.isSkipExistingRemote()
-                        && remoteExists(config, index, remoteDir, file.getName(), uploadedLength)) {
-                    boolean sameBytes = false;
-                    try {
-                        sameBytes = mOriginalStore.backfillFromRemote(config, remotePath, file,
-                                task.rowId, task.sha1);
-                    } catch (IOException e) {
-                        Logger.d("event=remote_exists_verify_failed remote=" + remotePath
-                                + " reason=" + e);
+                // probe 段：远端有没有这个同名同大小的候选，以及候选是不是真的一模一样。
+                // 后者要整份回读并算 SHA-256，几百 MB 的视频能走很久 —— 单独量出来
+                boolean remoteHit = false;
+                boolean sameBytes = false;
+                // 探测的观测结果。没开"跳过已存在"时按"远端没有"起步：判定自然落到照传，
+                // 与老行为一致
+                ProbeDecision.Outcome probeOutcome = ProbeDecision.Outcome.ABSENT;
+                long probeWaitedMs = 0L;
+                phaseAt = phase("probe_start", index, task, "remote=" + remotePath
+                        + " skip_existing=" + config.isSkipExistingRemote()
+                        + " deadline_ms=" + PROBE_DEADLINE_MS);
+                if (config.isSkipExistingRemote()) {
+                    // **探测有硬截止**：它只是"省一次上传"的优化，绝不许把 PUT 拖死。
+                    // 大目录下问一句"这个陌生文件在不在"能等到几十秒（见 PROBE_DEADLINE_MS）
+                    ProbeOutcome probe = probeRemoteExists(config, remoteDir, file.getName(),
+                            uploadedLength, remotePath);
+                    probeOutcome = probe.outcome;
+                    probeWaitedMs = probe.waitedMs;
+                    remoteHit = probeOutcome == ProbeDecision.Outcome.PRESENT;
+                    if (remoteHit) {
+                        try {
+                            sameBytes = mOriginalStore.backfillFromRemote(config, remotePath, file,
+                                    task.rowId, task.sha1);
+                        } catch (IOException e) {
+                            Logger.d("event=remote_exists_verify_failed remote=" + remotePath
+                                    + " reason=" + e);
+                        }
                     }
-                    if (sameBytes) {
-                        Logger.i("event=upload_skip_remote_exists path=" + task.path
-                                + " remote=" + remotePath + " size=" + uploadedLength
-                                + " verified=sha256");
-                        // Keep the success progress accounting consistent with a completed PUT.
-                        mPublisher.taskBytes(taskKey, uploadedLength);
-                        ok = finalizeOk(task, config, remotePath, "remote_exists",
-                                uploadedSha256, uploadedLength, uploadedMtime, true, true);
-                        return;
+                    if (ProbeDecision.isUnknown(probeOutcome, probeWaitedMs)) {
+                        // 到期 / 问不出来都照传：同路径覆盖写是幂等的，多传一份的代价
+                        // 远小于"一个字节都不发地干等"。
+                        // 幂等不靠这一条日志：这条路径的占用在**领任务时**就登记进
+                        // mInflightRemotePaths 了（worker 循环里，早于 upload()），
+                        // 而释放只在 upload() 的 finally 里 —— 超时分支既没提前领、也没提前放，
+                        // 所以照传仍然落在"同路径同时只有一条 PUT"的保护内
+                        Logger.w("event=upload_probe_deadline_proceed key=" + taskKey
+                                + " remote=" + remotePath + " waited_ms=" + probeWaitedMs
+                                + " probe=" + ProbeDecision.describe(probeOutcome));
                     }
+                }
+                phaseAt = phaseDone("probe_done", index, task, phaseAt,
+                        "remote=" + remotePath + " exists=" + remoteHit
+                                + " same_bytes=" + sameBytes
+                                + " probe=" + ProbeDecision.describe(probeOutcome)
+                                + " probe_ms=" + probeWaitedMs);
+                // 判定收在纯函数里（见 ProbeDecision）：只有"远端确认有 + 字节一致"才跳过，
+                // 超时/异常/不存在/大小对不上全部照传。与老代码的 `if (sameBytes)` 等价 ——
+                // sameBytes 只可能在 remoteHit 为真时被置真 —— 抽出来是为了把这条规则钉进单测
+                if (ProbeDecision.decide(probeOutcome, sameBytes, probeWaitedMs)
+                        == ProbeDecision.Action.SKIP) {
+                    Logger.i("event=upload_skip_remote_exists path=" + task.path
+                            + " remote=" + remotePath + " size=" + uploadedLength
+                            + " verified=sha256");
+                    // Keep the success progress accounting consistent with a completed PUT.
+                    mPublisher.taskBytes(taskKey, uploadedLength);
+                    ok = finalizeOk(task, config, remotePath, "remote_exists",
+                            uploadedSha256, uploadedLength, uploadedMtime, true, true);
+                    return;
+                }
+                if (remoteHit) {
                     Logger.i("event=remote_exists_mismatch remote=" + remotePath
                             + " action=upload");
                 }
@@ -1268,6 +1580,7 @@ public final class UploadQueue {
                 if (!file.isFile() || mOriginalStore.isProtectedUpload(file, task.rowId, task.sha1)) {
                     Logger.w("event=upload_skip_protected_before_put path=" + task.path
                             + " row=" + task.rowId + " sha1=" + task.sha1);
+                    logPreviewStateSkip(file, task.rowId, task.path);
                     synchronized (mLock) {
                         mPending.remove(taskKey);
                         mPendingVersion++;
@@ -1316,22 +1629,34 @@ public final class UploadQueue {
                 // 接着 markSynced 把相册那行记成已上传 —— 相册显示已传、WebDAV 里却没有，
                 // 两边数量再也对不上。所以 putSend 必须在 enqueueVerify 之前，
                 // 且 putSend 抛异常时这一项绝不会进入复核队列。
+                // put 段：写请求体 + 等服务器收尾回响应。后端要收完整份才回 201，
+                // 大文件这一段能等到十几分钟，而这段时间原来是完全静默的
+                phaseAt = phase("put_start", index, task, "remote=" + remotePath
+                        + " size=" + uploadedLength);
                 remotePath = client.putSendResolved(remotePath, file);
                 int remoteSlash = remotePath.lastIndexOf('/');
                 if (remoteSlash >= 0) {
                     remoteDir = remotePath.substring(0, remoteSlash);
                 }
                 rememberRemoteName(remoteDir, file.getName(), uploadedLength);
+                phaseAt = phaseDone("put_done", index, task, phaseAt,
+                        "remote=" + remotePath + " mode=direct");
                 if (config.isVerifyAsync()
                         && enqueueVerify(taskKey, task, config, remotePath, uploadedLength,
                                 uploadedSha256, uploadedMtime)) {
                     handedOff = true;
+                    // 异步复核的 verify_start/verify_done 都由复核线程在 verifyLoop 里打
+                    // （带 mode=async）：这一项此时已经不归 worker 了
                 } else {
                     // 同步路径：复核没过会抛 IOException（与"服务器直接回错误码"同一句话），
                     // 于是走同一套重试逻辑
+                    phaseAt = phase("verify_start", index, task, "remote=" + remotePath
+                            + " mode=sync");
                     client.requireStoredAs(remotePath, uploadedLength);
                     requireMatchingRemoteBytes(client, remotePath, file, uploadedLength,
                             uploadedSha256);
+                    phaseAt = phaseDone("verify_done", index, task, phaseAt,
+                            "remote=" + remotePath + " mode=sync ok=true");
                     ok = finalizeOk(task, config, remotePath, String.valueOf(index),
                             uploadedSha256, uploadedLength, uploadedMtime, false, true);
                 }
@@ -1521,11 +1846,17 @@ public final class UploadQueue {
                 // 复核是**唯一**的成功判据，同步路径与这里共用 WebDavClient.requireStoredAs：
                 // 那句话只有一处定义，日志里同一个故障不会出现两种写法。
                 // 复核不过绝不能记成功 —— 一写标记这项就再也不会重传了
+                // verify 段（异步）：HEAD/PROPFIND 复核 + 字节回读比对。worker 那边早就去传
+                // 下一项了，这一段只能在这里记；mode=async 与同步路径的 mode=sync 配对区分
+                long phaseAt = phase("verify_start", index, job.task,
+                        "remote=" + job.remotePath + " mode=async");
                 client.requireStoredAs(job.remotePath, job.size);
                 // 长度只是"候选"：字节回读核对过才算合格，不合格按普通失败重传 ——
                 // 它同时也是写远端旁车的前提（旁车摘要来自本地，不能自己证明自己）
                 requireMatchingRemoteBytes(client, job.remotePath, new File(job.task.path),
                         job.size, job.uploadedSha256);
+                phaseAt = phaseDone("verify_done", index, job.task, phaseAt,
+                        "remote=" + job.remotePath + " mode=async ok=true");
                 ok = finalizeOk(job.task, job.config, job.remotePath, "verify-" + index,
                         job.uploadedSha256, job.size, job.uploadedMtime, false, true);
                 Logger.i("event=verify_async_done ok=" + ok + " path=" + job.task.path
@@ -1550,6 +1881,147 @@ public final class UploadQueue {
         }
         // 停机（或线程被中断）时这一条连接要还回去
         releaseVerifyClientAt(index);
+    }
+
+    /** 开账本自检线程。一条就够：它只在"入队时键命中 done"时才有活，且每次一个 PROPFIND */
+    private void startLedgerChecker() {
+        Thread checker = new Thread(this::ledgerCheckLoop, "MiGallerySync-ledger-check");
+        // daemon：绝不能因为一条自检没做完就拖住相册进程退出
+        checker.setDaemon(true);
+        mLedgerChecker = checker;
+        checker.start();
+    }
+
+    /**
+     * 账本自检线程的主循环：把 {@link #enqueue} 登记下来的"键命中 done"的项拿去远端问一句。
+     *
+     * <p>为什么需要它（真机实证的数据流）：
+     * <pre>
+     *   event=upload_begin worker=1 path=… size=30630   ← 之后一条事件都没有
+     *   远端 HEAD 该路径 → 404
+     *   下一次同步 event=enqueue added=0 skipped=1 too_large=0 pending=1 done=1
+     * </pre>
+     * 也就是说"账本说传过了"和"远端真的有"被当成了同一件事：远端没有，账本有，于是这一项
+     * 永远不会再发一次（除非用户去改文件的修改时间换掉 key）。这是最难查的一类丢数据 ——
+     * 两边都没有，而且日志里全是"跳过"，没有一条 error。
+     */
+    private void ledgerCheckLoop() {
+        while (mRunning) {
+            LedgerCheck check;
+            synchronized (mLock) {
+                while (mRunning && mLedgerChecks.isEmpty()) {
+                    try {
+                        mLock.wait(WAIT_NO_TASK);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                if (!mRunning) {
+                    break;
+                }
+                check = mLedgerChecks.pollFirst();
+                if (check == null) {
+                    continue;
+                }
+            }
+            try {
+                checkLedgerEntry(check);
+            } catch (Throwable t) {
+                // 自检自己绝不能把线程弄死：它死了以后账本脏了就再没人发现
+                Logger.w("event=enqueue_verify_failed remote=" + check.remotePath
+                        + " key=" + check.key + " reason=" + t);
+                synchronized (mLock) {
+                    mLedgerChecking.remove(check.key);
+                }
+                requeueLedgerEntry(check,
+                        EnqueueLedgerDecision.RemoteState.UNKNOWN, 0L);
+            }
+        }
+        releaseLedgerClient();
+    }
+
+    /**
+     * 一次账本自检：问远端"这条路径在不在、多大"，再按
+     * {@link EnqueueLedgerDecision} 的规则决定跳过还是重新入队。
+     *
+     * <p>判据是**严的**，而且方向是确定的：只有"PROPFIND 回了正数、且与本地一样大"才跳过。
+     * 远端明确没有、大小不同、以及**问不出来**（{@code -2}、超时、鉴权失败、任何异常）
+     * 一律重新入队 —— 多传一次是同路径覆盖写（幂等，不产生第二个对象），少传一次就是永久丢文件。
+     */
+    private void checkLedgerEntry(LedgerCheck check) {
+        long remoteSize;
+        EnqueueLedgerDecision.RemoteState state;
+        try {
+            WebDavClient client = ledgerClientFor(check.config);
+            remoteSize = client.propfindSize(check.remotePath);
+            state = EnqueueLedgerDecision.fromPropfind(remoteSize, check.task.size);
+        } catch (Throwable t) {
+            // 401/403（鉴权失败）与网络异常都走这里：问不出来不等于"远端没有"，
+            // 但对账本自检来说，唯一安全的兜底是重传
+            Logger.w("event=enqueue_verify_failed remote=" + check.remotePath
+                    + " key=" + check.key + " reason=" + t);
+            requeueLedgerEntry(check, EnqueueLedgerDecision.RemoteState.UNKNOWN, 0L);
+            return;
+        }
+        if (EnqueueLedgerDecision.decide(state) == EnqueueLedgerDecision.Action.SKIP) {
+            synchronized (mLock) {
+                mLedgerChecking.remove(check.key);
+            }
+            // 账本这次是真的：key 留在 done 里，下一轮同样跳过（不再重复确认，省额度）
+            Logger.i("event=enqueue_skip_verified remote=" + check.remotePath
+                    + " key=" + check.key + " remote_size=" + remoteSize
+                    + " state=" + EnqueueLedgerDecision.describe(state));
+            return;
+        }
+        requeueLedgerEntry(check, state, remoteSize);
+    }
+
+    /**
+     * 账本脏了（或压根确认不了）：把那条 done 摘掉，按**当前**本地文件重新排进待传。
+     *
+     * <p>为什么要重取本地大小/修改时间：key 是由它们算出来的。文件在上次记账之后被改过
+     * （用户编辑、空间优化换过副本），沿用旧 key 会把新一份的账又记到旧 key 上，
+     * 下一轮入队还会命中"没有账"而重复入队 —— 白付一次上行。
+     *
+     * <p>重传是幂等的：PUT 打的是同一条远端路径，语义是覆盖写；并发方面有
+     * {@link #mInflightRemotePaths} 保证同一路径同时只有一条 PUT 在飞。
+     */
+    private void requeueLedgerEntry(LedgerCheck check, EnqueueLedgerDecision.RemoteState state,
+                                    long remoteSize) {
+        Task task = check.task;
+        File local = new File(task.path);
+        if (local.isFile() && local.length() > 0
+                && (local.length() != task.size || local.lastModified() != task.mtime)) {
+            task = new Task(task.path, local.length(), local.lastModified(), task.video,
+                    task.date, task.rowId, task.sha1);
+        }
+        final String key = task.key();
+        boolean queued = false;
+        synchronized (mLock) {
+            mLedgerChecking.remove(check.key);
+            // 两个 key 都要摘：旧 key 是那份脏账，新 key 是"万一上一轮已经按新属性记过账"
+            mDone.remove(check.key);
+            mDone.remove(key);
+            if (mPending.containsKey(key)) {
+                // 这期间相册（或 self-heal）已经把同一项重新交下来了，不必再塞一份
+                mLock.notifyAll();
+            } else {
+                mPending.put(key, task);
+                mPendingVersion++;
+                // 有新活了：把催相册的间隔拉回最短，别让这次自愈等上一小时
+                mIdleSyncDelay = IDLE_SYNC_BASE;
+                mIdleNotified = false;
+                saveThrottledLocked();
+                mLock.notifyAll();
+                queued = true;
+            }
+        }
+        Logger.w("event=enqueue_requeue_missing remote=" + check.remotePath
+                + " path=" + task.path + " key=" + key + " size=" + task.size
+                + " remote_size=" + remoteSize
+                + " state=" + EnqueueLedgerDecision.describe(state)
+                + " queued=" + queued);
     }
 
     /**
@@ -1890,6 +2362,31 @@ public final class UploadQueue {
     }
 
     /**
+     * 取探测线程的客户端。规则同 {@link #clientFor}，只是**独立一条**：
+     * 探测会在 worker 接着 PUT 的时候还在后台跑（超时之后允许它跑完），共用连接会串包。
+     */
+    private WebDavClient probeClientFor(Config config) {
+        String signature = Config.safeHost(config.getBaseUrl()) + "|" + config.getUsername();
+        WebDavClient stale;
+        WebDavClient client;
+        synchronized (mProbeLock) {
+            if (mProbeClient != null && signature.equals(mProbeTarget)) {
+                return mProbeClient;
+            }
+            stale = mProbeClient;
+            client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                    config.getPassword());
+            mProbeClient = client;
+            mProbeTarget = signature;
+        }
+        // close 放到锁外：它要等对应的连接真的关掉，不该把别的探测卡在这儿
+        if (stale != null) {
+            stale.close();
+        }
+        return client;
+    }
+
+    /**
      * 取第 index 个复核线程可复用的客户端。规则同 {@link #clientFor}，只是数组分开：
      * 复核跟上传会同时用连接，共用一条会互相读到对方的响应。
      */
@@ -1905,6 +2402,33 @@ public final class UploadQueue {
         mVerifyClients[index] = client;
         mVerifyTargets[index] = signature;
         return client;
+    }
+
+    /**
+     * 账本自检用的一条连接。规则同 {@link #verifyClientFor}，同样是**独立一条**：
+     * 自检可能正好撞上某一路上传、以及另一条复核，共用连接会互相把对方的响应读走。
+     */
+    private WebDavClient ledgerClientFor(Config config) {
+        String signature = Config.safeHost(config.getBaseUrl()) + "|" + config.getUsername();
+        WebDavClient existing = mLedgerClient;
+        if (existing != null && signature.equals(mLedgerClientTarget)) {
+            return existing;
+        }
+        releaseLedgerClient();
+        WebDavClient client =
+                new WebDavClient(config.getBaseUrl(), config.getUsername(), config.getPassword());
+        mLedgerClient = client;
+        mLedgerClientTarget = signature;
+        return client;
+    }
+
+    private void releaseLedgerClient() {
+        WebDavClient client = mLedgerClient;
+        mLedgerClient = null;
+        mLedgerClientTarget = null;
+        if (client != null) {
+            client.close();
+        }
     }
 
     /**
@@ -2059,7 +2583,88 @@ public final class UploadQueue {
     }
 
     /**
+     * 一次远端探测的观测结果：探测看到了什么，以及在它身上等了多久。
+     *
+     * <p>只用于日志与 {@link ProbeDecision} 的输入 —— 判定本身在纯函数里，方便单测。
+     */
+    private static final class ProbeOutcome {
+        final ProbeDecision.Outcome outcome;
+        final long waitedMs;
+
+        ProbeOutcome(ProbeDecision.Outcome outcome, long waitedMs) {
+            this.outcome = outcome;
+            this.waitedMs = waitedMs;
+        }
+    }
+
+    /**
+     * 在**硬截止**内做一次远端探测（{@link #PROBE_DEADLINE_MS}），超时就当问不出来。
+     *
+     * <p>为什么要在执行器里跑：探测是一句纯等待（大目录下的 PROPFIND 在平板上能等到
+     * 几十秒），而它所在的是上传 worker —— 同一个 worker 干等，就等于整条上传链路干等。
+     * 把探测丢出去、自己只等到截止点，链路就永远不会被它拖住。
+     *
+     * <p>超时之后任务**不强行杀**：{@link Future#cancel(boolean)} 会打断它，但 HTTP 读不一定
+     * 立刻可中断，它可能在后台继续跑完。这没关系 —— 它的结果只进日志
+     * （{@code upload_probe_task_result}），已经不在任何判定里；而且它用的是自己那条连接
+     * （{@link #probeClientFor}），碰不到 worker 正在用的那条。
+     */
+    private ProbeOutcome probeRemoteExists(final Config config, final String remoteDir,
+                                           final String name, final long size,
+                                           final String remotePath) {
+        final long start = nowMs();
+        Callable<Boolean> probe = () -> {
+            long at = nowMs();
+            try {
+                boolean exists = remoteExists(probeClientFor(config), remoteDir, name, size);
+                Logger.d("event=upload_probe_task_result remote=" + remotePath + " exists="
+                        + exists + " probe_ms=" + (nowMs() - at));
+                return exists;
+            } catch (Throwable t) {
+                // 结果只用于日志：主链路这一刻早就按"问不出来"继续上传了
+                Logger.d("event=upload_probe_task_result remote=" + remotePath
+                        + " exists=unknown reason=" + t + " probe_ms=" + (nowMs() - at));
+                return null;
+            }
+        };
+        Future<Boolean> future;
+        try {
+            future = PROBE_POOL.submit(probe);
+        } catch (RejectedExecutionException e) {
+            // 上一项探测还没跑完（执行器单线程、队列只有 1 格）：绝不再排队等它，
+            // 直接按"问不出来"照传 —— 排队等待正是这次要消除的那种"被探测拖死"
+            Logger.d("event=upload_probe_rejected remote=" + remotePath + " action=upload");
+            return new ProbeOutcome(ProbeDecision.Outcome.ERROR, 0L);
+        }
+        try {
+            Boolean exists = future.get(PROBE_DEADLINE_MS, TimeUnit.MILLISECONDS);
+            long waited = nowMs() - start;
+            if (exists == null) {
+                return new ProbeOutcome(ProbeDecision.Outcome.ERROR, waited);
+            }
+            return new ProbeOutcome(exists ? ProbeDecision.Outcome.PRESENT
+                    : ProbeDecision.Outcome.ABSENT, waited);
+        } catch (TimeoutException e) {
+            // 打断它只是让它别再占着那条连接；读不出来的结果直接丢掉，判定已经走照传
+            future.cancel(true);
+            return new ProbeOutcome(ProbeDecision.Outcome.TIMEOUT, nowMs() - start);
+        } catch (CancellationException | ExecutionException e) {
+            future.cancel(true);
+            return new ProbeOutcome(ProbeDecision.Outcome.ERROR, nowMs() - start);
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            // 队列停机（热重载换代）时被打断：把中断标志还回去，让 worker 循环自己退出
+            Thread.currentThread().interrupt();
+            return new ProbeOutcome(ProbeDecision.Outcome.ERROR, nowMs() - start);
+        }
+    }
+
+    /**
      * 远端那个目录里有没有名字与大小都匹配的候选对象。
+     *
+     * <p><b>客户端由调用方给</b>：探测跑在 {@link #PROBE_POOL} 的线程上，只能用
+     * {@link #probeClientFor} 那条独立连接 —— 拿 {@link #clientFor} 的会与 worker 正在发的
+     * PUT 抢同一条 socket（超时之后探测可能还在后台跑）。
      *
      * <p>用 {@code PROPFIND Depth 1} 一次拿回整个目录的名字与大小（见 {@link #mRemoteNames}），
      * 而不是对这一个文件发 HEAD：同一相册目录下的几十项只会付一次往返。这个结果只用来
@@ -2074,8 +2679,7 @@ public final class UploadQueue {
      * 它自己坏掉（不支持 PROPFIND、超时、被拦）绝不该让文件传不上去 —— 判错了方向以后果
      * 最轻：多传一次覆盖写。反过来若在拿不到名单时判"远端有"，那才是丢文件。
      */
-    private boolean remoteExists(Config config, int index, String remoteDir, String name,
-                                 long size) {
+    private boolean remoteExists(WebDavClient client, String remoteDir, String name, long size) {
         Map<String, Long> remote;
         synchronized (mLock) {
             RemoteNames cached = mRemoteNames.get(remoteDir);
@@ -2084,7 +2688,6 @@ public final class UploadQueue {
             }
         }
         try {
-            WebDavClient client = clientFor(config, index);
             List<WebDavClient.RemoteEntry> entries = client.list(remoteDir);
             if (entries == null) {
                 // 目录名单不可用时，单独问目标对象。只有HEAD/Depth 0 PROPFIND给出与本地
@@ -2465,6 +3068,27 @@ public final class UploadQueue {
             this.size = size;
             this.uploadedSha256 = uploadedSha256;
             this.uploadedMtime = uploadedMtime;
+        }
+    }
+
+    /**
+     * 一项"入队时键命中 done、但远端有没有还没确认"的工作。
+     *
+     * <p>记下当时的 {@link Task} 与配置快照：自检可能排到队列里等一会儿才轮上，
+     * 那时 {@link #mConfig} 可能已经换了目标 —— 必须按**登记这一刻**的目标去问远端，
+     * 否则会把"按旧目标算出来的路径"拿到新服务器上去问，答案毫无意义。
+     */
+    private static final class LedgerCheck {
+        final String key;
+        final Task task;
+        final Config config;
+        final String remotePath;
+
+        LedgerCheck(String key, Task task, Config config, String remotePath) {
+            this.key = key;
+            this.task = task;
+            this.config = config;
+            this.remotePath = remotePath;
         }
     }
 

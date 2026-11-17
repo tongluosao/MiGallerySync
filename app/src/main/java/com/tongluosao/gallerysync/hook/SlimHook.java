@@ -7,6 +7,8 @@ import android.net.Uri;
 
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.DownloadQueue;
+import com.tongluosao.gallerysync.core.InplacePreviewWriter;
+import com.tongluosao.gallerysync.core.InplaceSlimPolicy;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
 import com.tongluosao.gallerysync.core.UploadQueue;
@@ -146,10 +148,18 @@ final class SlimHook {
     }
 
     /**
-     * 跑完一张的完整流程：校验远端 → 编码 → 租约 → 发布 → saveToDB → 删原图 → 回滚。
+     * 跑完一张的完整流程：校验远端 → 原地分支 / 侧车分支。
+     *
+     * <p>两条分支共用前面整段安全闸门（身份、target、远端已校验、本地原图未变），分流点见
+     * {@link #useInplace}：
+     * <ul>
+     *   <li>HEIC/JPG 家族：编码到同目录临时件 → {@link InplacePreviewWriter#publish} 覆盖原路径
+     *       （租约 → 意图 → 改名 → 复核 → DB）；<b>不删原图</b>；</li>
+     *   <li>视频与 png/webp/gif 等：保持老侧车流程逐字不变（发布副本 → saveToDB → 删原图 → 回滚）。</li>
+     * </ul>
      *
      * <p>相册自己的 {@code SlimController.handleSlim} 与本模块的工作线程池（{@link SlimWorker}）
-     * 都走这一份实现，行为与日志保持一致：能省下字节就返回省下的字节，跳过或失败返回 0，
+     * 都走这一份实现：能省下字节就返回省下的字节，跳过或失败返回 0，
      * 而"这张根本不归模块管"时返回 {@link #PASSTHROUGH}，由调用方决定怎么交还给相册。
      */
     long runSlim(SlimItem item) {
@@ -271,6 +281,13 @@ final class SlimHook {
             return 0L;
         }
         tVerifyEnd = System.nanoTime();
+
+        // 分流点：HEIC/JPG 家族走原地覆盖（原路径原文件名），其余容器与视频继续走侧车方案。
+        // 两条分支共用上面这一整段安全闸门（远端已校验、身份对得上、本地原图未变）。
+        if (useInplace(item, original, config)) {
+            return runInplace(item, original, record, store, config, saveToDb, context, t0,
+                    gapMillis, tVerifyEnd);
+        }
 
         // 下载高清图与空间优化共用同一个副本路径：隐藏目录里一个与原图同名的文件。
         File preview;
@@ -411,7 +428,7 @@ final class SlimHook {
         } finally {
             long tEnd = System.nanoTime();
             sLastDoneNanos = tEnd;
-            Logger.i("event=slim_timing total=" + elapsedMillis(t0, tEnd)
+            Logger.i("event=slim_timing stage=sidecar total=" + elapsedMillis(t0, tEnd)
                     + " verify=" + elapsedMillis(t0, tVerifyEnd)
                     + " encode=" + elapsedMillis(tVerifyEnd, tEncodeEnd)
                     + " lease=" + elapsedMillis(tEncodeEnd, tLeaseEnd)
@@ -436,6 +453,258 @@ final class SlimHook {
     private static long elapsedMillis(long from, long to) {
         if (from <= 0L || to <= 0L || to < from) return -1L;
         return (to - from) / 1_000_000L;
+    }
+
+    /**
+     * 这张图片能不能原地覆盖。
+     *
+     * <p>除了容器本身（HEIC/JPG 家族），HEIF 还多一个前提：“保留 HEIC 格式”必须开着。
+     * 关掉时老逻辑的编码器会产出 JPEG，而原地覆盖不允许改扩展名 —— 把 JPEG 写进 {@code .heic}
+     * 就是容器不匹配，相册与远端都会把它当坏图，所以这种情况继续走侧车。
+     */
+    private static boolean useInplace(SlimItem item, File original, Config config) {
+        if (item.serverType != 1 || original == null || config == null
+                || !InplaceSlimPolicy.canOverwriteInPlace(original.getName())) {
+            return false;
+        }
+        return !"heic".equals(InplaceSlimPolicy.targetFormat(original.getName()))
+                || config.isPreserveHeicFormat();
+    }
+
+    /**
+     * 原地覆盖分支：编码到同目录临时件，再交给 {@link InplacePreviewWriter} 按固定顺序提交。
+     *
+     * <p>相对侧车分支少了两件事：预览不再搬进隐藏目录（目标就是原文件本身），也<b>不再删原图</b>
+     * —— 覆盖之后原路径上那份字节就是预览，删掉等于把照片弄丢。DB 也反过来写：
+     * {@code localFile=原路径}、{@code thumbnailFile=""}，相册因此认为原图仍在本机。
+     */
+    private long runInplace(SlimItem item, File original, OriginalStore.Record record,
+            OriginalStore store, Config config, Method saveToDb, Context context, long t0,
+            long gapMillis, long tVerifyEnd) {
+        InplaceCallbacks callbacks = new InplaceCallbacks(item, original, record, store, config,
+                saveToDb, context);
+        InplacePreviewWriter.Outcome outcome = null;
+        long tEncodeEnd = 0L;
+        long tPublishEnd = 0L;
+        long result = 0L;
+        try {
+            File staged = stagedInplacePreview(item, original, config, callbacks);
+            if (staged == null) {
+                return 0L;
+            }
+            String previewSha = InplacePreviewWriter.sha256Of(staged);
+            if (previewSha == null) {
+                Logger.w("event=slim_inplace_failed row=" + item.rowId
+                        + " reason=preview_hash_failed path=" + item.path);
+                return 0L;
+            }
+            tEncodeEnd = System.nanoTime();
+            InplacePreviewWriter.Request request = new InplacePreviewWriter.Request();
+            request.original = InplaceSlimPolicy.targetPath(original);
+            request.originalLength = record.originalLength;
+            request.originalSha256 = record.sha256;
+            request.staged = staged;
+            request.previewLength = staged.length();
+            request.previewSha256 = previewSha;
+            request.previewFormat = InplaceSlimPolicy.targetFormat(original.getName());
+            request.rowId = item.rowId;
+            // 与侧车分支一样：从这里到 DB 提交不允许切换还原目标，否则可能按旧目标覆盖本地原图
+            synchronized (mConfigLock) {
+                if (!isCurrentTargetLocked(config)) {
+                    Logger.w("event=slim_inplace_failed row=" + item.rowId
+                            + " reason=webdav_target_changed_before_publish path=" + item.path);
+                    return 0L;
+                }
+                outcome = InplacePreviewWriter.publish(request, callbacks);
+            }
+            tPublishEnd = System.nanoTime();
+            if (outcome.success) {
+                result = Math.max(0L, record.originalLength - request.previewLength);
+                Logger.i("event=slim_inplace_done row=" + item.rowId + " saved=" + result
+                        + " path=" + item.path);
+            } else {
+                Logger.w("event=slim_inplace_failed row=" + item.rowId + " reason="
+                        + outcome.reason + " path=" + item.path);
+            }
+        } catch (Throwable t) {
+            Logger.e("event=slim_inplace_failed row=" + item.rowId + " reason=exception path="
+                    + item.path, t);
+        } finally {
+            logInplaceTiming(item, t0, gapMillis, tVerifyEnd, tEncodeEnd, tPublishEnd, callbacks);
+            callbacks.close();
+        }
+        return result;
+    }
+
+    /**
+     * 把压缩预览编码到“与原文件同目录”的隐藏临时件。
+     *
+     * <p>同目录是硬要求：跨目录的 atomic rename 不成立，那就不再是原子发布。编码器按原文件名
+     * 选容器（heic/heif 出 HEIF、jpg/jpeg 出 JPEG），调用前已经确认过扩展名与编码器匹配。
+     * 失败返回 {@code null}，原因已经打进 {@code slim_inplace_failed}。
+     */
+    private File stagedInplacePreview(SlimItem item, File original, Config config,
+            InplaceCallbacks callbacks) {
+        File parent = original.getAbsoluteFile().getParentFile();
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs()
+                && !parent.isDirectory())) {
+            Logger.w("event=slim_inplace_failed row=" + item.rowId
+                    + " reason=target_directory_unavailable path=" + item.path);
+            return null;
+        }
+        File staged = new File(parent, "." + original.getName() + ".mgs-tmp-"
+                + UUID.randomUUID());
+        callbacks.staged = staged;
+        boolean encoded = DownloadQueue.createCompressedPreview(original, staged,
+                original.getName(), config);
+        if (!encoded || !staged.isFile() || staged.length() <= 0L
+                || staged.length() >= original.length()) {
+            Logger.i("event=slim_inplace_failed row=" + item.rowId
+                    + " reason=preview_not_smaller path=" + item.path);
+            return null;
+        }
+        return staged;
+    }
+
+    /** 原地分支的计时：字段与侧车一致，用 stage= 区分方案，便于对比两条路的耗时分布。 */
+    private static void logInplaceTiming(SlimItem item, long t0, long gapMillis, long tVerifyEnd,
+            long tEncodeEnd, long tPublishEnd, InplaceCallbacks callbacks) {
+        long tEnd = System.nanoTime();
+        sLastDoneNanos = tEnd;
+        Logger.i("event=slim_timing stage=inplace total=" + elapsedMillis(t0, tEnd)
+                + " verify=" + elapsedMillis(t0, tVerifyEnd)
+                + " encode=" + elapsedMillis(tVerifyEnd, tEncodeEnd)
+                + " lease=" + elapsedMillis(tEncodeEnd, callbacks.leaseEndNanos)
+                + " publish=" + elapsedMillis(callbacks.leaseEndNanos, tPublishEnd)
+                + " db=" + elapsedMillis(callbacks.dbStartNanos, callbacks.dbEndNanos)
+                + " tail=" + elapsedMillis(tPublishEnd, tEnd)
+                + " gap=" + gapMillis
+                + " path=" + item.path);
+    }
+
+    /**
+     * 原地覆盖的六个副作用：租约、意图、DB 回读、状态提交、损坏标记、原图回填。
+     *
+     * <p>全部经 {@link OriginalStore} 与宿主 {@code saveToDB} 实现；每个回调自己吞掉异常并返回
+     * false/void，让引擎只需要关心 reason，不必区分“抛了异常”与“返回了失败”。
+     */
+    private final class InplaceCallbacks implements InplacePreviewWriter.Callbacks {
+        private final SlimItem mItem;
+        private final File mOriginal;
+        private final OriginalStore.Record mRecord;
+        private final OriginalStore mStore;
+        private final Config mConfig;
+        private final Method mSaveToDb;
+        private final Context mContext;
+        private OriginalStore.PathLease mLease;
+        File staged;
+        long leaseEndNanos;
+        long dbStartNanos;
+        long dbEndNanos;
+
+        InplaceCallbacks(SlimItem item, File original, OriginalStore.Record record,
+                OriginalStore store, Config config, Method saveToDb, Context context) {
+            mItem = item;
+            mOriginal = original;
+            mRecord = record;
+            mStore = store;
+            mConfig = config;
+            mSaveToDb = saveToDb;
+            mContext = context;
+        }
+
+        @Override
+        public boolean beginLease() {
+            try {
+                // 等持有读租约的上传结束，并在整个覆盖+DB 切换期间挡住新的上传
+                mLease = mStore.beginDerivedMutation(mConfig, mItem.rowId, mItem.sha1, mOriginal);
+                if (mLease == null) {
+                    return false;
+                }
+                leaseEndNanos = System.nanoTime();
+                // 侧车分支拿到租约后会重验原图字节；原地覆盖更要在动字节之前再确认一次：
+                // 否则用户刚刚改过的照片会被一份预览静默覆盖（主机侧看不到任何回滚机会）
+                if (!mOriginal.isFile() || mOriginal.length() != mRecord.originalLength
+                        || !mRecord.sha256.equals(InplacePreviewWriter.sha256Of(mOriginal))) {
+                    Logger.w("event=slim_inplace_failed row=" + mItem.rowId
+                            + " reason=original_changed_before_publish path=" + mItem.path);
+                    return false;
+                }
+                return true;
+            } catch (Throwable t) {
+                Logger.w("event=slim_inplace_lease_failed path=" + mItem.path, t);
+                return false;
+            }
+        }
+
+        @Override
+        public boolean markPending(long len, String sha256, String format) {
+            try {
+                return mStore.markInplacePending(mConfig, mRecord, len, sha256, format) != null;
+            } catch (Throwable t) {
+                Logger.w("event=slim_inplace_pending_failed path=" + mItem.path, t);
+                return false;
+            }
+        }
+
+        @Override
+        public boolean commitDatabase(File original) {
+            dbStartNanos = System.nanoTime();
+            try {
+                // arg2=thumbnailFile 置空、arg3=localFile=原路径：相册认为原图还在本机
+                mSaveToDb.invoke(null, mItem.id, "", original.getAbsolutePath());
+                return databasePointsToInplace(mContext, mItem.id, original.getAbsolutePath());
+            } catch (Throwable t) {
+                Logger.e("event=slim_inplace_db_failed path=" + mItem.path, t);
+                return false;
+            } finally {
+                dbEndNanos = System.nanoTime();
+            }
+        }
+
+        @Override
+        public void markInPlace(long len, String sha256, String format) {
+            try {
+                mStore.markInplaceCommitted(mConfig, mRecord, len, sha256, format);
+            } catch (Throwable t) {
+                Logger.w("event=slim_inplace_commit_failed path=" + mItem.path, t);
+            }
+        }
+
+        @Override
+        public void markDamaged(String reason) {
+            try {
+                mStore.markDamaged(mConfig, mRecord, reason);
+            } catch (Throwable t) {
+                Logger.w("event=slim_inplace_damaged_failed path=" + mItem.path, t);
+            }
+        }
+
+        @Override
+        public void restoreOriginal() {
+            try {
+                // 复核失败时原路径上已经是这次写下的字节：先登记成派生副本，恢复流程才肯覆盖它
+                mStore.registerDerivedPath(mConfig, mItem.rowId, mItem.sha1, mOriginal);
+            } catch (Throwable t) {
+                Logger.w("event=slim_inplace_restore_mark_failed path=" + mItem.path, t);
+            }
+            try {
+                mStore.restoreOriginal(mConfig, mRecord, mOriginal);
+            } catch (Throwable t) {
+                Logger.e("event=slim_inplace_restore_failed path=" + mItem.path, t);
+            }
+        }
+
+        /** 释放租约并清掉没被引擎消费掉的临时件（成功路径上它已经被改名走了）。 */
+        void close() {
+            if (mLease != null) {
+                mLease.close();
+                mLease = null;
+            }
+            if (staged != null && staged.exists() && !staged.delete()) {
+                Logger.d("event=slim_temp_cleanup_failed path=" + staged.getAbsolutePath());
+            }
+        }
     }
 
     private boolean videoRestoreReady() {
@@ -539,6 +808,46 @@ final class SlimHook {
             String actualThumbnail = cursor.getString(thumbnailColumn);
             return (actualLocal == null || actualLocal.isEmpty())
                     && thumbnailPath.equals(actualThumbnail);
+        }
+    }
+
+    /**
+     * 原地模式的回读确认：{@code localFile} 必须等于原路径、{@code thumbnailFile} 必须为空。
+     *
+     * <p>与侧车模式正好相反 —— 侧车把预览写进 thumbnailFile 并清空 localFile，好让相册认为
+     * 原图不在本机；原地模式必须让相册认为原图就在原路径上，否则下一次扫描会把这张照片当成
+     * 云端独有、再从远端下一份完整原图回来。
+     */
+    private boolean databasePointsToInplace(Context context, int id, String localPath)
+            throws Exception {
+        Class<?> cloud = mClassLoader.loadClass(CLS_CLOUD_CONTRACT);
+        Field uriField = cloud.getField("CLOUD_URI");
+        Uri uri = (Uri) uriField.get(null);
+        if (uri == null) return false;
+        ContentResolver resolver = context.getContentResolver();
+        try (Cursor cursor = resolver.query(uri,
+                new String[]{"localFile", "thumbnailFile"}, "_id = ?",
+                new String[]{String.valueOf(id)}, null)) {
+            if (cursor == null || !cursor.moveToFirst()) return false;
+            int localColumn = cursor.getColumnIndex("localFile");
+            int thumbnailColumn = cursor.getColumnIndex("thumbnailFile");
+            if (localColumn < 0 || thumbnailColumn < 0) return false;
+            String actualLocal = cursor.getString(localColumn);
+            String actualThumbnail = cursor.getString(thumbnailColumn);
+            return samePathValue(localPath, actualLocal)
+                    && (actualThumbnail == null || actualThumbnail.isEmpty());
+        }
+    }
+
+    /** 路径相等的宽松比较：宿主可能存绝对路径，也可能存经过符号链接归一化的路径。 */
+    private static boolean samePathValue(String expected, String actual) {
+        if (expected == null || actual == null) return false;
+        if (expected.equals(actual)) return true;
+        try {
+            return new File(expected).getCanonicalPath()
+                    .equals(new File(actual).getCanonicalPath());
+        } catch (IOException e) {
+            return false;
         }
     }
 

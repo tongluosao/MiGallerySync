@@ -4,12 +4,28 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.hook.gallery.Binding;
+import com.tongluosao.gallerysync.hook.gallery.Profiles;
 
 /**
  * 通过反射读取相册内部同步项。所有访问都做空值与异常保护：
  * 相册升级后字段或方法改名时只会导致读取失败，不会把异常抛回宿主调用栈。
+ *
+ * <p>类名与字段名不写死：先看当前版本档案（{@link Profiles#resolveBinding}）里声明了什么，
+ * 档案缺失或没声明时才回落到下面这几个 4.3.1.6 的类名。手机上两者解析到同一个类，
+ * 行为与改造前逐字一致；平板（旧版 3.6.2.10）走的则是档案里的
+ * {@code com.miui.gallery.cloud.RequestCloudItem} 那套。
+ *
+ * <p>解析只做一次（{@link #create}），失败返回 null 并留下 {@code reader_binding_missing}，
+ * 调用点据此把上传拦在安全兜底上 —— 这正是平板以前 {@code reader_init_failed} 的成因。
  */
 public final class CloudItemReader {
+
+    /** 新版相册（4.3.x）的同步项类名：档案不可用时的最后回落；旧版类名见 {@link Profiles#G2024} */
+    private static final String CLS_REQUEST_CLOUD_ITEM =
+            "com.miui.gallery.data.remote.RequestCloudItem";
+    private static final String CLS_REQUEST_ITEM_BASE =
+            "com.miui.gallery.data.remote.RequestItemBase";
 
     /** 需要备份到 WebDAV 的优先级：2=自动视频 3=手动视频 4=自动图片 5=手动/共享图片 */
     private static final int PRIORITY_AUTO_VIDEO = 2;
@@ -29,11 +45,13 @@ public final class CloudItemReader {
     private final Method mGetSha1;
 
     private CloudItemReader(ClassLoader cl) throws Exception {
-        Class<?> itemCls = cl.loadClass("com.miui.gallery.data.remote.RequestCloudItem");
-        Class<?> baseCls = cl.loadClass("com.miui.gallery.data.remote.RequestItemBase");
+        Binding itemBinding = Profiles.resolveBinding(cl, CLS_REQUEST_CLOUD_ITEM);
+        Binding baseBinding = Profiles.resolveBinding(cl, CLS_REQUEST_ITEM_BASE);
+        Class<?> itemCls = clazz(itemBinding, cl, CLS_REQUEST_CLOUD_ITEM);
+        Class<?> baseCls = clazz(baseBinding, cl, CLS_REQUEST_ITEM_BASE);
 
-        fDbCloud = itemCls.getField("dbCloud");
-        fPriority = baseCls.getField("priority");
+        fDbCloud = field(itemBinding, itemCls, "dbCloud");
+        fPriority = field(baseBinding, baseCls, "priority");
         // 从 dbCloud 字段的声明类型上取方法，不要按名字猜类名：4.3.1.6 里
         // com.miui.gallery.data.local.DBItem 只是一个带 getId() 的接口，
         // getLocalFile/getSize 这些方法全在 DBImage 上，猜错就整条链路放行
@@ -44,16 +62,49 @@ public final class CloudItemReader {
         mIsVideoType = dbCls.getMethod("isVideoType");
         mGetMixedDateTime = dbCls.getMethod("getMixedDateTime");
         mGetSha1 = dbCls.getMethod("getSha1");
-        Logger.i("event=reader_ready dbClass=" + dbCls.getName());
+        Logger.i("event=reader_ready dbClass=" + dbCls.getName()
+                + " profile=" + Profiles.profileName(cl));
     }
 
     public static CloudItemReader create(ClassLoader cl) {
         try {
             return new CloudItemReader(cl);
         } catch (Throwable t) {
+            // 类名/字段对不上时这是唯一线索：把缺了什么写进 missing=，别只留一行堆栈
+            Logger.w("event=reader_binding_missing profile=" + Profiles.profileName(cl)
+                    + " missing=" + describe(t));
             Logger.e("event=reader_init_failed", t);
             return null;
         }
+    }
+
+    /** 档案里声明了这个类就用它解析到的 Class，否则回落写死的类名（拿不到就抛给调用点） */
+    private static Class<?> clazz(Binding binding, ClassLoader cl, String hardcodedName)
+            throws Exception {
+        if (binding != null && binding.clazz() != null) {
+            return binding.clazz();
+        }
+        return cl.loadClass(hardcodedName);
+    }
+
+    /** 档案里的字段优先，取不到再按写死的字段名查一次 */
+    private static Field field(Binding binding, Class<?> cls, String name) throws Exception {
+        if (binding != null) {
+            Field declared = binding.field(name);
+            if (declared != null) {
+                return declared;
+            }
+        }
+        return cls.getField(name);
+    }
+
+    /** 失败原因：异常自带的信息（类名/字段名）比类名本身有用，没有就退回异常类型 */
+    private static String describe(Throwable t) {
+        String message = t.getMessage();
+        if (message == null || message.trim().isEmpty()) {
+            return t.getClass().getSimpleName();
+        }
+        return message;
     }
 
     public static boolean isBackupPriority(int priority) {

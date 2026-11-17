@@ -16,6 +16,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -1617,6 +1618,11 @@ public final class WebDavClient {
 
         Res prop = propfind(remotePath, 0);
         if (prop == null) {
+            // 问不出来（不支持 PROPFIND，或超时重试一次后仍超时）：这是"判不了"，不是"没有"。
+            // 调用方（UploadQueue.remoteExists 的兜底分支）拿到 0 不会跳过，会照常 PUT；
+            // PUT 打到的是**同一条解析好的路径**，语义是覆盖写，幂等 —— 不会留下第二个对象。
+            // 所以这里不需要（也不该）把"判不了"升级成失败，那只会让整次上传卡住。
+            Logger.d("event=remote_probe_unknown action=proceed remote=" + remotePath);
             return 0L;
         }
         if (prop.code == 207 && prop.bodyComplete && hasCompleteMultistatus(prop.body)) {
@@ -1730,6 +1736,21 @@ public final class WebDavClient {
      * @return 列目录里查到的大小；列表里也没有才是 {@code -1}；问不出来为 {@code 0}
      */
     private long notFoundUnlessListed(String remotePath) {
+        // 先用 Depth:0 只问这一个对象。列父目录是 Depth:1，在 OpenList+S3 的大目录上
+        // 一次要几秒到几十秒，而这里只想知道"这个文件在不在"。
+        long exact;
+        try {
+            exact = propfindSize(remotePath);
+        } catch (IOException e) {
+            exact = -2L;
+        }
+        if (exact > 0L) {
+            return exact;
+        }
+        if (exact == -1L) {
+            return -1L;
+        }
+        Logger.d("event=probe_fallback_list remote=" + remotePath);
         long listed = listedSize(remotePath);
         if (listed == LIST_UNKNOWN) {
             // 问不出来 → 说"有，但不知道多大"，把"不存在"这个结论留待下次
@@ -2054,25 +2075,43 @@ public final class WebDavClient {
         String target = url.getFile().isEmpty() ? "/" : url.getFile();
         long length = sizeOf(file, body);
         // 复用来的连接可能刚好被服务器关掉：这是常态不是故障，换一条新的重试一次就好。
-        // 新连接上的失败不重试 —— 那说明目标确实有问题，重试只是把同一个错再犯一遍，
+        // 新连接上的失败默认不重试 —— 那说明目标确实有问题，重试只是把同一个错再犯一遍，
         // 大文件还要再付一遍上传流量。
+        //
+        // 元数据请求是唯一的例外，它的读超时已经放宽到 90 秒（见 WebDavTimeoutPolicy），
+        // 但"慢后端"仍可能更慢：真机上就是 PROPFIND 读超时 → conn_reopen → 再超时 →
+        // propfind_failed，上传卡在 upload_begin 之后。所以元数据请求撞到
+        // SocketTimeoutException 时，换一条**新连接**再试一次，两次都超才判失败；
+        // 流式请求（PUT）不在此列，重试等于整份上行再烧一遍。
         boolean reused = mSocket != null;
-        try {
-            return exchange(method, host, port, target, file, body, length, readBody, depth,
-                    bodyCap, destination, overwrite);
-        } catch (IOException e) {
-            dropConnection();
-            if (!reused) {
+        int failedAttempts = 0;
+        while (true) {
+            try {
+                return exchange(method, host, port, target, file, body, length, readBody, depth,
+                        bodyCap, destination, overwrite);
+            } catch (IOException e) {
+                dropConnection();
+                failedAttempts++;
+                if (e instanceof SocketTimeoutException
+                        && WebDavTimeoutPolicy.shouldRetryAfterTimeout(method, failedAttempts)) {
+                    Logger.w("event=meta_retry method=" + method + " attempt=" + failedAttempts
+                            + " timeout_ms=" + WebDavTimeoutPolicy.META_READ_TIMEOUT_MS);
+                    reused = false;
+                    continue;
+                }
+                if (e instanceof SocketTimeoutException
+                        && WebDavTimeoutPolicy.isMetadataMethod(method)) {
+                    Logger.w("event=meta_timeout method=" + method
+                            + " attempts=" + failedAttempts);
+                    throw transportFailure(method, host, e);
+                }
+                if (reused && failedAttempts == 1) {
+                    Logger.d("event=conn_reopen method=" + method + " reason=" + e.getMessage());
+                    reused = false;
+                    continue;
+                }
                 throw transportFailure(method, host, e);
             }
-            Logger.d("event=conn_reopen method=" + method + " reason=" + e.getMessage());
-        }
-        try {
-            return exchange(method, host, port, target, file, body, length, readBody, depth,
-                    bodyCap, destination, overwrite);
-        } catch (IOException e) {
-            dropConnection();
-            throw transportFailure(method, host, e);
         }
     }
 
@@ -2128,7 +2167,7 @@ public final class WebDavClient {
             String destination, String overwrite)
             throws IOException {
         Socket socket = connect(host, port);
-        socket.setSoTimeout(readTimeoutFor(length));
+        socket.setSoTimeout(readTimeoutFor(method, length));
         try {
             OutputStream out = mOut;
             byte[] headBytes = requestHead(method, host, port, target, file, body, length,
@@ -2151,15 +2190,20 @@ public final class WebDavClient {
     }
 
     /**
-     * 读超时按请求体上浮。
+     * 读超时选择。
      *
-     * <p>小文件用短超时：连接被掐时能早点知道，不至于每个失败都干等两分钟。
-     * 大文件必须给足时间 —— 服务器往往要先把整个请求体收完、落盘，才肯回响应，
-     * 一个 600MB 的视频几十秒根本不够。
+     * <p><b>流式请求（PUT）</b>按请求体上浮：小文件用短超时，连接被掐时能早点知道，
+     * 不至于每个失败都干等两分钟；大文件必须给足时间 —— 服务器往往要先把整个请求体收完、
+     * 落盘，才肯回响应，一个 600MB 的视频几十秒根本不够。
+     *
+     * <p><b>元数据请求（PROPFIND/HEAD/MKCOL/DELETE/OPTIONS…）</b>走固定 90 秒：
+     * 它们的请求体只有几百字节，等的是"慢后端算元数据"，照搬流式的按字节算完全对不上
+     * 真实耗时（PC 实测同服务器 PROPFIND 冷启动 6.8 秒，而这里按字节算只有 30 秒）。
+     * 判定与重试规则见 {@link WebDavTimeoutPolicy}。
      */
-    private static int readTimeoutFor(long bodyLength) {
-        long allowance = READ_TIMEOUT_BASE + bodyLength / READ_TIMEOUT_PER_BYTE_MS;
-        return (int) Math.min(allowance, READ_TIMEOUT_MAX);
+    private static int readTimeoutFor(String method, long bodyLength) {
+        return WebDavTimeoutPolicy.readTimeoutMs(method, bodyLength,
+                READ_TIMEOUT_BASE, READ_TIMEOUT_PER_BYTE_MS, READ_TIMEOUT_MAX);
     }
 
     private Res readResponse(String method, boolean readBody) throws IOException {

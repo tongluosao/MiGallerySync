@@ -5,11 +5,15 @@ import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
 
+import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.core.OriginalStore;
+import com.tongluosao.gallerysync.core.PreviewStateRules;
 
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 空间优化的候选照片清单：模块自己那条优化队列从哪来。
@@ -22,17 +26,17 @@ import java.util.List;
  * 也不要收进不该动的行：真正的安全校验（远端原件是否验证过、格式、体积、租约）在后面
  * {@code SlimHook.runSlim} 里逐项再做一遍，这里只是决定"要不要试"。
  *
- * <p>条件与理由：
+ * <p>第 3 波起筛选分两层：SQL 只做粗筛，状态由注册表在 Java 侧判。
  * <ul>
- *   <li>{@code localFile} 在 {@code /storage/emulated/0/} 下：只优化本机真实存在的照片，
- *       镜像目录与回收站都不碰。</li>
- *   <li>不含 {@code /.gallerysync-slim/}：那里面已经是优化副本，再优化就是套娃。</li>
- *   <li>{@code serverType IN (1,2)}：只处理图片与视频，跳过未知行。</li>
- *   <li>{@code localFlag = 7}：相册自己的"仅本地、未同步"状态；其余状态说明这张照片
- *       还有别的流程在动它。</li>
- *   <li>{@code size > 128 KiB}：几百 KB 以下的照片压不出多少空间，失败的编码尝试
- *       只会白烧 CPU。</li>
- *   <li>{@code sha1} 长度 40：没有摘要就没法跟远端原件对账，直接跳过。</li>
+ *   <li>SQL 侧（粗筛）：{@code localFile} 是本机真实路径、不在 {@code .gallerysync-slim}
+ *       镜像目录里、图片/视频、仅本地未同步、体积够大、有 sha1。原来那条
+ *       "{@code thumbnailFile} 在隐藏目录里就排除"的条件已经去掉：原地覆盖之后
+ *       {@code localFile} 是原路径、{@code thumbnailFile} 为空，这两列根本分不出
+ *       "已经优化过"和"还没优化"，继续按列猜只会把该跳过的行放进队列。</li>
+ *   <li>Java 侧（精确过滤）：按 {@code _id} / {@code sha1} 查注册表登记的
+ *       {@link OriginalStore.LocalState}，用 {@link PreviewStateRules#skipSlimCandidate}
+ *       跳过已经优化（原地 / 侧车）、写入中途和损坏的行。没有登记记录的行照常进候选，
+ *       交给 {@code SlimHook} 的安全闸门判。</li>
  * </ul>
  */
 public final class SlimCandidates {
@@ -46,7 +50,7 @@ public final class SlimCandidates {
     /** 小于这个体积的照片优化收益太低，直接排除。 */
     private static final long MIN_SIZE = 128L * 1024L;
 
-    private static final String[] PROJECTION = {"_id"};
+    private static final String[] PROJECTION = {"_id", "sha1"};
 
     private SlimCandidates() {
     }
@@ -56,8 +60,11 @@ public final class SlimCandidates {
      *
      * <p>查询失败返回空表而不是抛异常：调用方（命令广播、界面）只能显示"没有可优化的照片"，
      * 让它自己异常退出只会把相册进程的接收线程带下去。
+     *
+     * @param store 注册表；为 null 时退化为只做 SQL 粗筛（旧行为），不因取不到注册表就不优化
+     * @param config 当前远端目标；为 null 时同样不做状态过滤
      */
-    public static List<Long> collect(Context context) {
+    public static List<Long> collect(Context context, Config config, OriginalStore store) {
         if (context == null) {
             return Collections.emptyList();
         }
@@ -65,12 +72,15 @@ public final class SlimCandidates {
         if (resolver == null) {
             return Collections.emptyList();
         }
+        Map<String, OriginalStore.LocalState> states = stateIndex(config, store);
         List<Long> ids = new ArrayList<>();
+        int skippedByState = 0;
+        // 细筛只去掉了"thumbnailFile 在隐藏目录就排除"这个硬编码假设：
+        // 镜像目录本身仍然不碰（localFile 落在 .gallerysync-slim 里的行是下载镜像，不是相册原件）。
         String where = "localFile IS NOT NULL"
                 + " AND localFile <> ''"
                 + " AND localFile LIKE '/storage/emulated/0/%'"
                 + " AND localFile NOT LIKE '%/.gallerysync-slim/%'"
-                + " AND (thumbnailFile IS NULL OR thumbnailFile NOT LIKE '%/.gallerysync-slim/%')"
                 + " AND serverType IN (1,2)"
                 + " AND localFlag = 7"
                 + " AND size > " + MIN_SIZE
@@ -87,14 +97,48 @@ public final class SlimCandidates {
                 Logger.w("event=slim_candidates_empty reason=no_id_column");
                 return Collections.emptyList();
             }
+            int sha1Index = cursor.getColumnIndex("sha1");
             while (cursor.moveToNext() && ids.size() < MAX_CANDIDATES) {
-                ids.add(cursor.getLong(index));
+                long id = cursor.getLong(index);
+                String sha1 = sha1Index < 0 || cursor.isNull(sha1Index)
+                        ? null : cursor.getString(sha1Index);
+                OriginalStore.LocalState state =
+                        OriginalStore.stateForRow(states, Long.toString(id), sha1);
+                if (PreviewStateRules.skipSlimCandidate(state)) {
+                    skippedByState++;
+                    Logger.d("event=slim_candidate_skipped row=" + id
+                            + " state=" + state.wire()
+                            + " desc=" + PreviewStateRules.describe(state));
+                    continue;
+                }
+                ids.add(id);
             }
         } catch (Throwable t) {
             Logger.w("event=slim_candidates_failed detail=" + t, t);
             return Collections.emptyList();
         }
-        Logger.i("event=slim_candidates_collected count=" + ids.size());
+        Logger.i("event=slim_candidates_collected count=" + ids.size()
+                + " skipped_by_state=" + skippedByState);
         return ids;
+    }
+
+    /**
+     * 一次建好的 rowId/sha1 -> 本地状态快照。
+     *
+     * <p>必须一次建表：候选最多 2 万条、注册表上限 10 万条，逐条 {@code find()} 是
+     * O(候选 x 登记) 的全表扫描。注册表不可用时返回空表（照旧只做 SQL 粗筛），
+     * 不能因为查不到状态就把整批候选丢掉。
+     */
+    private static Map<String, OriginalStore.LocalState> stateIndex(Config config,
+            OriginalStore store) {
+        if (config == null || store == null) {
+            return Collections.emptyMap();
+        }
+        try {
+            return store.localStateIndex(config);
+        } catch (Throwable t) {
+            Logger.w("event=slim_candidate_state_index_failed detail=" + t);
+            return Collections.emptyMap();
+        }
     }
 }

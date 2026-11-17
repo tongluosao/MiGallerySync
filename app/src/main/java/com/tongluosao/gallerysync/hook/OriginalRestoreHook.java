@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
+import com.tongluosao.gallerysync.core.PreviewStateRules;
 import com.tongluosao.gallerysync.core.VideoCacheRetryPolicy;
 import com.tongluosao.gallerysync.core.VideoPlayCache;
 import com.tongluosao.gallerysync.core.VideoStreamPolicy;
@@ -1019,11 +1020,33 @@ final class OriginalRestoreHook {
                 setField(video, "mPreviewManager", previewManager);
             }
             initGalleryState.invoke(previewManager, Boolean.TRUE);
+            startPlaybackAfterPrepare(playback, url);
             return true;
         } catch (Throwable t) {
             Logger.w("event=managed_video_gallery_state_failed row="
                     + playback.record.rowId, t);
             return false;
+        }
+    }
+
+    /**
+     * Native {@code handleOnlineRequest} does two things: create the gallery player state, then ask
+     * {@code VideoPlayManager.doPlayDifferentVideo} to start it. Our interception replaced both, so
+     * only the state was created and the user had to tap play again. This replays the second step so
+     * a single tap starts playback; a failure here only costs that convenience, not the state.
+     */
+    private void startPlaybackAfterPrepare(VideoPlaybackRequest playback, String url) {
+        Method play = mPlayDifferentVideoMethod;
+        if (play == null || playback.playManager == null || playback.item == null) {
+            Logger.w("event=managed_video_play_request_skipped row=" + playback.record.rowId);
+            return;
+        }
+        try {
+            play.invoke(playback.playManager, playback.item, url, null, null, null, null);
+            Logger.i("event=managed_video_play_requested row=" + playback.record.rowId);
+        } catch (Throwable t) {
+            Logger.w("event=managed_video_play_request_failed row="
+                    + playback.record.rowId, t);
         }
     }
 
@@ -1147,7 +1170,7 @@ final class OriginalRestoreHook {
                             OriginalStore.Record record = recordForItem(dataItem, store, mConfig);
                             if (record == null || record.originalLength <= 0
                                     || Boolean.TRUE.equals(optionalCall(dataItem, "isBurstItem"))
-                                    || !localBytesNeedRestore(dataItem, store, record)) {
+                                    || !localBytesNeedRestore(dataItem, record)) {
                                 return chain.proceed();
                             }
                             Context context = HostContext.get(mLoader);
@@ -1299,9 +1322,11 @@ final class OriginalRestoreHook {
     /**
      * “下载原图”只在本地确实缺少完整原图时出现。
      *
-     * <p>旧判据只是“该 item 在注册表里有记录”，但上传成功就会登记，因此从未优化过的普通照片
-     * （本地文件就是完整原图）也满足条件，菜单与标题会错误地显示原图大小。
-     * 现在记录之后再加一道 {@link #localBytesNeedRestore} 物理判定：本地已有完整原图 → 不显示。
+     * <p>第 3 波把判据从“路径/长度/派生副本”换成注册表登记的本地状态：
+     * {@link PreviewStateRules#needsOriginalRestore}。旧判据只是“该 item 在注册表里有记录”，
+     * 上传成功就会登记，于是从未优化过的普通照片（本地就是完整原图）也显示了菜单；
+     * {@code ORIGINAL} 且长度一致时必须不显示。四个预览类状态（原地预览 / 写入中途 /
+     * 侧车预览 / 损坏）一律显示。
      */
     private boolean restorableItem(Object item) {
         if (!mOriginHookReady || !mImageLoaderHookReady || item == null) return false;
@@ -1310,7 +1335,14 @@ final class OriginalRestoreHook {
         OriginalStore store = store();
         try {
             OriginalStore.Record record = recordForItem(item, store, config);
-            return record != null && localBytesNeedRestore(item, store, record);
+            if (record == null) return false;
+            boolean show = localBytesNeedRestore(item, record);
+            // 每次菜单可见性询问都记一行：排查“为什么没优化也显示下载原图”时只需看这一条。
+            Logger.d("event=download_original_menu row=" + record.rowId
+                    + " state=" + record.getLocalState().wire()
+                    + " desc=" + PreviewStateRules.describe(record.getLocalState())
+                    + " show=" + show);
+            return show;
         } catch (Throwable t) {
             Logger.d("event=managed_original_lookup_failed detail=" + t);
             return false;
@@ -1318,22 +1350,23 @@ final class OriginalRestoreHook {
     }
 
     /**
-     * item 的任一本机候选路径本身就是完整原图（存在、不是登记过的派生副本、长度等于登记原图
-     * 长度）→ 不需要恢复。空间优化成功后 Gallery 会把 thumbnailFile 指向 .gallerysync-slim
-     * 副本、localFile 清空，所以原图路径缺失、缩略图路径是登记副本，两者都判成“需要恢复”。
+     * 该 item 是否还需要恢复完整原图：按注册表状态判，不再猜“路径是不是在隐藏目录里”。
      *
-     * <p>只做路径与长度判定（{@link OriginalStore#isRegisteredDerivedPath} 不哈希），主线程安全。
+     * <p>状态不是 {@code ORIGINAL} 时结论与本地长度无关（本地那份文件本来就不是原图），
+     * 直接返回，连路径探测都省掉；{@code ORIGINAL} 时取 {@code localFile} 对应当前本地长度，
+     * 长度一致（或长度未知）就不显示。只做路径与长度判定，不哈希，主线程安全。
      */
-    private boolean localBytesNeedRestore(Object item, OriginalStore store,
-            OriginalStore.Record record) throws Exception {
+    private boolean localBytesNeedRestore(Object item, OriginalStore.Record record) throws Exception {
+        OriginalStore.LocalState state = record.getLocalState();
+        if (PreviewStateRules.needsOriginalRestore(state, 0L, record.originalLength)) {
+            return true;
+        }
         for (String getter : ITEM_LOCAL_PATH_GETTERS) {
             File file = localFileFromPath(optionalStringCall(item, getter));
             if (file == null) continue;
-            boolean exists = file.isFile();
-            boolean derived = exists && store != null
-                    && store.isRegisteredDerivedPath(record, file);
-            if (!OriginalStore.needsOriginalRestore(record.originalLength, record.sha256,
-                    exists, exists ? file.length() : 0L, derived, null)) {
+            long localLength = file.isFile() ? file.length() : 0L;
+            if (!PreviewStateRules.needsOriginalRestore(state, localLength,
+                    record.originalLength)) {
                 return false;
             }
         }

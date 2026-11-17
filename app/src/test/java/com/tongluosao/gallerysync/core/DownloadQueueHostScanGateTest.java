@@ -4,7 +4,9 @@ import org.junit.Test;
 
 import java.io.File;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -62,18 +64,27 @@ public class DownloadQueueHostScanGateTest {
                 "/storage/emulated/0/DCIM/Camera/.gallerysync-slim-old/photo.jpg"));
     }
 
-    @Test public void previewPathForHidesEveryDerivedCopy() {
-        File[] originals = {
+    @Test public void previewPathForOnlyHidesSidecarCopies() {
+        // 第 4 波：原地格式的“副本”就是原路径本身，不产生新的本地文件，
+        // 因此它既不需要隐藏、也不会被当成另一张照片交给宿主扫描（发布后直接改既有行）。
+        File jpeg = new File("/storage/emulated/0/DCIM/Camera/IMG_0002.jpg");
+        assertEquals(jpeg, DownloadQueue.previewPathFor(jpeg, false));
+        File heic = new File("/storage/emulated/0/DCIM/Camera/IMG_0001.HEIC");
+        assertEquals(heic, DownloadQueue.previewPathFor(heic, true));
+        assertTrue(DownloadQueue.hostScanAllowed(jpeg.getAbsolutePath()));
+
+        // 侧车格式仍然藏在隐藏目录里，且一律不许交给宿主扫描器
+        File[] sidecarOriginals = {
                 new File("/storage/emulated/0/DCIM/Camera/IMG_0001.HEIC"),
-                new File("/storage/emulated/0/DCIM/Camera/IMG_0002.jpg"),
+                new File("/storage/emulated/0/DCIM/Camera/IMG_0003.png"),
+                new File("/storage/emulated/0/DCIM/Camera/IMG_0004.webp"),
         };
-        for (File original : originals) {
-            for (boolean preserveHeic : new boolean[]{true, false}) {
-                File preview = DownloadQueue.previewPathFor(original, preserveHeic);
-                assertFalse(preview.getAbsolutePath(),
-                        DownloadQueue.hostScanAllowed(preview.getAbsolutePath()));
-                assertTrue(DownloadQueue.hostScanAllowed(original.getAbsolutePath()));
-            }
+        for (File original : sidecarOriginals) {
+            File preview = DownloadQueue.previewPathFor(original, false);
+            assertNotEquals(original, preview);
+            assertFalse(preview.getAbsolutePath(),
+                    DownloadQueue.hostScanAllowed(preview.getAbsolutePath()));
+            assertTrue(DownloadQueue.hostScanAllowed(original.getAbsolutePath()));
             assertFalse(DownloadQueue.hostScanAllowed(
                     DownloadQueue.videoPosterPathFor(new File(original.getPath() + ".mp4"))
                             .getAbsolutePath()));

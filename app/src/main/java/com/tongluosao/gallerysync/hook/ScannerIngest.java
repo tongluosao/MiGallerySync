@@ -1,5 +1,6 @@
 package com.tongluosao.gallerysync.hook;
 
+import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
@@ -182,8 +183,59 @@ public final class ScannerIngest implements DownloadQueue.Ingest {
         }
     }
 
-    /** 按相册路径找既有云行；0 行（用户已丢进回收站等）或多行时一律返回 null。 */
-    private Integer uniqueRowId(Context context, Set<String> albumCandidates) {
+    /**
+     * 原地覆盖之后的 DB 切换：<b>精确更新既有云行</b>，绝不让扫描器建行。
+     *
+     * <p>与 {@link #adoptPreview} 同一个目的、不同的字段方向：原地模式下原路径上的字节就是这张
+     * 照片的本地表示，所以行要改成 {@code localFile = 原路径}、{@code thumbnailFile = ""}
+     * （缩略图由宿主按原路径自己生成）。adoptPreview 是“本地只有隐藏目录副本”，两个字段刚好相反。
+     *
+     * <p>条件 {@code _id=? AND (sha1=? OR ?='')}：
+     * <ul>
+     *   <li>{@code _id} 是唯一的落点，不靠路径模糊匹配，因此不会误改同一时间新扫描出来的行；</li>
+     *   <li>传入 sha1 时再核一次身份 —— 用户重拍/换图导致行内容变了就一行也不改；</li>
+     *   <li>传空 sha1（下载记录还没绑定 sha1）时退化成只按 _id 更新，第三参数为空串使 OR 恒真。</li>
+     * </ul>
+     * 返回受影响行数 &gt; 0；任何异常、没有宿主 Context、行不存在都返回 false，让调用方把这次
+     * 原地覆盖判失败并回落到整份下载原图。
+     */
+    @Override
+    public boolean updateExistingRow(File dest, long rowId, String sha1,
+            String thumbnailFileOrEmpty) {
+        if (dest == null || rowId <= 0L) {
+            Logger.w("event=download_row_update_failed reason=missing_row_or_path row=" + rowId);
+            return false;
+        }
+        Context context = HostContext.get(mLoader);
+        if (context == null) {
+            Logger.w("event=download_row_update_failed reason=no_host_context row=" + rowId);
+            return false;
+        }
+        String identity = sha1 == null ? "" : sha1.trim();
+        try {
+            ContentValues values = new ContentValues();
+            values.put("localFile", dest.getAbsolutePath());
+            values.put("thumbnailFile",
+                    thumbnailFileOrEmpty == null ? "" : thumbnailFileOrEmpty);
+            int updated = context.getContentResolver().update(CLOUD_URI, values,
+                    "_id = ? AND (sha1 = ? OR ? = '')",
+                    new String[]{String.valueOf(rowId), identity, identity});
+            if (updated > 0) {
+                Logger.i("event=download_row_updated row=" + rowId + " rows=" + updated
+                        + " local=" + dest.getAbsolutePath()
+                        + " thumbnail=" + (thumbnailFileOrEmpty == null ? "" : thumbnailFileOrEmpty));
+                return true;
+            }
+            Logger.w("event=download_row_update_failed reason=no_row_updated row=" + rowId
+                    + " sha1_present=" + !identity.isEmpty());
+            return false;
+        } catch (Throwable t) {
+            Logger.w("event=download_row_update_failed row=" + rowId, t);
+            return false;
+        }
+    }
+
+    /** 按相册路径找既有云行；0 行（用户已丢进回收站等）或多行时一律返回 null。 */    private Integer uniqueRowId(Context context, Set<String> albumCandidates) {
         Set<Integer> rows = new LinkedHashSet<>();
         boolean ambiguous = false;
         for (String candidate : albumCandidates) {

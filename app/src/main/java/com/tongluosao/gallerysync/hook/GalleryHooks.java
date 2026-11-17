@@ -20,6 +20,7 @@ import com.tongluosao.gallerysync.core.SyncMarker;
 import com.tongluosao.gallerysync.core.TrashQueue;
 import com.tongluosao.gallerysync.core.UploadQueue;
 import com.tongluosao.gallerysync.core.WebDavClient;
+import com.tongluosao.gallerysync.hook.gallery.Profiles;
 
 import io.github.libxposed.api.XposedInterface;
 
@@ -40,6 +41,11 @@ public final class GalleryHooks {
     /** 模块自驱优化队列的默认并发路数；界面可覆盖，最终由 {@code SlimWorker} 夹到 1..4 */
     private static final int DEFAULT_SLIM_CONCURRENCY = 4;
 
+    /**
+     * 下面这些都是<b>新版（4.3.x）</b>的类名：旧版 3.6.2.10 把同名类放在
+     * {@code com.miui.gallery.cloud.*} 下。真正的查找走 {@link #requireClass}：
+     * 当前版本档案优先，档案缺失时才回落到这里 —— 手机上两者是同一个类，行为逐字不变。
+     */
     private static final String CLS_UP_DOWNLOAD_MANAGER = "com.miui.gallery.cloud.UpDownloadManager";
     private static final String CLS_GALLERY_APP = "com.miui.gallery.GalleryApp";
     private static final String CLS_SFS_TRANSFER_MANAGER =
@@ -97,6 +103,7 @@ public final class GalleryHooks {
     }
 
     public static GalleryHooks install(XposedInterface xposed, ClassLoader classLoader) {
+        logCapabilityReport(classLoader);
         GalleryHooks hooks = new GalleryHooks(xposed, classLoader);
         hooks.installInvokeListHook();
         hooks.installUploadOutletHook();
@@ -108,6 +115,34 @@ public final class GalleryHooks {
         hooks.installSlimHook();
         hooks.installNativeDownloadHook();
         return hooks;
+    }
+
+    /**
+     * 启动自检：一行 {@code capability_report} 说清这次装到的是哪个相册版本（G2026/G2024/none）、
+     * 缺了哪些必需成员。只看声明，不实例化能力，所以不影响任何业务分支。
+     *
+     * <p>用宿主 ClassLoader 探测（{@link Profiles#registry}）；探测失败也只记一行 warn，
+     * 版本识别不出来不该挡住装 Hook。
+     */
+    private static void logCapabilityReport(ClassLoader classLoader) {
+        try {
+            Profiles.registry(classLoader).logReport();
+        } catch (Throwable t) {
+            Logger.w("event=capability_report_failed", t);
+        }
+    }
+
+    /**
+     * 类查找：当前版本档案优先、写死的（新版）类名回落。
+     * 两处都没有就抛 {@link ClassNotFoundException}，让各个 install 方法照旧打 {@code class_not_found}。
+     */
+    private static Class<?> requireClass(ClassLoader classLoader, String hardcodedName)
+            throws ClassNotFoundException {
+        Class<?> clazz = Profiles.resolveClass(classLoader, hardcodedName);
+        if (clazz == null) {
+            throw new ClassNotFoundException(hardcodedName);
+        }
+        return clazz;
     }
 
     /**
@@ -164,7 +199,7 @@ public final class GalleryHooks {
 
     private void installInvokeListHook() {
         try {
-            Class<?> manager = mClassLoader.loadClass(CLS_UP_DOWNLOAD_MANAGER);
+            Class<?> manager = requireClass(mClassLoader, CLS_UP_DOWNLOAD_MANAGER);
             Method invokeList = manager.getDeclaredMethod("invokeList", List.class, boolean.class);
             invokeList.setAccessible(true);
             mXposed.hook(invokeList)
@@ -200,11 +235,11 @@ public final class GalleryHooks {
 
     private void installUploadOutletHook() {
         try {
-            Class<?> manager = mClassLoader.loadClass(CLS_SFS_TRANSFER_MANAGER);
-            Class<?> itemCls = mClassLoader.loadClass(CLS_REQUEST_CLOUD_ITEM);
-            Class<?> descCls = mClassLoader.loadClass(CLS_UPLOAD_DESCRIPTOR);
-            Class<?> ctrlCls = mClassLoader.loadClass(CLS_UPLOAD_CONTROLLER);
-            Class<?> listenerCls = mClassLoader.loadClass(CLS_PROGRESS_LISTENER);
+            Class<?> manager = requireClass(mClassLoader, CLS_SFS_TRANSFER_MANAGER);
+            Class<?> itemCls = requireClass(mClassLoader, CLS_REQUEST_CLOUD_ITEM);
+            Class<?> descCls = requireClass(mClassLoader, CLS_UPLOAD_DESCRIPTOR);
+            Class<?> ctrlCls = requireClass(mClassLoader, CLS_UPLOAD_CONTROLLER);
+            Class<?> listenerCls = requireClass(mClassLoader, CLS_PROGRESS_LISTENER);
             Method doUpload = manager.getDeclaredMethod(
                     "doUpload", itemCls, descCls, ctrlCls, listenerCls);
             doUpload.setAccessible(true);
@@ -289,7 +324,7 @@ public final class GalleryHooks {
      */
     private void installAppStartHook() {
         try {
-            Class<?> appCls = mClassLoader.loadClass(CLS_GALLERY_APP);
+            Class<?> appCls = requireClass(mClassLoader, CLS_GALLERY_APP);
             Method onCreate = appCls.getDeclaredMethod("onCreate");
             onCreate.setAccessible(true);
             mXposed.hook(onCreate)
@@ -386,7 +421,7 @@ public final class GalleryHooks {
      */
     private void installDirtyCountHook() {
         try {
-            Class<?> infoCls = mClassLoader.loadClass(CLS_SYNC_STATE_INFO);
+            Class<?> infoCls = requireClass(mClassLoader, CLS_SYNC_STATE_INFO);
             Method getDirtyCount = infoCls.getDeclaredMethod("getDirtyCount");
             getDirtyCount.setAccessible(true);
             mXposed.hook(getDirtyCount)
@@ -908,7 +943,15 @@ public final class GalleryHooks {
             Logger.w("event=slim_start_skipped reason=no_ready_context");
             return;
         }
-        List<Long> candidates = SlimCandidates.collect(context);
+        List<Long> candidates;
+        try {
+            // 第 3 波：候选的精确过滤在 Java 侧按注册表状态判，SQL 只做粗筛（见 SlimCandidates）。
+            candidates = SlimCandidates.collect(context, config,
+                    OriginalStore.get(context.getApplicationContext()));
+        } catch (Throwable t) {
+            Logger.w("event=slim_start_skipped reason=registry_unavailable", t);
+            return;
+        }
         if (candidates.isEmpty()) {
             Logger.i("event=slim_start_skipped reason=no_candidates");
             return;
