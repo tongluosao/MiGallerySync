@@ -20,6 +20,8 @@ import java.util.Locale;
 public final class VideoPlayCache {
 
     private static final String DIR_NAME = "video-play";
+    /** 渐进下载中的临时文件后缀：中继直接读它，实现边下边播。 */
+    public static final String PART_SUFFIX = ".part";
     private static final String DEFAULT_EXTENSION = ".mp4";
     private static final String FALLBACK_NAME = "video";
     private static final int MAX_NAME_LENGTH = 96;
@@ -49,6 +51,11 @@ public final class VideoPlayCache {
         if (budget > 0 && stem.length() > budget) stem = stem.substring(0, budget);
         if (stem.isEmpty()) stem = FALLBACK_NAME;
         return new File(dir(context), stem + extension);
+    }
+
+    /** 渐进下载中的临时文件：{@link #fileFor} 的路径加 {@code .part}。 */
+    public static File partFileFor(Context context, OriginalStore.Record record) {
+        return new File(fileFor(context, record).getPath() + PART_SUFFIX);
     }
 
     /** 只有长度也完全一致才算命中，半截文件一律重新下载。 */

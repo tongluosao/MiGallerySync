@@ -510,6 +510,32 @@ class SettingsModel : CoroutineScope {
     }
 
     companion object {
+        /**
+         * 设置页每一个可交互项的稳定 id（= 落盘键，顺序即界面顺序）。
+         *
+         * <p>这里只列**已有**的键：用来核对分组没漏项也没重项（见 SettingsSectionsTest），
+         * 不新增任何存储语义，也不改变读写方式。测试连接与重置上传标记是纯界面按钮、
+         * 没有配置可写，故不在本表内 —— 它们列在 [UI_ONLY_IDS] 里。
+         */
+        val ALL_SETTING_KEYS: List<String> = listOf(
+            Config.KEY_BASE_URL,
+            Config.KEY_USERNAME,
+            Config.KEY_PASSWORD,
+            Config.KEY_REMOTE_ROOT,
+            Config.KEY_REPLACE_MODE,
+            Config.KEY_WIFI_ONLY,
+            Config.KEY_REMOTE_LAYOUT,
+            Config.KEY_VERIFY_ASYNC,
+            Config.KEY_SKIP_EXISTING_REMOTE,
+            Config.KEY_UPLOAD_CONCURRENCY,
+            Config.KEY_MAX_UPLOAD_BYTES,
+            Config.KEY_PRESERVE_METADATA,
+            Config.KEY_PRESERVE_HEIC_FORMAT,
+            Config.KEY_LOCAL_FLAG_MODE,
+            Config.KEY_UI_MASK,
+            KEY_THEME_MODE
+        )
+
         /** 备份模式的落盘值，顺序必须与界面选项一致 */
         val MODE_VALUES = listOf(Config.MODE_REPLACE, Config.MODE_MIRROR, Config.MODE_OFF)
 

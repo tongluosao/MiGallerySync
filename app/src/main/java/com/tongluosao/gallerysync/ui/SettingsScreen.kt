@@ -57,6 +57,9 @@ import top.yukonga.miuix.kmp.window.WindowDialog
 /**
  * 设置页的滚动区。主题控制器、顶栏与底栏都由 [MainScreen] 持有，
  * 本页只负责列表本身，切页时才不会连底栏一起重建。
+ *
+ * <p>分组、每组包含哪些项、先排哪一组，全部来自 [SECTIONS]（见 SettingsSections.kt）：
+ * 这里只按数据渲染，不再另写一份顺序，否则加一项就得改两处。
  */
 @Composable
 fun SettingsContent(
@@ -92,27 +95,15 @@ fun SettingsContent(
             }
         }
 
-        item(key = "section_webdav") {
-            SettingsSection(stringResource(R.string.section_webdav)) {
-                WebDavSection(model)
+        SECTIONS.forEach { section ->
+            // 一个项都没有的组连标题一起省掉，免得列表里挂一个空标题
+            if (section.items.isEmpty()) {
+                return@forEach
             }
-        }
-
-        item(key = "section_behavior") {
-            SettingsSection(stringResource(R.string.section_behavior)) {
-                BehaviorSection(model)
-            }
-        }
-
-        item(key = "section_maintenance") {
-            SettingsSection(stringResource(R.string.section_maintenance)) {
-                MaintenanceSection(model)
-            }
-        }
-
-        item(key = "section_appearance") {
-            SettingsSection(stringResource(R.string.section_appearance)) {
-                AppearanceSection(model)
+            item(key = "section_" + section.name) {
+                SettingsSection(section.title) {
+                    SectionContent(section, model)
+                }
             }
         }
     }
@@ -127,74 +118,258 @@ private fun SettingsSection(title: String, content: @Composable () -> Unit) {
     }
 }
 
+/**
+ * 一组的正文。顺序完全按 [SettingsSection.items] 走（见 [runsOf]），相邻的卡片项并成一张卡：
+ * 想让某个开关排在按钮前面，改数据就行，不必改这里。
+ */
 @Composable
-private fun WebDavSection(model: SettingsModel) {
+private fun SectionContent(section: SettingsSection, model: SettingsModel) {
     val focusManager = LocalFocusManager.current
     Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
-        Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
-            SettingsField(
-                value = model.baseUrl,
-                onValueChange = model::onBaseUrlChange,
-                label = stringResource(R.string.hint_base_url),
-                keyboardType = KeyboardType.Uri,
-                imeAction = ImeAction.Next,
-                focusManager = focusManager
-            )
-            HintLine(stringResource(R.string.summary_base_url))
-        }
-        SettingsField(
-            value = model.username,
-            onValueChange = model::onUsernameChange,
-            label = stringResource(R.string.hint_username),
-            keyboardType = KeyboardType.Text,
-            imeAction = ImeAction.Next,
-            focusManager = focusManager
-        )
-        Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
-            SettingsField(
-                value = model.password,
-                onValueChange = model::onPasswordChange,
-                label = stringResource(R.string.hint_password),
-                keyboardType = KeyboardType.Password,
-                imeAction = ImeAction.Next,
-                focusManager = focusManager,
-                masked = true
-            )
-            HintLine(stringResource(R.string.summary_password))
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
-            SettingsField(
-                value = model.remoteRoot,
-                onValueChange = model::onRemoteRootChange,
-                label = stringResource(R.string.hint_remote_root),
-                keyboardType = KeyboardType.Text,
-                imeAction = ImeAction.Done,
-                focusManager = focusManager
-            )
-            HintLine(stringResource(R.string.summary_remote_root))
-        }
-        Row(
-            modifier = Modifier.padding(horizontal = ScreenMargin),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(BlockGap)
-        ) {
-            Button(
-                onClick = {
-                    // 先收键盘再测，否则"连接成功/失败"那行结果会被输入法盖住
-                    focusManager.clearFocus()
-                    model.testConnection()
-                },
-                enabled = model.testState !is TestState.Running,
-                minWidth = 96.dp,
-                colors = ButtonDefaults.buttonColorsPrimary(
-                    // 默认禁用态是白字压在浅蓝底上，测试期间那几百毫秒几乎看不清
-                    disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                )
-            ) {
-                Text(text = stringResource(R.string.action_test))
+        runsOf(section).forEach { run ->
+            when (run.kind) {
+                ItemKind.FIELD -> run.ids.forEach { FieldItem(it, model, focusManager) }
+                ItemKind.ACTION -> run.ids.forEach { ActionItem(it, model) }
+                ItemKind.PREFERENCE -> PreferenceCard(run.ids, model)
             }
-            TestResultText(model.testState)
         }
+        // 替换模式的后果比其它开关重：云端查看与释放空间会失效，提示挂在卡片外面，
+        // 免得被当成卡片里又一行无害的说明
+        if (model.isReplaceMode && section.items.contains(SettingId.REPLACE_MODE)) {
+            HintLine(stringResource(R.string.warn_replace_mode), error = true)
+        }
+    }
+}
+
+/** 一组相邻的 Preference 共用一张卡片，与分组前的观感一致 */
+@Composable
+private fun PreferenceCard(ids: List<String>, model: SettingsModel) {
+    Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
+        ids.forEach { PrefItem(it, model) }
+    }
+}
+
+/** 一个输入项的全部参数：值、回调、标签、提示语与键盘行为 */
+private class FieldSpec(
+    val value: String,
+    val onChange: (String) -> Unit,
+    val label: Int,
+    val hint: Int?,
+    val keyboardType: KeyboardType,
+    val imeAction: ImeAction,
+    val masked: Boolean = false
+)
+
+private fun fieldSpec(id: String, model: SettingsModel): FieldSpec = when (id) {
+    SettingId.BASE_URL -> FieldSpec(
+        value = model.baseUrl,
+        onChange = model::onBaseUrlChange,
+        label = R.string.hint_base_url,
+        hint = R.string.summary_base_url,
+        keyboardType = KeyboardType.Uri,
+        imeAction = ImeAction.Next
+    )
+
+    SettingId.USERNAME -> FieldSpec(
+        value = model.username,
+        onChange = model::onUsernameChange,
+        label = R.string.hint_username,
+        hint = null,
+        keyboardType = KeyboardType.Text,
+        imeAction = ImeAction.Next
+    )
+
+    SettingId.PASSWORD -> FieldSpec(
+        value = model.password,
+        onChange = model::onPasswordChange,
+        label = R.string.hint_password,
+        hint = R.string.summary_password,
+        keyboardType = KeyboardType.Password,
+        imeAction = ImeAction.Next,
+        masked = true
+    )
+
+    SettingId.REMOTE_ROOT -> FieldSpec(
+        value = model.remoteRoot,
+        onChange = model::onRemoteRootChange,
+        label = R.string.hint_remote_root,
+        hint = R.string.summary_remote_root,
+        keyboardType = KeyboardType.Text,
+        imeAction = ImeAction.Done
+    )
+
+    else -> error("没有为 $id 定义输入框")
+}
+
+@Composable
+private fun FieldItem(id: String, model: SettingsModel, focusManager: FocusManager) {
+    val spec = fieldSpec(id, model)
+    // 提示语紧贴它说明的那个框（HintGap），与别的输入项之间才用 BlockGap
+    Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
+        SettingsField(
+            value = spec.value,
+            onValueChange = spec.onChange,
+            label = stringResource(spec.label),
+            keyboardType = spec.keyboardType,
+            imeAction = spec.imeAction,
+            focusManager = focusManager,
+            masked = spec.masked
+        )
+        spec.hint?.let { HintLine(stringResource(it)) }
+    }
+}
+
+/** 卡片里的一个下拉框或开关。默认值、落盘键与回调全部来自 [SettingsModel]，这里只管文案 */
+@Composable
+private fun PrefItem(id: String, model: SettingsModel) {
+    when (id) {
+        SettingId.REPLACE_MODE -> OverlayDropdownPreference(
+            items = listOf(
+                stringResource(R.string.mode_replace),
+                stringResource(R.string.mode_mirror),
+                stringResource(R.string.mode_off)
+            ),
+            selectedIndex = model.replaceModeIndex,
+            title = stringResource(R.string.label_replace_mode),
+            onSelectedIndexChange = model::onReplaceModeChange
+        )
+
+        SettingId.WIFI_ONLY -> SwitchPreference(
+            checked = model.wifiOnly,
+            onCheckedChange = model::onWifiOnlyChange,
+            title = stringResource(R.string.label_wifi_only),
+            summary = stringResource(R.string.summary_wifi_only)
+        )
+
+        SettingId.REMOTE_LAYOUT -> OverlayDropdownPreference(
+            items = listOf(
+                stringResource(R.string.layout_album),
+                stringResource(R.string.layout_date),
+                stringResource(R.string.layout_flat)
+            ),
+            selectedIndex = model.layoutIndex,
+            title = stringResource(R.string.label_remote_layout),
+            onSelectedIndexChange = model::onLayoutChange
+        )
+
+        SettingId.VERIFY_ASYNC -> SwitchPreference(
+            checked = model.verifyAsync,
+            onCheckedChange = model::onVerifyAsyncChange,
+            title = stringResource(R.string.label_verify_async),
+            summary = stringResource(R.string.summary_verify_async)
+        )
+
+        SettingId.SKIP_EXISTING_REMOTE -> SwitchPreference(
+            checked = model.skipExistingRemote,
+            onCheckedChange = model::onSkipExistingRemoteChange,
+            title = stringResource(R.string.label_skip_existing_remote),
+            summary = stringResource(R.string.summary_skip_existing_remote)
+        )
+
+        SettingId.UPLOAD_CONCURRENCY -> OverlayDropdownPreference(
+            items = SettingsModel.CONCURRENCY_ITEMS,
+            selectedIndex = model.concurrencyIndex,
+            title = stringResource(R.string.label_upload_concurrency),
+            summary = stringResource(R.string.summary_upload_concurrency),
+            onSelectedIndexChange = model::onConcurrencyChange
+        )
+
+        SettingId.MAX_UPLOAD_BYTES -> OverlayDropdownPreference(
+            items = listOf(
+                stringResource(R.string.size_cap_unlimited),
+                stringResource(R.string.size_cap_200mb),
+                stringResource(R.string.size_cap_500mb),
+                stringResource(R.string.size_cap_1gb),
+                stringResource(R.string.size_cap_2gb)
+            ),
+            selectedIndex = model.maxUploadBytesIndex,
+            title = stringResource(R.string.label_max_upload_bytes),
+            summary = stringResource(R.string.summary_max_upload_bytes),
+            onSelectedIndexChange = model::onMaxUploadBytesChange
+        )
+
+        SettingId.PRESERVE_METADATA -> SwitchPreference(
+            checked = model.preserveMetadata,
+            onCheckedChange = model::onPreserveMetadataChange,
+            title = stringResource(R.string.label_preserve_metadata),
+            summary = stringResource(R.string.summary_preserve_metadata)
+        )
+
+        SettingId.PRESERVE_HEIC_FORMAT -> SwitchPreference(
+            checked = model.preserveHeicFormat,
+            onCheckedChange = model::onPreserveHeicFormatChange,
+            title = stringResource(R.string.label_preserve_heic_format),
+            summary = stringResource(R.string.summary_preserve_heic_format)
+        )
+
+        SettingId.LOCAL_FLAG_MODE -> OverlayDropdownPreference(
+            items = listOf(
+                stringResource(R.string.flag_mode_shared),
+                stringResource(R.string.flag_mode_per_target)
+            ),
+            selectedIndex = model.localFlagModeIndex,
+            title = stringResource(R.string.label_local_flag_mode),
+            summary = stringResource(R.string.summary_local_flag_mode),
+            onSelectedIndexChange = model::onLocalFlagModeChange
+        )
+
+        SettingId.UI_MASK -> SwitchPreference(
+            checked = model.uiMask,
+            onCheckedChange = model::onUiMaskChange,
+            title = stringResource(R.string.label_ui_mask),
+            summary = stringResource(R.string.summary_ui_mask)
+        )
+
+        SettingId.THEME_MODE -> OverlayDropdownPreference(
+            items = listOf(
+                stringResource(R.string.theme_mode_system),
+                stringResource(R.string.theme_mode_light),
+                stringResource(R.string.theme_mode_dark)
+            ),
+            selectedIndex = model.themeModeIndex,
+            title = stringResource(R.string.label_theme_mode),
+            summary = stringResource(R.string.summary_theme_mode),
+            onSelectedIndexChange = model::onThemeModeChange
+        )
+
+        else -> error("没有为 $id 定义下拉框或开关")
+    }
+}
+
+/** 独立按钮行 */
+@Composable
+private fun ActionItem(id: String, model: SettingsModel) {
+    when (id) {
+        SettingId.TEST_CONNECTION -> TestConnectionAction(model)
+        SettingId.RESET_UPLOADED -> ResetUploadedAction(model)
+        else -> error("没有为 $id 定义按钮行")
+    }
+}
+
+@Composable
+private fun TestConnectionAction(model: SettingsModel) {
+    val focusManager = LocalFocusManager.current
+    Row(
+        modifier = Modifier.padding(horizontal = ScreenMargin),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(BlockGap)
+    ) {
+        Button(
+            onClick = {
+                // 先收键盘再测，否则"连接成功/失败"那行结果会被输入法盖住
+                focusManager.clearFocus()
+                model.testConnection()
+            },
+            enabled = model.testState !is TestState.Running,
+            minWidth = 96.dp,
+            colors = ButtonDefaults.buttonColorsPrimary(
+                // 默认禁用态是白字压在浅蓝底上，测试期间那几百毫秒几乎看不清
+                disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
+            )
+        ) {
+            Text(text = stringResource(R.string.action_test))
+        }
+        TestResultText(model.testState)
     }
 }
 
@@ -228,111 +403,14 @@ private fun RowScope.ResultText(text: String, color: Color) {
     )
 }
 
-@Composable
-private fun BehaviorSection(model: SettingsModel) {
-    Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
-        Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
-            OverlayDropdownPreference(
-                items = listOf(
-                    stringResource(R.string.mode_replace),
-                    stringResource(R.string.mode_mirror),
-                    stringResource(R.string.mode_off)
-                ),
-                selectedIndex = model.replaceModeIndex,
-                title = stringResource(R.string.label_replace_mode),
-                onSelectedIndexChange = model::onReplaceModeChange
-            )
-            SwitchPreference(
-                checked = model.wifiOnly,
-                onCheckedChange = model::onWifiOnlyChange,
-                title = stringResource(R.string.label_wifi_only),
-                summary = stringResource(R.string.summary_wifi_only)
-            )
-            SwitchPreference(
-                checked = model.uiMask,
-                onCheckedChange = model::onUiMaskChange,
-                title = stringResource(R.string.label_ui_mask),
-                summary = stringResource(R.string.summary_ui_mask)
-            )
-            OverlayDropdownPreference(
-                items = listOf(
-                    stringResource(R.string.layout_album),
-                    stringResource(R.string.layout_date),
-                    stringResource(R.string.layout_flat)
-                ),
-                selectedIndex = model.layoutIndex,
-                title = stringResource(R.string.label_remote_layout),
-                onSelectedIndexChange = model::onLayoutChange
-            )
-            SwitchPreference(
-                checked = model.verifyAsync,
-                onCheckedChange = model::onVerifyAsyncChange,
-                title = stringResource(R.string.label_verify_async),
-                summary = stringResource(R.string.summary_verify_async)
-            )
-            SwitchPreference(
-                checked = model.skipExistingRemote,
-                onCheckedChange = model::onSkipExistingRemoteChange,
-                title = stringResource(R.string.label_skip_existing_remote),
-                summary = stringResource(R.string.summary_skip_existing_remote)
-            )
-            SwitchPreference(
-                checked = model.preserveMetadata,
-                onCheckedChange = model::onPreserveMetadataChange,
-                title = stringResource(R.string.label_preserve_metadata),
-                summary = stringResource(R.string.summary_preserve_metadata)
-            )
-            SwitchPreference(
-                checked = model.preserveHeicFormat,
-                onCheckedChange = model::onPreserveHeicFormatChange,
-                title = stringResource(R.string.label_preserve_heic_format),
-                summary = stringResource(R.string.summary_preserve_heic_format)
-            )
-            OverlayDropdownPreference(
-                items = listOf(
-                    stringResource(R.string.flag_mode_shared),
-                    stringResource(R.string.flag_mode_per_target)
-                ),
-                selectedIndex = model.localFlagModeIndex,
-                title = stringResource(R.string.label_local_flag_mode),
-                summary = stringResource(R.string.summary_local_flag_mode),
-                onSelectedIndexChange = model::onLocalFlagModeChange
-            )
-            OverlayDropdownPreference(
-                items = SettingsModel.CONCURRENCY_ITEMS,
-                selectedIndex = model.concurrencyIndex,
-                title = stringResource(R.string.label_upload_concurrency),
-                summary = stringResource(R.string.summary_upload_concurrency),
-                onSelectedIndexChange = model::onConcurrencyChange
-            )
-            OverlayDropdownPreference(
-                items = listOf(
-                    stringResource(R.string.size_cap_unlimited),
-                    stringResource(R.string.size_cap_200mb),
-                    stringResource(R.string.size_cap_500mb),
-                    stringResource(R.string.size_cap_1gb),
-                    stringResource(R.string.size_cap_2gb)
-                ),
-                selectedIndex = model.maxUploadBytesIndex,
-                title = stringResource(R.string.label_max_upload_bytes),
-                summary = stringResource(R.string.summary_max_upload_bytes),
-                onSelectedIndexChange = model::onMaxUploadBytesChange
-            )
-        }
-        if (model.isReplaceMode) {
-            HintLine(stringResource(R.string.warn_replace_mode), error = true)
-        }
-    }
-}
-
 /**
- * 维护区：只放"会真的动相册数据"的动作。
+ * 重置"已上传标记"：只放"会真的动相册数据"的动作。
  *
- * <p>单独一个分区而不是塞进"同步"里，是因为这一项与其它配置项性质不同 ——
- * 其余项改了只是换个行为，这一项点下去是**不可逆的重传**，要给用户一个明显的边界。
+ * <p>与其它配置项性质不同 —— 其余项改了只是换个行为，这一项点下去是**不可逆的重传**，
+ * 所以单独成行、还要过一次确认框。
  */
 @Composable
-private fun MaintenanceSection(model: SettingsModel) {
+private fun ResetUploadedAction(model: SettingsModel) {
     var confirming by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
         Row(
@@ -412,22 +490,6 @@ private fun RowScope.ResetResultText(
                 .clickable { onDismiss() },
             style = MiuixTheme.textStyles.body2,
             color = color
-        )
-    }
-}
-
-@Composable
-private fun AppearanceSection(model: SettingsModel) {    Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
-        OverlayDropdownPreference(
-            items = listOf(
-                stringResource(R.string.theme_mode_system),
-                stringResource(R.string.theme_mode_light),
-                stringResource(R.string.theme_mode_dark)
-            ),
-            selectedIndex = model.themeModeIndex,
-            title = stringResource(R.string.label_theme_mode),
-            summary = stringResource(R.string.summary_theme_mode),
-            onSelectedIndexChange = model::onThemeModeChange
         )
     }
 }

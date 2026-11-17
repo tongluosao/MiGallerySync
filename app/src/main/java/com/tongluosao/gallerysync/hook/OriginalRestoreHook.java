@@ -13,19 +13,21 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
+import com.tongluosao.gallerysync.core.VideoCacheRetryPolicy;
 import com.tongluosao.gallerysync.core.VideoPlayCache;
+import com.tongluosao.gallerysync.core.VideoStreamPolicy;
 import com.tongluosao.gallerysync.core.WebDavClient;
 import com.tongluosao.gallerysync.core.WebDavVideoSource;
 
@@ -55,6 +57,26 @@ final class OriginalRestoreHook {
     private static final long VIDEO_CACHE_KEEP_MILLIS = 24L * 60L * 60L * 1000L;
     private static final long VIDEO_CACHE_MAX_BYTES = 800L * 1024L * 1024L;
     private static final int VIDEO_CACHE_BUFFER_BYTES = 64 * 1024;
+    /** 先同步备好首块再交地址给播放器，避免中继第一请求扑空走上游。 */
+    private static final long VIDEO_CACHE_FIRST_CHUNK = 1024L * 1024L;
+    private static final long VIDEO_CACHE_FIRST_CHUNK_WAIT_MS = 3_000L;
+    /** 目录/文件被系统清掉时重建目录并重试的次数。 */
+    private static final int VIDEO_CACHE_DOWNLOAD_ATTEMPTS = 3;
+    /** 下载过程中目录被清空后最多重建几次，超过就按失败处理。 */
+    private static final int VIDEO_CACHE_DIR_REBUILD_ATTEMPTS = 2;
+    /** 顺序下载每写 1MB 复查一次「领先播放位置多少」，超过窗口就停下来等播放追上来。 */
+    private static final long VIDEO_CACHE_CHECKPOINT_BYTES = 1024L * 1024L;
+    /** 领先窗口的时长基准见 {@link VideoStreamPolicy#WINDOW_SECONDS}。 */
+    private static final long VIDEO_CACHE_MIN_WINDOW = 4L * 1024L * 1024L;
+    private static final long VIDEO_CACHE_MAX_WINDOW = 64L * 1024L * 1024L;
+    /** 播放器还没发请求（playhead 为 0）时至少放行这么多，避免首块之后立刻卡住。 */
+    private static final long VIDEO_CACHE_START_WINDOW = 8L * 1024L * 1024L;
+    /** 播放速率初值 2MB/s，之后按播放位置增量做指数平滑。 */
+    private static final double VIDEO_CACHE_INITIAL_RATE = 2.0 * 1024.0 * 1024.0;
+    /** 播放位置连续 30 秒不动且已不在播放，就放开窗口把文件补完。 */
+    private static final long VIDEO_CACHE_IDLE_FINISH_MS = 30_000L;
+    private static final long VIDEO_CACHE_THROTTLE_POLL_MS = 200L;
+    private static final long VIDEO_CACHE_THROTTLE_LOG_MS = 5_000L;
 
     private final XposedInterface mXposed;
     private final ClassLoader mLoader;
@@ -396,8 +418,8 @@ final class OriginalRestoreHook {
     }
 
     /**
-     * 缓存优先的接管分支：命中就播本地文件，未命中先整份下载再回到主线程起播。中继分支留在
-     * {@link #prepareVideoStream} 里，靠 {@link #PLAY_FROM_CACHE} 切换。
+     * 缓存优先的接管分支：整份缓存命中就播本地文件（秒开）；未命中则起一个顺序下载线程写
+     * {@code .part}，同时立刻走中继让播放器先播起来，中继从 {@code .part} 里读已下好的部分。
      */
     private void prepareVideoCache(VideoPlaybackRequest playback) {
         OriginalStore.Record record = playback.record;
@@ -424,15 +446,90 @@ final class OriginalRestoreHook {
                 playCachedFileOnMain(playback, cache);
                 return;
             }
-            Logger.i("event=video_play_cache_miss row=" + record.rowId
+            File part = VideoPlayCache.partFileFor(context, record);
+            Logger.i("event=video_play_cache_progressive row=" + record.rowId
                     + " bytes=" + record.originalLength);
-            toastOnMain(context, "正在准备视频，请稍候…");
-            startVideoCacheDownload(playback, context, cache);
+            // 目录可能刚被系统清空：先重建目录再起下载线程，否则首块必然 ENOENT。
+            ensureCacheDir(part, record.rowId);
+            // 先把首块落到 .part 再把地址交给播放器：否则中继第一次请求必然扑空，静默走上游。
+            boolean firstChunkReady = false;
+            for (int attempt = 0;
+                    attempt < VideoCacheRetryPolicy.MAX_FIRST_CHUNK_ATTEMPTS; attempt++) {
+                if (attempt > 0) {
+                    // 首块失败多半是相册 cache 目录被清掉：重建目录、换新线程再等一次。
+                    Logger.w("event=video_play_cache_first_chunk_retry row=" + record.rowId
+                            + " attempt=" + attempt);
+                    ensureCacheDir(part, record.rowId);
+                }
+                java.util.concurrent.CountDownLatch firstChunk =
+                        new java.util.concurrent.CountDownLatch(1);
+                startProgressiveDownload(playback, context, part, firstChunk, attempt);
+                firstChunkReady = awaitFirstChunk(part, cache, record, firstChunk);
+                if (firstChunkReady) break;
+                Logger.w("event=video_play_cache_first_chunk_failed row=" + record.rowId
+                        + " attempt=" + attempt
+                        + " part=" + (part.isFile() ? part.length() : -1L)
+                        + " bytes=" + record.originalLength);
+                if (!VideoCacheRetryPolicy.shouldRetryFirstChunk(attempt, part.isFile(),
+                        isCacheDirPresent(part))) {
+                    break;
+                }
+            }
+            if (!firstChunkReady) {
+                // 两次都没备好首块就退回纯中继，progressivePart 保持 null，让中继自己走上游。
+                prepareVideoStream(playback);
+                return;
+            }
+            Logger.i("event=video_play_cache_first_chunk row=" + record.rowId
+                    + " bytes=" + Math.min(record.originalLength, VIDEO_CACHE_FIRST_CHUNK));
+            playback.progressivePart = part;
+            prepareVideoStream(playback);
         } catch (Throwable t) {
             Logger.w("event=video_play_cache_failed row=" + record.rowId
                     + " message=" + t);
             startFullVideoRestore(playback, t);
         }
+    }
+
+    /** 等首块落盘（最多 {@link #VIDEO_CACHE_FIRST_CHUNK_WAIT_MS}），以文件长度为最终判据。 */
+    private boolean awaitFirstChunk(File part, File cache, OriginalStore.Record record,
+            java.util.concurrent.CountDownLatch firstChunk) {
+        try {
+            firstChunk.await(VIDEO_CACHE_FIRST_CHUNK_WAIT_MS,
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        long need = Math.min(record.originalLength, VIDEO_CACHE_FIRST_CHUNK);
+        return (part.isFile() && part.length() >= need)
+                || VideoPlayCache.isReady(cache, record.originalLength);
+    }
+
+    private static boolean isCacheDirPresent(File part) {
+        File parent = part == null ? null : part.getParentFile();
+        return parent != null && parent.isDirectory();
+    }
+
+    /**
+     * 确保 {@code .part} 的父目录存在。相册 cache 目录被系统清掉后 {@code getCacheDir()} 仍返回同一
+     * 路径，但不 mkdirs 就写文件会直接 ENOENT，所以每次起下载线程前都重建一遍。
+     */
+    private static boolean ensureCacheDir(File part, String rowId) {
+        File parent = part == null ? null : part.getParentFile();
+        if (parent == null) return false;
+        try {
+            if (parent.isDirectory()) return true;
+            if (parent.mkdirs() || parent.isDirectory()) {
+                Logger.i("event=video_play_cache_dir_recreated row=" + rowId
+                        + " dir=" + parent.getName());
+                return true;
+            }
+        } catch (Throwable t) {
+            Logger.w("event=video_play_cache_dir_recreate_failed row=" + rowId
+                    + " message=" + t);
+        }
+        return false;
     }
 
     /** 用本地文件替换原来的中继 URL 起播；两条原生入口都失败才退回完整下载还原。 */
@@ -467,97 +564,268 @@ final class OriginalRestoreHook {
         }
     }
 
-    private void startVideoCacheDownload(final VideoPlaybackRequest playback,
-            final Context context, final File cache) {
+    /**
+     * 同一个 record 只跑一个顺序下载线程：key 是 {@code .part} 的绝对路径，线程结束时释放。
+     * 中继同时在读同一个文件，所以下载不阻塞起播。
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, Object> sActive =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 起一个顺序下载线程。{@code attempt>0} 表示首块失败后的重试：换一个新 token 与新的下载序号，
+     * 老线程会在下一个缓冲点自行退出，避免两个写者同时写同一个 {@code .part}。
+     */
+    private void startProgressiveDownload(final VideoPlaybackRequest playback,
+            final Context context, final File part,
+            final java.util.concurrent.CountDownLatch firstChunk, final int attempt) {
         final OriginalStore.Record record = playback.record;
-        final Config config = playback.config;
-        final WeakReference<VideoPlaybackRequest> playbackRef = new WeakReference<>(playback);
-        final WeakReference<Object> itemRef = new WeakReference<>(playback.item);
-        Thread thread = new Thread(() -> downloadVideoCache(context, cache, record, config,
-                playbackRef, itemRef), "mgs-video-cache");
+        final String key = part.getAbsolutePath();
+        final Object token = new Object();
+        final int run = playback.downloadRun.incrementAndGet();
+        if (attempt == 0) {
+            if (sActive.putIfAbsent(key, token) != null) {
+                firstChunk.countDown();
+                return;
+            }
+        } else {
+            sActive.put(key, token);
+            ensureCacheDir(part, record.rowId);
+        }
+        Thread thread = new Thread(() -> {
+            try {
+                downloadProgressivePart(playback, context, part, firstChunk, run);
+            } finally {
+                sActive.remove(key, token);
+            }
+        }, "mgs-video-cache");
         thread.setDaemon(true);
         try {
             thread.start();
         } catch (Throwable t) {
+            sActive.remove(key, token);
+            firstChunk.countDown();
             Logger.w("event=video_play_cache_failed row=" + record.rowId + " message=" + t);
             toastOnMain(context, "视频准备失败，请重试");
         }
     }
 
-    /** 后台线程：Range 拉整份原片到 {@code .part}，校验长度后改名成最终缓存文件。 */
-    private void downloadVideoCache(Context context, File cache, OriginalStore.Record record,
-            Config config, WeakReference<VideoPlaybackRequest> playbackRef,
-            WeakReference<Object> itemRef) {
-        File tmp = new File(cache.getParentFile(), cache.getName() + ".part");
+    /**
+     * 后台线程：从 {@code .part} 当前长度续写（Range 起点=已有字节），只领先播放位置一个缓冲窗口，
+     * 避免一进场就像整份下载。目录/文件被系统清掉时重建目录并从 0 重来；校验长度后改名成正式缓存。
+     */
+    private void downloadProgressivePart(VideoPlaybackRequest playback, Context context,
+            File part, java.util.concurrent.CountDownLatch firstChunk, int run) {
+        OriginalStore.Record record = playback.record;
         long startedAt = System.currentTimeMillis();
+        long firstChunkBytes = Math.min(record.originalLength, VIDEO_CACHE_FIRST_CHUNK);
+        int dirRebuilds = 0;
         try {
-            File parent = cache.getParentFile();
-            if (parent != null && !parent.isDirectory() && !parent.mkdirs()
-                    && !parent.isDirectory()) {
-                throw new IOException("video cache dir unavailable");
+            for (int attempt = 0; attempt < VIDEO_CACHE_DOWNLOAD_ATTEMPTS; attempt++) {
+                if (playback.downloadRun.get() != run) {
+                    Logger.i("event=video_play_cache_download_superseded row=" + record.rowId);
+                    return;
+                }
+                long resumeFrom = part.isFile() ? part.length() : 0L;
+                if (resumeFrom > record.originalLength) resumeFrom = 0L;
+                if (resumeFrom >= record.originalLength) break;
+                if (resumeFrom >= firstChunkBytes) firstChunk.countDown();
+                // 线程启动前先确保目录存在：cache 目录可能刚被系统清空。
+                ensureParentDir(part, record);
+                try {
+                    downloadPartRange(playback, context, part, resumeFrom, firstChunk, run);
+                    break;
+                } catch (DownloadSupersededException e) {
+                    Logger.i("event=video_play_cache_download_superseded row=" + record.rowId);
+                    return;
+                } catch (CacheFileLostException e) {
+                    // 一律以 part.length() 为准：文件还在、只是比已写计数短，就直接按当前长度续写。
+                    long current = part.isFile() ? part.length() : -1L;
+                    if (VideoStreamPolicy.resumeDecision(current, resumeFrom)
+                            == VideoStreamPolicy.RESUME) {
+                        Logger.w("event=video_play_cache_resume row=" + record.rowId
+                                + " bytes=" + current);
+                        ensureParentDir(part, record);
+                        continue;
+                    }
+                    Logger.w("event=video_play_cache_part_lost row=" + record.rowId
+                            + " written=" + current + " resumeFrom=" + resumeFrom);
+                    deleteQuietly(part);
+                    ensureParentDir(part, record);
+                } catch (java.io.IOException e) {
+                    // 目录被系统清掉（ENOENT / No such file）：重建目录后从 0 重来，不要直接失败退出。
+                    if (!VideoCacheRetryPolicy.isRecoverableIoFailure(e)
+                            || dirRebuilds >= VIDEO_CACHE_DIR_REBUILD_ATTEMPTS) {
+                        throw e;
+                    }
+                    dirRebuilds++;
+                    Logger.w("event=video_play_cache_dir_recreated row=" + record.rowId
+                            + " rebuild=" + dirRebuilds
+                            + " bytes=" + (part.isFile() ? part.length() : -1L)
+                            + " cause=" + e);
+                    deleteQuietly(part);
+                    ensureParentDir(part, record);
+                }
             }
-            WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
-                    config.getPassword());
-            WebDavClient.RangeResponse response = client.streamRange(record.remotePath, 0L,
-                    record.originalLength - 1L);
-            try {
-                writeCacheBody(response.body(), tmp, record.originalLength);
-            } finally {
-                response.close();
+            if (!part.isFile() || part.length() != record.originalLength) {
+                throw new IOException("cache length mismatch "
+                        + (part.isFile() ? part.length() : -1L));
             }
-            if (tmp.length() != record.originalLength) {
-                throw new IOException("cache length mismatch " + tmp.length());
-            }
-            if (!tmp.renameTo(cache)) {
-                copyCacheFile(tmp, cache, record.originalLength);
+            File cache = VideoPlayCache.fileFor(context, record);
+            if (!part.renameTo(cache)) {
+                copyCacheFile(part, cache, record.originalLength);
             }
             Logger.i("event=video_play_cache_ready row=" + record.rowId
                     + " bytes=" + record.originalLength
                     + " elapsed=" + (System.currentTimeMillis() - startedAt));
             VideoPlayCache.prune(context, VIDEO_CACHE_KEEP_MILLIS, VIDEO_CACHE_MAX_BYTES);
-            final File ready = cache;
-            if (!mMain.post(() -> replayCachedFile(playbackRef.get(), itemRef.get(), ready, record))) {
-                Logger.w("event=video_play_cache_callback_rejected row=" + record.rowId);
-            }
         } catch (Throwable t) {
-            deleteQuietly(tmp);
+            deleteQuietly(part);
             Logger.w("event=video_play_cache_failed row=" + record.rowId + " message=" + t);
-            if (!mMain.post(() -> toastOnMain(context, "视频准备失败，请重试"))) {
-                Logger.w("event=video_play_cache_toast_rejected row=" + record.rowId);
-            }
+            toastOnMain(context, "视频准备失败，请重试");
+        } finally {
+            firstChunk.countDown();
         }
     }
 
-    /** 下载完成回到主线程：页面还在且仍是当前播放请求才起播。 */
-    private void replayCachedFile(VideoPlaybackRequest playback, Object item, File cache,
-            OriginalStore.Record record) {
-        if (playback == null || item == null || playback.item != item) {
-            Logger.w("event=video_play_cache_stale row=" + record.rowId);
-            return;
-        }
-        if (mActiveVideoPlayback != playback || !isVideoPlaybackCurrent(playback)) {
-            Logger.w("event=video_play_cache_stale row=" + record.rowId);
-            return;
-        }
-        try {
-            playCachedFile(playback, cache);
-        } catch (Throwable t) {
-            Logger.w("event=video_play_cache_start_failed row=" + record.rowId, t);
-        }
-    }
-
-    private static void writeCacheBody(InputStream body, File target, long expectedLength)
+    /** 拉 [resumeFrom, len-1] 这一段写进 {@code .part}（追加模式）。 */
+    private void downloadPartRange(VideoPlaybackRequest playback, Context context, File part,
+            long resumeFrom, java.util.concurrent.CountDownLatch firstChunk, int run)
             throws IOException {
-        FileOutputStream out = new FileOutputStream(target);
+        OriginalStore.Record record = playback.record;
+        Config config = playback.config;
+        WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                config.getPassword());
+        WebDavClient.RangeResponse response = client.streamRange(record.remotePath, resumeFrom,
+                record.originalLength - 1L);
+        try {
+            writeCacheBodyThrottled(response.body(), part, resumeFrom, record.originalLength,
+                    playback, firstChunk, run);
+        } finally {
+            response.close();
+        }
+    }
+
+    private static void ensureParentDir(File part, OriginalStore.Record record) throws IOException {
+        if (!ensureCacheDir(part, record == null ? null : record.rowId)) {
+            throw new IOException("video cache dir unavailable");
+        }
+    }
+
+    /** {@code .part} 被外部（系统清理/用户）删掉：由下载循环重建目录并从头续写。 */
+    private static final class CacheFileLostException extends IOException {
+        CacheFileLostException() {
+            super("video cache file lost");
+        }
+    }
+
+    /** 该下载已被重试替代：安静退出，既不删文件也不弹 Toast。 */
+    private static final class DownloadSupersededException extends IOException {
+        DownloadSupersededException() {
+            super("video cache download superseded");
+        }
+    }
+
+    /**
+     * 限领先量的顺序写入：每写 1MB 用「已写字节 - 播放位置」比对窗口，超过窗口就每 200ms 轮询，
+     * 等播放追上来（回落到 3/4 窗口）再继续；播放结束（页面关闭且播放位置 30 秒不动）才放开限制
+     * 把文件补完，保证下次能秒开。
+     */
+    private void writeCacheBodyThrottled(InputStream body, File target, long resumeFrom,
+            long expectedLength, VideoPlaybackRequest playback,
+            java.util.concurrent.CountDownLatch firstChunk, int run) throws IOException {
+        ensureParentDir(target, playback.record);
+        long firstChunkBytes = Math.min(expectedLength, VIDEO_CACHE_FIRST_CHUNK);
+        FileOutputStream out = new FileOutputStream(target, true);
         try {
             byte[] buffer = new byte[VIDEO_CACHE_BUFFER_BYTES];
-            long total = 0L;
-            int read;
-            while ((read = body.read(buffer)) != -1) {
+            long total = resumeFrom;
+            long checkpoint = resumeFrom;
+            long playhead = Math.max(0L, playheadOf(playback));
+            long lastPlayheadAt = System.currentTimeMillis();
+            long lastAdvanceAt = lastPlayheadAt;
+            long lastThrottleLogAt = 0L;
+            double bytesPerSecond = VIDEO_CACHE_INITIAL_RATE;
+            boolean idleFinishLogged = false;
+            boolean firstChunkDone = total >= firstChunkBytes;
+            if (firstChunkDone) firstChunk.countDown();
+            while (true) {
+                // 被重试替代 / 目录被系统清掉就交给下载循环处理，不要在这里抛出去终止播放
+                if (playback.downloadRun.get() != run) throw new DownloadSupersededException();
+                ensureParentDir(target, playback.record);
+                if (!target.exists()) throw new CacheFileLostException();
+                int read = body.read(buffer);
+                if (read < 0) break;
                 if (read == 0) continue;
+                if (playback.downloadRun.get() != run) throw new DownloadSupersededException();
                 total += read;
                 if (total > expectedLength) throw new IOException("cache download overflow");
                 out.write(buffer, 0, read);
+                if (!firstChunkDone && total >= firstChunkBytes) {
+                    // 首块落盘后立刻放行等待方，让中继第一次请求就能命中本地字节
+                    out.flush();
+                    firstChunkDone = true;
+                    firstChunk.countDown();
+                }
+                if (total - checkpoint < VIDEO_CACHE_CHECKPOINT_BYTES) continue;
+                checkpoint = total;
+                long now = System.currentTimeMillis();
+                long observed = playheadOf(playback);
+                if (observed >= 0L && observed > playhead) {
+                    long deltaMs = now - lastPlayheadAt;
+                    if (deltaMs >= 200L) {
+                        bytesPerSecond = smoothRate(bytesPerSecond, observed - playhead, deltaMs);
+                        playhead = observed;
+                        lastPlayheadAt = now;
+                    }
+                    lastAdvanceAt = now;
+                }
+                long window = VideoStreamPolicy.windowBytes((long) bytesPerSecond, playhead,
+                        VIDEO_CACHE_MIN_WINDOW, VIDEO_CACHE_MAX_WINDOW,
+                        VIDEO_CACHE_START_WINDOW);
+                long ahead = Math.max(0L, total - playhead);
+                if (ahead <= window) continue;
+                while (ahead > window * 3L / 4L) {
+                    if (playback.downloadRun.get() != run) {
+                        throw new DownloadSupersededException();
+                    }
+                    if (!target.exists()) throw new CacheFileLostException();
+                    long waitNow = System.currentTimeMillis();
+                    long head = playheadOf(playback);
+                    if (head > playhead) {
+                        long deltaMs = waitNow - lastPlayheadAt;
+                        if (deltaMs >= 200L) {
+                            bytesPerSecond = smoothRate(bytesPerSecond, head - playhead, deltaMs);
+                            playhead = head;
+                            lastPlayheadAt = waitNow;
+                        }
+                        lastAdvanceAt = waitNow;
+                        window = VideoStreamPolicy.windowBytes((long) bytesPerSecond, playhead,
+                                VIDEO_CACHE_MIN_WINDOW, VIDEO_CACHE_MAX_WINDOW,
+                                VIDEO_CACHE_START_WINDOW);
+                    }
+                    ahead = Math.max(0L, total - playhead);
+                    if (ahead <= window * 3L / 4L) break;
+                    if (!isPlaybackActive(playback)
+                            && waitNow - lastAdvanceAt > VIDEO_CACHE_IDLE_FINISH_MS) {
+                        if (!idleFinishLogged) {
+                            idleFinishLogged = true;
+                            Logger.i("event=video_cache_finish_after_idle written=" + total);
+                        }
+                        break;
+                    }
+                    if (waitNow - lastThrottleLogAt >= VIDEO_CACHE_THROTTLE_LOG_MS) {
+                        lastThrottleLogAt = waitNow;
+                        Logger.i("event=video_cache_throttled ahead=" + ahead
+                                + " window=" + window);
+                    }
+                    try {
+                        Thread.sleep(VIDEO_CACHE_THROTTLE_POLL_MS);
+                    } catch (InterruptedException e) {
+                        // 线程被中断就放开限制继续补文件，不把异常抛出去
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             }
             out.flush();
             out.getFD().sync();
@@ -568,6 +836,30 @@ final class OriginalRestoreHook {
                 // 关不掉也不能把异常冒到下载线程外
             }
         }
+    }
+
+    /** 播放位置；中继已随页面关闭销毁时返回 -1，调用方沿用上一次观测值。 */
+    private static long playheadOf(VideoPlaybackRequest playback) {
+        if (playback == null) return -1L;
+        WebDavVideoSource source = playback.relaySource;
+        if (source == null) source = playback.streamSource;
+        if (source == null) return -1L;
+        try {
+            return source.playheadBytes();
+        } catch (Throwable t) {
+            return -1L;
+        }
+    }
+
+    /** 仍在播放：还是当前播放请求，且中继没有被页面退出关掉。 */
+    private boolean isPlaybackActive(VideoPlaybackRequest playback) {
+        return playback != null && mActiveVideoPlayback == playback
+                && (playback.relaySource != null || playback.streamSource != null);
+    }
+
+    private static double smoothRate(double previous, long deltaBytes, long deltaMs) {
+        double instant = deltaBytes * 1000.0 / deltaMs;
+        return previous * 0.7 + instant * 0.3;
     }
 
     private static void copyCacheFile(File source, File target, long expectedLength)
@@ -639,6 +931,8 @@ final class OriginalRestoreHook {
         try {
             mVideoSourceWorker.execute(() -> {
                 WebDavVideoSource source = new WebDavVideoSource();
+                source.setProgressiveCache(playback.progressivePart,
+                        playback.record.originalLength);
                 String url;
                 try {
                     synchronized (mVideoSourceLock) {
@@ -1342,8 +1636,12 @@ final class OriginalRestoreHook {
         final Config config;
         final long generation;
         final AtomicBoolean fallbackStarted = new AtomicBoolean();
+        /** 每次重试换一个序号：被替换的老下载线程看到序号不符就安静退出。 */
+        final AtomicInteger downloadRun = new AtomicInteger();
         volatile WebDavVideoSource relaySource;
         volatile WebDavVideoSource streamSource;
+        /** 渐进缓存中的 {@code .part}；中继优先从它读取已下好的区间。 */
+        volatile File progressivePart;
 
         VideoPlaybackRequest(Object video, Object item, Object downloadManager,
                 Object playManager, OriginalStore.Record record, Config config, long generation) {

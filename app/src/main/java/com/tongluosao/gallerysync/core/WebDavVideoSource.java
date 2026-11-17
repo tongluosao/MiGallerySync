@@ -4,9 +4,11 @@ import com.tongluosao.gallerysync.core.Logger;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.EOFException;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -40,6 +42,11 @@ public final class WebDavVideoSource implements AutoCloseable {
     private static final int LOCAL_READ_TIMEOUT_MS = 15_000;
     private static final long IDLE_EXPIRY_MS = TimeUnit.MINUTES.toMillis(30);
     private static final long WARMUP_BUDGET_MS = 8_000L;    private static final long MAX_LIFETIME_MS = TimeUnit.HOURS.toMillis(4);
+    /** 渐进缓存读不到新字节时的复查间隔与「无增长」判死时限。 */
+    private static final long PROGRESSIVE_POLL_MS = 50L;
+    private static final long PROGRESSIVE_STALL_MS = 20_000L;
+    /** 起点还没下到时等下载追上：累计 60 秒无增长才判死。 */
+    private static final long PROGRESSIVE_WAIT_MS = 60_000L;
     private static final SecureRandom RANDOM = new SecureRandom();
     private static volatile WebDavClient sSharedClient;
     private static volatile String sSharedClientKey;
@@ -60,8 +67,60 @@ public final class WebDavVideoSource implements AutoCloseable {
     private volatile String mMimeType;
     private volatile long mOriginalLength;
     private volatile String mPlaybackUrl;
+    /** 下载中的 {@code .part}；为空时行为与纯中继完全一致。 */
+    private volatile File mProgressiveFile;
+    /** MP4 的 moov 索引常在尾部：会话建立时就并行拉尾部 4MB 到内存，尾部请求不必等下载。 */
+    private static final long TAIL_BYTES = 4L * 1024L * 1024L;
+    private static final long TAIL_WAIT_MS = 5_000L;
+    private volatile byte[] mTail;
+    private volatile boolean mTailLoading;
+    /** 中继同时处理的连接数上限：播放器一次会开十几条探测连接。 */
+    private static final long BUSY_WAIT_MS = 2_000L;
+    private final java.util.concurrent.Semaphore mHandlers =
+            new java.util.concurrent.Semaphore(4);
+    /** 上游请求计数：证明探测/重连不会额外增加上游负担。 */
+    private final java.util.concurrent.atomic.AtomicInteger mUpstreamCalls =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger mUpstreamWarmup =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger mUpstreamTail =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private final java.util.concurrent.atomic.AtomicInteger mUpstreamRelay =
+            new java.util.concurrent.atomic.AtomicInteger();
+    /** 播放器主动断开的连接数（探测/切档），只做汇总，不记失败。 */
+    private final java.util.concurrent.atomic.AtomicInteger mClientClosedCount =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    private void noteUpstreamCall(java.util.concurrent.atomic.AtomicInteger slot) {
+        slot.incrementAndGet();
+        mUpstreamCalls.incrementAndGet();
+    }
+    /** 播放器已经请求到的最大字节偏移（单调递增），用来限制下载领先量。 */
+    private final java.util.concurrent.atomic.AtomicLong mPlayheadBytes =
+            new java.util.concurrent.atomic.AtomicLong();
 
     public WebDavVideoSource() { }
+
+    /** 播放位置（播放器请求过的最大字节偏移）。 */
+    public long playheadBytes() {
+        return mPlayheadBytes.get();
+    }
+
+    /** 该视频的期望总长度，未初始化时返回 0。 */
+    public long expectedLength() {
+        return mOriginalLength;
+    }
+
+    /**
+     * 让中继优先读本地渐进缓存：命中已下到的区间就直接从 {@code partFile} 读，读不到再转发上游。
+     * 不调用（或传 null）时行为与原来的纯中继一致。
+     */
+    public void setProgressiveCache(File partFile, long expectedLength) {
+        mProgressiveFile = partFile;
+        if (partFile != null && expectedLength > 0L) {
+            mOriginalLength = expectedLength;
+        }
+    }
 
     /**
      * Reuse one client per target: a fresh client per playback means a fresh TLS handshake, and
@@ -116,9 +175,64 @@ public final class WebDavVideoSource implements AutoCloseable {
         mRemotePath = record.remotePath;
         mOriginalLength = record.originalLength;
         mMimeType = mimeTypeFor(record.remotePath);
+        mTail = null;
+        mTailLoading = false;
+        if (mProgressiveFile != null) prefetchTail();
         String url = start();
         warmUp();
         return url;
+    }
+
+    /**
+     * 并行拉尾部 4MB（moov 索引）进内存：播放器一上来就请求尾部区间时不必等顺序下载走到片尾。
+     * 失败只记日志，回退到「等 .part 下载追上」。
+     */
+    private void prefetchTail() {
+        final WebDavClient client = mClient;
+        final String remotePath = mRemotePath;
+        final long length = mOriginalLength;
+        if (client == null || remotePath == null || remotePath.isEmpty() || length <= 0L) return;
+        if (mTailLoading || mTail != null) return;
+        final long start = Math.max(0L, length - TAIL_BYTES);
+        final int size = (int) (length - start);
+        if (size <= 0) return;
+        mTailLoading = true;
+        Thread thread = new Thread(() -> {
+            try {
+                noteUpstreamCall(mUpstreamTail);
+                WebDavClient.RangeResponse response = client.streamRange(remotePath, start,
+                        length - 1L);
+                try {
+                    byte[] buffer = new byte[size];
+                    int filled = 0;
+                    InputStream body = response.body();
+                    while (filled < size) {
+                        int read = body.read(buffer, filled, size - filled);
+                        if (read < 0) break;
+                        filled += read;
+                    }
+                    if (filled < size) {
+                        Logger.w("event=video_relay_tail_short bytes=" + filled + "/" + size);
+                        return;
+                    }
+                    mTail = buffer;
+                    Logger.i("event=video_relay_tail_ready bytes=" + filled + " start=" + start);
+                } finally {
+                    response.close();
+                }
+            } catch (Throwable t) {
+                Logger.w("event=video_relay_tail_failed", t);
+            } finally {
+                mTailLoading = false;
+            }
+        }, "gallery-webdav-video-tail");
+        thread.setDaemon(true);
+        try {
+            thread.start();
+        } catch (Throwable t) {
+            mTailLoading = false;
+            Logger.w("event=video_relay_tail_failed", t);
+        }
     }
 
     /**
@@ -131,7 +245,18 @@ public final class WebDavVideoSource implements AutoCloseable {
         if (client == null || remotePath == null || remotePath.isEmpty()) {
             return;
         }
+        try {
+            File part = mProgressiveFile;
+            if (part != null) {
+                // 渐进缓存接管时首字节由本地文件提供，不必再等一轮上游往返。
+                Logger.i("event=video_relay_warmup_skipped reason=progressive_cache");
+                return;
+            }
+        } catch (Throwable ignored) {
+            // 读不到本地状态就当没有渐进缓存
+        }
         long startedAt = System.currentTimeMillis();
+        noteUpstreamCall(mUpstreamWarmup);
         WebDavClient.RangeCall call = client.newRangeCall(remotePath, 0L, 0L);
         try (WebDavClient.RangeResponse response = call.open()) {
             if (response.body().read() < 0) {
@@ -254,9 +379,13 @@ public final class WebDavVideoSource implements AutoCloseable {
 
         @Override
         public void run() {
+            boolean acquired = false;
             try {
+                acquired = acquireHandler(socket);
+                if (!acquired) return;
                 relay(socket);
             } finally {
+                if (acquired) mHandlers.release();
                 mLocalSockets.remove(socket);
                 closeQuietly(socket);
             }
@@ -268,8 +397,34 @@ public final class WebDavVideoSource implements AutoCloseable {
         }
     }
 
+    /**
+     * 单会话最多 4 条中继连接，拿不到信号量等 2 秒：超时直接 503。播放器探测/重连只会撞上
+     * 这个闸门，不会把上游连接数顶上去。
+     */
+    private boolean acquireHandler(Socket socket) {
+        boolean acquired;
+        try {
+            acquired = mHandlers.tryAcquire(BUSY_WAIT_MS,
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            acquired = false;
+        }
+        if (acquired) return true;
+        Logger.w("event=video_relay_busy");
+        try {
+            OutputStream output = new BufferedOutputStream(socket.getOutputStream(), 8 * 1024);
+            writeError(output, 503, "Service Unavailable", null);
+        } catch (Throwable ignored) {
+            // 客户端可能已经走了
+        }
+        return false;
+    }
+
     private void relay(Socket socket) {
         boolean responseStarted = false;
+        long relayRangeStart = -1L;
+        long relayRangeBytes = 0L;
         try {
             InputStream input = new BufferedInputStream(socket.getInputStream(), 8 * 1024);
             OutputStream output = new BufferedOutputStream(socket.getOutputStream(), 32 * 1024);
@@ -296,7 +451,14 @@ public final class WebDavVideoSource implements AutoCloseable {
                         "Content-Range: bytes */" + mOriginalLength + "\r\n");
                 return;
             }
+            relayRangeStart = range.start;
+            relayRangeBytes = range.end - range.start + 1L;
             boolean partial = request.range != null;
+            long tailStart = VideoStreamPolicy.tailStart(mOriginalLength, (int) TAIL_BYTES);
+            if (tailStart <= 0L || range.start < tailStart) {
+                // 尾部索引请求不算播放进度，否则下载端会误以为已经播到片尾
+                mPlayheadBytes.accumulateAndGet(range.start, Math::max);
+            }
             long expectedLength = range.end - range.start + 1L;
             String responseType = mMimeType;
             if ("HEAD".equals(request.method)) {
@@ -308,6 +470,44 @@ public final class WebDavVideoSource implements AutoCloseable {
                 return;
             }
 
+            // 渐进缓存已启用就只用本地文件服务：起点还没下到就让读线程等下载追上来，
+            // 绝不再转发上游 Range（上游在这里会被 ConnectionReset，播放器只会在重试里打转）。
+            File progressive = progressiveFileFor();
+            if (progressive != null) {
+                if (VideoStreamPolicy.coveredByTail(range.start, mOriginalLength,
+                        (int) TAIL_BYTES)) {
+                    // 请求起点已经在尾部索引区：直接内存切片，必要时最多等 5 秒。
+                    byte[] tail = awaitTail(TAIL_WAIT_MS);
+                    if (tail != null) {
+                        long tailOffset = mOriginalLength - tail.length;
+                        int from = (int) Math.max(0L, range.start - tailOffset);
+                        int to = (int) Math.min(tail.length - 1L, range.end - tailOffset);
+                        if (from >= 0 && to >= from && range.start >= tailOffset) {
+                            writeHeaders(output, partial ? 206 : 200,
+                                    partial ? "Partial Content" : "OK", expectedLength,
+                                    responseType,
+                                    partial ? "Content-Range: bytes " + range.start + "-"
+                                            + range.end + "/" + mOriginalLength + "\r\n" : null);
+                            responseStarted = true;
+                            output.write(tail, from, to - from + 1);
+                            output.flush();
+                            touch();
+                            Logger.d("event=video_relay_tail_served start=" + range.start
+                                    + " bytes=" + (to - from + 1));
+                            return;
+                        }
+                    }
+                }
+                writeHeaders(output, partial ? 206 : 200,
+                        partial ? "Partial Content" : "OK", expectedLength, responseType,
+                        partial ? "Content-Range: bytes " + range.start + "-" + range.end
+                                + "/" + mOriginalLength + "\r\n" : null);
+                responseStarted = true;
+                streamProgressiveFile(progressive, output, range);
+                return;
+            }
+
+            noteUpstreamCall(mUpstreamRelay);
             WebDavClient.RangeCall rangeCall = mClient.newRangeCall(
                     mRemotePath, range.start, range.end);
             mActiveCalls.add(rangeCall);
@@ -375,6 +575,16 @@ public final class WebDavVideoSource implements AutoCloseable {
                 mActiveRanges.remove(upstream);
             }
         } catch (IOException | RuntimeException e) {
+            if (responseStarted && isClientClosed(e)) {
+                // 播放器开一条探测连接、读几 KB 就自己断开，属于正常行为，不记失败也不写 502。
+                int closed = mClientClosedCount.incrementAndGet();
+                Logger.d("event=video_relay_closed_by_client range=" + relayRangeStart
+                        + " bytes=" + relayRangeBytes);
+                if (closed % 20 == 0) {
+                    Logger.i("event=video_relay_client_closed_summary count=" + closed);
+                }
+                return;
+            }
             Logger.w("event=video_relay_failed responseStarted=" + responseStarted
                     + " kind=" + e.getClass().getSimpleName() + " message=" + e.getMessage());
             // Request URLs, credentials, and signed redirect locations must never enter logs.
@@ -385,6 +595,176 @@ public final class WebDavVideoSource implements AutoCloseable {
                 }
             } catch (Throwable ignored) { }
         }
+    }
+
+    /** 客户端主动关连接（探测/切档）的判定：不谈“失败”，只做汇总。 */
+    private static boolean isClientClosed(Throwable t) {
+        if (t == null) return false;
+        if (t instanceof java.net.SocketException) return true;
+        String name = t.getClass().getSimpleName();
+        if (name.contains("ConnectionReset") || name.contains("BrokenPipe")) return true;
+        String message = t.getMessage();
+        if (message == null) return false;
+        return message.contains("Connection reset") || message.contains("Broken pipe")
+                || message.contains("Socket closed") || message.contains("EPIPE");
+    }
+
+    /**
+     * 渐进会话里要服务的文件：{@code .part} 已改名成正式缓存就整份直读，否则就是 {@code .part}
+     * （可能还没下到请求起点，由 {@link #streamProgressiveFile} 等下载追上来）。未启用时返回 null。
+     */
+    private File progressiveFileFor() {
+        File part = mProgressiveFile;
+        if (part == null) return null;
+        try {
+            File completed = completedFileFor(part);
+            if (completed != null && completed.isFile()
+                    && (mOriginalLength <= 0L || completed.length() == mOriginalLength)) {
+                return completed;
+            }
+        } catch (Throwable ignored) {
+            // 读不到就继续用 .part
+        }
+        return part;
+    }
+
+    /** 等尾部缓存就绪（最多 timeoutMs）；加载已结束仍为空就立刻返回 null。 */
+    private byte[] awaitTail(long timeoutMs) throws IOException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (true) {
+            byte[] tail = mTail;
+            if (tail != null) return tail;
+            if (mClosed || !mTailLoading) return null;
+            if (System.currentTimeMillis() >= deadline) {
+                Logger.w("event=video_relay_tail_wait_timeout");
+                return null;
+            }
+            sleepForGrowth();
+        }
+    }
+
+    /**
+     * 打开渐进文件再边下边播。文件还没出现（下载线程正在重建目录）或还没下到请求起点时，
+     * 每 50ms 复查一次长度，累计 60 秒没有任何增长才抛 {@code progressive wait timeout}。
+     */
+    private void streamProgressiveFile(File file, OutputStream output, RangeSpec range)
+            throws IOException {
+        RandomAccessFile local = null;
+        long lastLength = -1L;
+        long lastGrowthAt = System.currentTimeMillis();
+        try {
+            while (true) {
+                if (mClosed) throw new IOException("progressive relay closed");
+                if (local == null) {
+                    File target = file;
+                    if (!target.isFile()) {
+                        File completed = completedFileFor(file);
+                        if (completed != null && completed.isFile()
+                                && (mOriginalLength <= 0L
+                                        || completed.length() == mOriginalLength)) {
+                            target = completed;
+                        }
+                    }
+                    try {
+                        local = new RandomAccessFile(target, "r");
+                    } catch (Throwable t) {
+                        local = null;
+                    }
+                }
+                long length = -1L;
+                if (local != null) {
+                    try {
+                        length = local.length();
+                    } catch (Throwable t) {
+                        length = -1L;
+                    }
+                }
+                if (VideoStreamPolicy.canServeFromLocal(length, range.start)) break;
+                long now = System.currentTimeMillis();
+                if (length != lastLength) {
+                    lastLength = length;
+                    lastGrowthAt = now;
+                } else if (now - lastGrowthAt > PROGRESSIVE_WAIT_MS) {
+                    throw new IOException("progressive wait timeout");
+                }
+                sleepForGrowth();
+            }
+            streamProgressive(local, output, range);
+        } finally {
+            if (local != null) closeQuietly(local);
+        }
+    }
+
+    private static File completedFileFor(File part) {
+        String path = part.getPath();
+        if (!path.endsWith(VideoPlayCache.PART_SUFFIX)) return null;
+        return new File(path.substring(0, path.length() - VideoPlayCache.PART_SUFFIX.length()));
+    }
+
+    /**
+     * 边下边播：从 {@code range.start} 顺序读本地文件写进 socket，读到当前文件末尾就每 50ms 复查一次
+     * 长度；连续 20 秒没有任何增长（下载线程已死/上游断了）才放弃，让播放器走错误回退。
+     */
+    private void streamProgressive(RandomAccessFile file, OutputStream output, RangeSpec range)
+            throws IOException {
+        file.seek(range.start);
+        byte[] buffer = new byte[64 * 1024];
+        long position = range.start;
+        long end = range.end;
+        long knownLength = -1L;
+        long lastGrowthAt = System.currentTimeMillis();
+        while (position <= end) {
+            if (mClosed) throw new IOException("progressive relay closed");
+            long length = file.length();
+            if (length <= position) {
+                long now = System.currentTimeMillis();
+                if (knownLength < 0L || length > knownLength) {
+                    knownLength = length;
+                    lastGrowthAt = now;
+                } else if (now - lastGrowthAt > PROGRESSIVE_STALL_MS) {
+                    throw new IOException("progressive cache stalled");
+                }
+                sleepForGrowth();
+                continue;
+            }
+            int want = (int) Math.min(buffer.length, end - position + 1L);
+            want = (int) Math.min(want, length - position);
+            if (want <= 0) {
+                sleepForGrowth();
+                continue;
+            }
+            // 每次读前显式定位：下载线程截断重写 .part 时也不会把读指针带偏。
+            file.seek(position);
+            int read = file.read(buffer, 0, want);
+            if (read <= 0) {
+                sleepForGrowth();
+                continue;
+            }
+            output.write(buffer, 0, read);
+            position += read;
+            // 真正喂给播放器的位置也要记：播放器只发一次开放式 Range 时靠这个推进播放位置。
+            mPlayheadBytes.accumulateAndGet(position, Math::max);
+            knownLength = file.length();
+            lastGrowthAt = System.currentTimeMillis();
+            touch();
+        }
+        output.flush();
+        Logger.d("event=video_relay_progressive_done start=" + range.start + " end=" + end);
+    }
+
+    private static void sleepForGrowth() throws IOException {
+        try {
+            Thread.sleep(PROGRESSIVE_POLL_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("progressive relay interrupted");
+        }
+    }
+
+    private static void closeQuietly(RandomAccessFile file) {
+        try {
+            file.close();
+        } catch (IOException ignored) { }
     }
 
     private boolean authorizedPath(String requestTarget) {
@@ -575,6 +955,9 @@ public final class WebDavVideoSource implements AutoCloseable {
             return;
         }
         mClosed = true;
+        Logger.i("event=video_relay_upstream_summary calls=" + mUpstreamCalls.get()
+                + " tail=" + mUpstreamTail.get() + " warmup=" + mUpstreamWarmup.get()
+                + " relay=" + mUpstreamRelay.get());
         ServerSocket server = mServer;
         mServer = null;
         if (server != null) {
