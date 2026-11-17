@@ -6,8 +6,14 @@ import android.os.Handler;
 import android.os.Looper;
 import android.view.MenuItem;
 import android.view.View;
+import android.widget.Toast;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
@@ -19,6 +25,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
+import com.tongluosao.gallerysync.core.VideoPlayCache;
+import com.tongluosao.gallerysync.core.WebDavClient;
 import com.tongluosao.gallerysync.core.WebDavVideoSource;
 
 import io.github.libxposed.api.XposedInterface;
@@ -38,6 +46,15 @@ final class OriginalRestoreHook {
     private static final String[] ITEM_LOCAL_PATH_GETTERS =
             {"getOriginalPath", "getThumnailPath", "getMicroPath"};
     private static final ThreadLocal<Request> ACTIVE_REQUEST = new ThreadLocal<>();
+    /**
+     * 真机实测：中继流式播放首字节 0.6-1 秒，播放器多次重连后解码器仍拿不到帧。改为先把原片整份
+     * 下载到应用缓存，再让相册原生播放器播本地文件。中继分支保留（{@link #prepareVideoStream}）
+     * 以便随时回滚。
+     */
+    private static final boolean PLAY_FROM_CACHE = true;
+    private static final long VIDEO_CACHE_KEEP_MILLIS = 24L * 60L * 60L * 1000L;
+    private static final long VIDEO_CACHE_MAX_BYTES = 800L * 1024L * 1024L;
+    private static final int VIDEO_CACHE_BUFFER_BYTES = 64 * 1024;
 
     private final XposedInterface mXposed;
     private final ClassLoader mLoader;
@@ -252,6 +269,11 @@ final class OriginalRestoreHook {
                             return chain.proceed();
                         }
                         if (record == null) return chain.proceed();
+                        if (PLAY_FROM_CACHE && (record.originalLength <= 0L
+                                || record.remotePath == null)) {
+                            Logger.w("event=video_play_cache_unavailable row=" + record.rowId);
+                            return chain.proceed();
+                        }
 
                         // A verified original can already exist at the registered destination
                         // while this page item still has no original path (for example, when
@@ -294,7 +316,11 @@ final class OriginalRestoreHook {
                             startFullVideoRestore(playback, null);
                             return Boolean.TRUE;
                         }
-                        prepareVideoStream(playback);
+                        if (PLAY_FROM_CACHE) {
+                            prepareVideoCache(playback);
+                        } else {
+                            prepareVideoStream(playback);
+                        }
                         // Do not fall through to Gallery's Xiaomi OnlineVideo URL request for
                         // a managed item whose registered local original is absent.
                         return Boolean.TRUE;
@@ -366,6 +392,246 @@ final class OriginalRestoreHook {
             }
         } catch (Throwable t) {
             Logger.e("event=managed_video_playback_restore_hook_missing method=PhotoPageVideoItem.handleOnlineRequest()", t);
+        }
+    }
+
+    /**
+     * 缓存优先的接管分支：命中就播本地文件，未命中先整份下载再回到主线程起播。中继分支留在
+     * {@link #prepareVideoStream} 里，靠 {@link #PLAY_FROM_CACHE} 切换。
+     */
+    private void prepareVideoCache(VideoPlaybackRequest playback) {
+        OriginalStore.Record record = playback.record;
+        if (record == null) {
+            startFullVideoRestore(playback, null);
+            return;
+        }
+        try {
+            Context host = HostContext.get(mLoader);
+            Context context = host == null ? null : host.getApplicationContext();
+            if (context == null) {
+                Logger.w("event=video_play_cache_failed row=" + record.rowId
+                        + " message=host context unavailable");
+                startFullVideoRestore(playback, null);
+                return;
+            }
+            if (VideoPlayCache.totalBytes(context) > VIDEO_CACHE_MAX_BYTES) {
+                VideoPlayCache.prune(context, VIDEO_CACHE_KEEP_MILLIS, VIDEO_CACHE_MAX_BYTES);
+            }
+            File cache = VideoPlayCache.fileFor(context, record);
+            if (VideoPlayCache.isReady(cache, record.originalLength)) {
+                Logger.i("event=video_play_cache_hit row=" + record.rowId
+                        + " bytes=" + record.originalLength);
+                playCachedFileOnMain(playback, cache);
+                return;
+            }
+            Logger.i("event=video_play_cache_miss row=" + record.rowId
+                    + " bytes=" + record.originalLength);
+            toastOnMain(context, "正在准备视频，请稍候…");
+            startVideoCacheDownload(playback, context, cache);
+        } catch (Throwable t) {
+            Logger.w("event=video_play_cache_failed row=" + record.rowId
+                    + " message=" + t);
+            startFullVideoRestore(playback, t);
+        }
+    }
+
+    /** 用本地文件替换原来的中继 URL 起播；两条原生入口都失败才退回完整下载还原。 */
+    private void playCachedFile(VideoPlaybackRequest playback, File cache) {
+        String url = Uri.fromFile(cache).toString();
+        if (startGalleryOnlinePlay(playback, url)) {
+            Logger.i("event=video_play_cache_started row=" + playback.record.rowId);
+            return;
+        }
+        try {
+            Method play = mPlayDifferentVideoMethod;
+            if (play == null || playback.playManager == null) {
+                throw new NoSuchMethodException("native video player entry missing");
+            }
+            play.invoke(playback.playManager, playback.item, url, null, null, null, null);
+            Logger.i("event=video_play_cache_started_legacy row=" + playback.record.rowId);
+        } catch (Throwable t) {
+            Logger.w("event=video_play_cache_start_failed row="
+                    + playback.record.rowId, t);
+            startFullVideoRestore(playback, t);
+        }
+    }
+
+    private void playCachedFileOnMain(final VideoPlaybackRequest playback, final File cache) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            playCachedFile(playback, cache);
+            return;
+        }
+        if (!mMain.post(() -> playCachedFile(playback, cache))) {
+            Logger.w("event=video_play_cache_callback_rejected row="
+                    + playback.record.rowId);
+        }
+    }
+
+    private void startVideoCacheDownload(final VideoPlaybackRequest playback,
+            final Context context, final File cache) {
+        final OriginalStore.Record record = playback.record;
+        final Config config = playback.config;
+        final WeakReference<VideoPlaybackRequest> playbackRef = new WeakReference<>(playback);
+        final WeakReference<Object> itemRef = new WeakReference<>(playback.item);
+        Thread thread = new Thread(() -> downloadVideoCache(context, cache, record, config,
+                playbackRef, itemRef), "mgs-video-cache");
+        thread.setDaemon(true);
+        try {
+            thread.start();
+        } catch (Throwable t) {
+            Logger.w("event=video_play_cache_failed row=" + record.rowId + " message=" + t);
+            toastOnMain(context, "视频准备失败，请重试");
+        }
+    }
+
+    /** 后台线程：Range 拉整份原片到 {@code .part}，校验长度后改名成最终缓存文件。 */
+    private void downloadVideoCache(Context context, File cache, OriginalStore.Record record,
+            Config config, WeakReference<VideoPlaybackRequest> playbackRef,
+            WeakReference<Object> itemRef) {
+        File tmp = new File(cache.getParentFile(), cache.getName() + ".part");
+        long startedAt = System.currentTimeMillis();
+        try {
+            File parent = cache.getParentFile();
+            if (parent != null && !parent.isDirectory() && !parent.mkdirs()
+                    && !parent.isDirectory()) {
+                throw new IOException("video cache dir unavailable");
+            }
+            WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                    config.getPassword());
+            WebDavClient.RangeResponse response = client.streamRange(record.remotePath, 0L,
+                    record.originalLength - 1L);
+            try {
+                writeCacheBody(response.body(), tmp, record.originalLength);
+            } finally {
+                response.close();
+            }
+            if (tmp.length() != record.originalLength) {
+                throw new IOException("cache length mismatch " + tmp.length());
+            }
+            if (!tmp.renameTo(cache)) {
+                copyCacheFile(tmp, cache, record.originalLength);
+            }
+            Logger.i("event=video_play_cache_ready row=" + record.rowId
+                    + " bytes=" + record.originalLength
+                    + " elapsed=" + (System.currentTimeMillis() - startedAt));
+            VideoPlayCache.prune(context, VIDEO_CACHE_KEEP_MILLIS, VIDEO_CACHE_MAX_BYTES);
+            final File ready = cache;
+            if (!mMain.post(() -> replayCachedFile(playbackRef.get(), itemRef.get(), ready, record))) {
+                Logger.w("event=video_play_cache_callback_rejected row=" + record.rowId);
+            }
+        } catch (Throwable t) {
+            deleteQuietly(tmp);
+            Logger.w("event=video_play_cache_failed row=" + record.rowId + " message=" + t);
+            if (!mMain.post(() -> toastOnMain(context, "视频准备失败，请重试"))) {
+                Logger.w("event=video_play_cache_toast_rejected row=" + record.rowId);
+            }
+        }
+    }
+
+    /** 下载完成回到主线程：页面还在且仍是当前播放请求才起播。 */
+    private void replayCachedFile(VideoPlaybackRequest playback, Object item, File cache,
+            OriginalStore.Record record) {
+        if (playback == null || item == null || playback.item != item) {
+            Logger.w("event=video_play_cache_stale row=" + record.rowId);
+            return;
+        }
+        if (mActiveVideoPlayback != playback || !isVideoPlaybackCurrent(playback)) {
+            Logger.w("event=video_play_cache_stale row=" + record.rowId);
+            return;
+        }
+        try {
+            playCachedFile(playback, cache);
+        } catch (Throwable t) {
+            Logger.w("event=video_play_cache_start_failed row=" + record.rowId, t);
+        }
+    }
+
+    private static void writeCacheBody(InputStream body, File target, long expectedLength)
+            throws IOException {
+        FileOutputStream out = new FileOutputStream(target);
+        try {
+            byte[] buffer = new byte[VIDEO_CACHE_BUFFER_BYTES];
+            long total = 0L;
+            int read;
+            while ((read = body.read(buffer)) != -1) {
+                if (read == 0) continue;
+                total += read;
+                if (total > expectedLength) throw new IOException("cache download overflow");
+                out.write(buffer, 0, read);
+            }
+            out.flush();
+            out.getFD().sync();
+        } finally {
+            try {
+                out.close();
+            } catch (Throwable ignored) {
+                // 关不掉也不能把异常冒到下载线程外
+            }
+        }
+    }
+
+    private static void copyCacheFile(File source, File target, long expectedLength)
+            throws IOException {
+        FileInputStream in = new FileInputStream(source);
+        try {
+            FileOutputStream out = new FileOutputStream(target);
+            try {
+                byte[] buffer = new byte[VIDEO_CACHE_BUFFER_BYTES];
+                long total = 0L;
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    if (read == 0) continue;
+                    total += read;
+                    if (total > expectedLength) throw new IOException("cache copy overflow");
+                    out.write(buffer, 0, read);
+                }
+                out.flush();
+                out.getFD().sync();
+            } finally {
+                try {
+                    out.close();
+                } catch (Throwable ignored) {
+                    // 同上：缓存文件复制失败由调用方的长度校验兜底
+                }
+            }
+        } finally {
+            try {
+                in.close();
+            } catch (Throwable ignored) {
+                // 同上
+            }
+        }
+        if (target.length() != expectedLength) throw new IOException("cache copy mismatch");
+        deleteQuietly(source);
+    }
+
+    private static void deleteQuietly(File file) {
+        if (file == null) return;
+        try {
+            if (file.exists() && !file.delete()) {
+                Logger.w("event=video_play_cache_delete_failed");
+            }
+        } catch (Throwable ignored) {
+            // 残留文件由 prune 后续清理
+        }
+    }
+
+    private void toastOnMain(final Context context, final String text) {
+        if (context == null) return;
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            if (!mMain.post(() -> toast(context, text))) {
+                Logger.w("event=video_play_cache_toast_rejected");
+            }
+            return;
+        }
+        toast(context, text);
+    }
+
+    private void toast(Context context, String text) {
+        try {
+            Toast.makeText(context, text, Toast.LENGTH_SHORT).show();
+        } catch (Throwable t) {
+            Logger.w("event=video_play_cache_toast_failed message=" + t);
         }
     }
 
