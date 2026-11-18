@@ -98,6 +98,15 @@ public final class ProgressProtocol {
     /** 停止空间优化队列：正在处理的那张做完就收尾，不再领新任务 */
     public static final String CMD_SLIM_STOP = "slim_stop";
 
+    /**
+     * “接管”相册里已有的照片：把云端已经存在的行登记进注册表，<b>一个字节都不下载</b>。
+     *
+     * <p>接收方是相册进程里的 {@code MetadataRestoreJob}（{@code mode=takeover}）：
+     * 它自己查相册库、按目录 PROPFIND 一次，然后逐行补登记。这里不带任何参数 ——
+     * 请求文件由接收方自己写，避免两个进程对同一份 JSON 各写一半。
+     */
+    public static final String CMD_TAKEOVER = "takeover";
+
     /** 优化并发路数（1..4），随 {@link #CMD_SLIM_START} 一起下发 */
     public static final String EXTRA_CONCURRENCY = "concurrency";
 

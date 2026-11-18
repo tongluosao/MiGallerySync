@@ -1795,25 +1795,26 @@ public final class DownloadQueue {
 
     /**
      * 本地高清副本的位置与命名规则。<b>原地模式的格式直接返回原文件本身</b>
-     * （{@code .jpg/.jpeg}、{@code .png}，以及 {@code preserveHeic} 打开时的 {@code .heic/.heif}）：
+     * （{@code .jpg/.jpeg}，以及 {@code preserveHeic} 打开时的 {@code .heic/.heif}）：
      * 预览就覆盖在原路径、原文件名上，不再另起一份。
      *
-     * <p>PNG 与 HEIC 的开关无关：它的编码器只会写 PNG（无损、保 alpha），同扩展名覆盖永远成立；
-     * 只有 HEIC 需要看 {@code preserveHeic}，因为关掉时编码器产出 JPEG，写进 {@code .heic}
-     * 就是容器不匹配。其余容器（webp/bmp/gif/视频）与 {@code preserveHeic=false} 的 HEIC 仍走
-     * 老侧车规则（{@code <相册目录>/.gallerysync-slim/<stem>.<ext>}，见 {@link #legacyPreviewPathFor}）。
+     * <p>PNG 不再原地覆盖：无损重编省不了字节、超大图还有 OOM 风险，空间优化整类跳过它；
+     * 下载高清分支仍可能遇到 png，这时仍按老侧车规则落一份 JPEG 预览
+     * （{@code <相册目录>/.gallerysync-slim/<stem>.jpg}，见 {@link #legacyPreviewPathFor}）。
+     * 其余容器（webp/bmp/gif/视频）与 {@code preserveHeic=false} 的 HEIC 同样走侧车。
      *
      * <p>判定全部交给 {@link InplaceSlimPolicy} 与 {@link PreviewEncodePolicy}，调用方不要再自己
      * 拼目录或文件名。规则幂等：同一张图片永远得到同一个路径。返回原图路径表示“这个类型就地覆盖”。
      */
     public static File previewPathFor(File original, boolean preserveHeic) {
         String format = InplaceSlimPolicy.targetFormat(original.getName());
-        if ("png".equals(format) || "jpg".equals(format)) {
+        if ("jpg".equals(format)) {
             return InplaceSlimPolicy.targetPath(original);
         }
         if ("heic".equals(format) && preserveHeic) {
             return InplaceSlimPolicy.targetPath(original);
         }
+        // png（以及 webp/bmp/gif/视频、关掉 preserveHeic 的 heic）落侧车目录
         return legacyPreviewPathFor(original, preserveHeic);
     }
 

@@ -266,6 +266,15 @@ private fun PrefItem(id: String, model: SettingsModel) {
             summary = stringResource(R.string.summary_skip_existing_remote)
         )
 
+        // 文案直接写中文：本页其余文案走字符串资源，但新增这一项没有对应的 R.string
+        // （本波只允许改这几个 ui/*.kt），而本模块界面只有中文一种语言
+        SettingId.WEBDAV_TAKEOVER -> SwitchPreference(
+            checked = model.webdavTakeover,
+            onCheckedChange = model::onWebdavTakeoverChange,
+            title = "接管相册已有照片（实验）",
+            summary = "把相册里已经上传过的照片登记进注册表；只登记，不下载任何字节"
+        )
+
         SettingId.UPLOAD_CONCURRENCY -> OverlayDropdownPreference(
             items = SettingsModel.CONCURRENCY_ITEMS,
             selectedIndex = model.concurrencyIndex,
@@ -341,8 +350,72 @@ private fun PrefItem(id: String, model: SettingsModel) {
 private fun ActionItem(id: String, model: SettingsModel) {
     when (id) {
         SettingId.TEST_CONNECTION -> TestConnectionAction(model)
+        SettingId.TAKEOVER_NOW -> TakeoverAction(model)
         SettingId.RESET_UPLOADED -> ResetUploadedAction(model)
         else -> error("没有为 $id 定义按钮行")
+    }
+}
+
+/**
+ * 立即接管：让相册进程把已有的云端行登记进注册表，一个字节都不下载。
+ *
+ * <p>不做确认框：它只往注册表补记录 —— 不下载、不删除、不改照片与相册行，
+ * 点错了再点一次也只是"都已登记"而已。真正要防的是"开关没打开就点"，
+ * 所以按钮可用性直接绑在 [SettingsModel.webdavTakeover] 上（模型侧还有一道同样的判断）。
+ */
+@Composable
+private fun TakeoverAction(model: SettingsModel) {
+    Column(verticalArrangement = Arrangement.spacedBy(BlockGap)) {
+        Row(
+            modifier = Modifier.padding(horizontal = ScreenMargin),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(BlockGap)
+        ) {
+            Button(
+                onClick = model::takeoverNow,
+                enabled = model.ready && model.webdavTakeover
+                        && model.takeoverState !is SettingsModel.ResetState.Running,
+                minWidth = 96.dp,
+                colors = ButtonDefaults.buttonColorsPrimary(
+                    disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
+                )
+            ) {
+                Text(text = "立即接管（不下载字节）")
+            }
+            TakeoverResultText(model.takeoverState, onDismiss = model::dismissTakeoverResult)
+        }
+        HintLine("先打开上面那条开关。接管只补注册表记录：不下载字节、不删除照片、不改相册行；相册需要在运行。")
+        if (!model.webdavTakeover) {
+            HintLine("接管还没有打开，按钮不可用。", error = true)
+        }
+    }
+}
+
+@Composable
+private fun RowScope.TakeoverResultText(
+    state: SettingsModel.ResetState,
+    onDismiss: () -> Unit
+) {
+    val text = when (state) {
+        SettingsModel.ResetState.Idle -> null
+        SettingsModel.ResetState.Running -> "正在通知相册…"
+        SettingsModel.ResetState.Sent -> "已通知相册，处理进度见日志（event=takeover_done）"
+        is SettingsModel.ResetState.Failed -> "发送失败：" + state.detail
+    }
+    val color = when (state) {
+        SettingsModel.ResetState.Sent -> MiuixTheme.colorScheme.primary
+        SettingsModel.ResetState.Running -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+        else -> MiuixTheme.colorScheme.error
+    }
+    if (text != null) {
+        Text(
+            text = text,
+            modifier = Modifier
+                .weight(1f)
+                .clickable { onDismiss() },
+            style = MiuixTheme.textStyles.body2,
+            color = color
+        )
     }
 }
 

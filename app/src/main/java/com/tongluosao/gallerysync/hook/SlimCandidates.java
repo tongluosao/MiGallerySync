@@ -29,10 +29,11 @@ import java.util.Map;
  * <p>第 3 波起筛选分两层：SQL 只做粗筛，状态由注册表在 Java 侧判。
  * <ul>
  *   <li>SQL 侧（粗筛）：{@code localFile} 是本机真实路径、不在 {@code .gallerysync-slim}
- *       镜像目录里、图片/视频、仅本地未同步、体积够大、有 sha1。原来那条
+ *       镜像目录里、不是 {@code .png}、图片/视频、仅本地未同步、体积够大、有 sha1。原来那条
  *       "{@code thumbnailFile} 在隐藏目录里就排除"的条件已经去掉：原地覆盖之后
  *       {@code localFile} 是原路径、{@code thumbnailFile} 为空，这两列根本分不出
- *       "已经优化过"和"还没优化"，继续按列猜只会把该跳过的行放进队列。</li>
+ *       "已经优化过"和"还没优化"，继续按列猜只会把该跳过的行放进队列。png 因为不参与空间优化
+ *       （{@code SlimHook} 里也会再判一次），直接在 SQL 里排除，免得它占"等待优化"的计数。</li>
  *   <li>Java 侧（精确过滤）：按 {@code _id} / {@code sha1} 查注册表登记的
  *       {@link OriginalStore.LocalState}，用 {@link PreviewStateRules#skipSlimCandidate}
  *       跳过已经优化（原地 / 侧车）、写入中途和损坏的行。没有登记记录的行照常进候选，
@@ -81,6 +82,9 @@ public final class SlimCandidates {
                 + " AND localFile <> ''"
                 + " AND localFile LIKE '/storage/emulated/0/%'"
                 + " AND localFile NOT LIKE '%/.gallerysync-slim/%'"
+                // PNG 不参与空间优化：无损重编收益小、超大图还会 OOM，连候选都不该占
+                // "等待优化"的计数。LOWER() 让大写的 .PNG 也被排除。
+                + " AND LOWER(localFile) NOT LIKE '%.png'"
                 + " AND serverType IN (1,2)"
                 + " AND localFlag = 7"
                 + " AND size > " + MIN_SIZE

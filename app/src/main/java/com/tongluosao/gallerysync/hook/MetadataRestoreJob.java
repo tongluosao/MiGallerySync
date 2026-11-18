@@ -11,6 +11,9 @@ import com.tongluosao.gallerysync.core.InplaceSlimPolicy;
 import com.tongluosao.gallerysync.core.Logger;
 import com.tongluosao.gallerysync.core.OriginalStore;
 import com.tongluosao.gallerysync.core.RemoteSuppress;
+import com.tongluosao.gallerysync.core.TakeoverPlanner;
+import com.tongluosao.gallerysync.core.UploadQueue;
+import com.tongluosao.gallerysync.core.WebDavClient;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -27,8 +30,10 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -73,6 +78,25 @@ public final class MetadataRestoreJob {
     /** reconcile_inplace 的 keeper 行要看的列：路径、预览位、指纹、远端状态与登记尺寸。 */
     private static final String[] RECONCILE_KEEPER_COLUMNS = new String[]{"_id", "localFile",
             "thumbnailFile", "sha1", "serverId", "size"};
+
+    /** 请求根上 {@code mode} 的取值：接管相册里已有的云端行，一个字节都不下载。 */
+    static final String TAKEOVER_MODE = "takeover";
+    /** takeover 枚举候选要看的列：身份、指纹、尺寸、本地路径与远端状态。 */
+    private static final String[] TAKEOVER_ROW_COLUMNS = new String[]{"_id", "sha1", "size",
+            "localFile", "fileName", "serverType", "localFlag", "serverId"};
+    private static final int TAKEOVER_SERVER_TYPE_IMAGE = 1;
+    private static final int TAKEOVER_SERVER_TYPE_VIDEO = 2;
+    /** {@code localFlag = 7} 是“本地已同步”：只有这类行的 {@code size} 才是当年上传的字节数。 */
+    private static final int TAKEOVER_LOCAL_FLAG_SYNCED = 7;
+    /** 各版本里“这行是正常本地照片”的 localFlag 取值（手机 7；平板 3.6 上是 0/8）。 */
+    private static final java.util.Set<Integer> TAKEOVER_ACCEPTED_FLAGS =
+            new java.util.HashSet<>(java.util.Arrays.asList(0, 7, 8));
+    /** 远端索引最多走几层：根目录算第 0 层，相册/年/月这种布局两层就到底了。 */
+    private static final int TAKEOVER_INDEX_MAX_DEPTH = 4;
+    /** 远端索引最多收多少个文件条目：一万多张照片 + 视频留足余量，再大就是远端树出了问题。 */
+    private static final int TAKEOVER_INDEX_MAX_ENTRIES = 60_000;
+    /** 远端索引最多列多少个目录：远端树异常深/异常宽时不能把整趟接管拖死。 */
+    private static final int TAKEOVER_INDEX_MAX_DIRS = 500;
 
     /** 单元测试的 JVM 里没有 Android 实现；解析失败时退化成 null（设备上不会发生）。 */
     private static Uri cloudUri() {
@@ -193,6 +217,24 @@ public final class MetadataRestoreJob {
         }
         boolean stoppedForSpace = false;
         boolean cancelled = false;
+        if (TAKEOVER_MODE.equals(request.mode)) {
+            // 接管模式自己按相册行枚举，不读 items / tempFiles：两条循环都不进
+            TakeoverRun run = runTakeover(context, config, store, target, request);
+            String status;
+            if (!run.reason.isEmpty()) {
+                status = "failed";
+            } else if (run.cancelled) {
+                status = "cancelled";
+            } else {
+                status = run.failed > 0 ? "partial" : "complete";
+            }
+            if (writeTakeoverResult(resultFile, jobId, target, status, run)) {
+                logStatus(status);
+            } else {
+                logStatus("result_write_failed");
+            }
+            return;
+        }
         // 整批只落盘一次：逐项保存会把数 MB 的注册表重写 N 次（三千项约 16 GB 写入）。
         store.beginBatch();
         try {
@@ -288,12 +330,447 @@ public final class MetadataRestoreJob {
         }
     }
 
+    /**
+     * 接管：把相册里已有的云端行登记进注册表，<b>一个字节都不下载</b>。
+     *
+     * <p>三步，顺序不能换：
+     * <ol>
+     *   <li>查相册库拿候选行：远端有对象（{@code serverId} 非空）、本地已同步
+     *       （{@code localFlag = 7}）、40 位 {@code sha1}、{@code size > 0}；</li>
+     *   <li>整趟只建一次远端索引（BFS 列目录，见 {@link #indexRemoteFiles}）—— 逐文件
+     *       {@code PROPFIND} 在一万张老照片上就是一万次往返，和“不下载字节”这个前提自相矛盾；</li>
+     *   <li>逐行解析远端路径（有 {@code localFile} 走上传算法，否则按 文件名 + 字节数 唯一命中），
+     *       再问 {@link TakeoverPlanner}，只有 TAKE_* 才写注册表；dryRun 只统计不落盘。</li>
+     * </ol>
+     *
+     * <p>任何一步问不出来（索引里没有、同名多义、登记被拒）都只跳过那一行：
+     * 接管是补登记，跳过不会让现状更差；登记错了却会让上传侧以为这些字节已经验证过。
+     */
+    private TakeoverRun runTakeover(Context context, Config config, OriginalStore store,
+            String target, Request request) {
+        TakeoverRun run = new TakeoverRun(request.dryRun);
+        List<TakeoverRow> rows;
+        try {
+            rows = readTakeoverRows(context, request.includeVideos);
+        } catch (Throwable failure) {
+            Logger.e("event=takeover_query_failed", failure);
+            run.reason = "takeover_query_failed";
+            return run;
+        }
+        Logger.i("event=takeover_rows rows=" + rows.size() + " includeVideos="
+                + request.includeVideos + " dryRun=" + request.dryRun);
+        Set<String> registered = store.remotePathsForTarget(config);
+        WebDavClient client;
+        try {
+            client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                    config.getPassword());
+        } catch (Throwable failure) {
+            Logger.e("event=takeover_client_failed", failure);
+            run.reason = "takeover_client_failed";
+            return run;
+        }
+        try {
+            // 远端树只走这一遍：索引按文件名归组，路径/大小都在里面，后面全是纯内存判断
+            Map<String, List<RemoteHit>> index = indexRemoteFiles(client, config.getRemoteRoot());
+            // 整趟只落盘一次：逐行保存会把注册表重写 N 次
+            store.beginBatch();
+            try {
+                int resolvedByName = 0;
+                for (TakeoverRow row : rows) {
+                    if (!isCurrent(target)) {
+                        run.cancelled = true;
+                        break;
+                    }
+                    Long remoteSize;
+                    if (row.localFile != null && !row.localFile.isEmpty()) {
+                        // a. 有本地路径：与上传侧同一套算法拼出远端路径，再按精确路径对字节数
+                        String remotePath = UploadQueue.remotePathFor(config, row.localFile,
+                                row.serverType == TAKEOVER_SERVER_TYPE_VIDEO, row.mtime);
+                        int slash = remotePath == null ? -1 : remotePath.lastIndexOf('/');
+                        if (remotePath == null || slash <= 0 || slash >= remotePath.length() - 1) {
+                            // 推不出远端路径（不在已知布局下）就没法证明远端有这份文件
+                            run.skip("remote_path_unknown");
+                            logTakeoverItem(row.rowId, "remote_path_unknown", "");
+                            continue;
+                        }
+                        row.remotePath = remotePath;
+                        RemoteHit hit = findIndexHit(index, remotePath);
+                        remoteSize = hit == null ? null : Long.valueOf(hit.size);
+                    } else {
+                        // b. 平板 3.6 的主体：localFile 与 albumId 都是空的，只剩 文件名 + 字节数
+                        RemoteResolve resolved = resolveRemotePath(row.fileName, row.size, index);
+                        if (resolved.status == RemoteResolve.Status.MISSING) {
+                            run.skip("remote_missing");
+                            logTakeoverItem(row.rowId, "remote_missing", "");
+                            continue;
+                        }
+                        if (resolved.status == RemoteResolve.Status.AMBIGUOUS) {
+                            run.skip("remote_ambiguous");
+                            logTakeoverItem(row.rowId, "remote_ambiguous", "");
+                            continue;
+                        }
+                        row.remotePath = resolved.remotePath;
+                        remoteSize = Long.valueOf(row.size);
+                        resolvedByName++;
+                        if (resolvedByName <= 5) {
+                            Logger.i("event=takeover_row_resolved_by_name row=" + row.rowId
+                                    + " remote=" + row.remotePath);
+                        }
+                    }
+                    evaluateTakeoverRow(config, store, run, row, remoteSize, registered);
+                }
+            } finally {
+                store.endBatch();
+            }
+        } finally {
+            try {
+                client.close();
+            } catch (Throwable ignored) {
+                // 关不掉客户端不影响已经登记的结果
+            }
+        }
+        Logger.i("event=takeover_done planned=" + run.planned + " taken=" + run.taken
+                + " skipped=" + run.skipped + " failed=" + run.failed + " dryRun="
+                + run.dryRun);
+        return run;
+    }
+
+    /**
+     * 一趟建好“文件名 → 远端命中列表”的索引：BFS 列目录，<b>绝不取字节</b>。
+     *
+     * <p>为什么是整棵树而不是逐目录：平板 3.6 的云端行既没有 {@code localFile} 也没有
+     * {@code albumId}，唯一能拿到的线索是 {@code fileName + size}；要知道这份文件在远端
+     * 哪个目录，只能把树走一遍。三个上限（层数/条目数/目录数）是给异常远端树兜底的：
+     * 走不完就少认几行，不会把整趟接管拖死。
+     *
+     * <p>单个目录列失败只记一条 {@code takeover_index_dir_failed} 就继续 ——
+     * 一个坏目录不该让整趟接管失败。
+     */
+    private static Map<String, List<RemoteHit>> indexRemoteFiles(WebDavClient client,
+            String remoteRoot) {
+        long start = System.currentTimeMillis();
+        Map<String, List<RemoteHit>> index = new HashMap<>();
+        String root = remoteRoot == null ? "" : remoteRoot;
+        if (client == null) {
+            Logger.w("event=takeover_index_dir_failed dir=" + root + " reason=client_unavailable");
+            return index;
+        }
+        ArrayDeque<IndexDir> pending = new ArrayDeque<>();
+        pending.add(new IndexDir(root, 0));
+        int entries = 0;
+        int dirs = 0;
+        while (!pending.isEmpty() && entries < TAKEOVER_INDEX_MAX_ENTRIES
+                && dirs < TAKEOVER_INDEX_MAX_DIRS) {
+            IndexDir dir = pending.poll();
+            dirs++;
+            List<WebDavClient.RemoteEntry> listed;
+            try {
+                Logger.d("event=takeover_index_list_start dir=" + dir.path + " depth=" + dir.depth);
+                listed = client.list(dir.path);
+                Logger.d("event=takeover_index_list_done dir=" + dir.path + " entries="
+                        + (listed == null ? -1 : listed.size()));
+            } catch (IOException failure) {
+                Logger.w("event=takeover_index_dir_failed dir=" + dir.path
+                        + " reason=list_failed");
+                continue;
+            } catch (Throwable failure) {
+                Logger.w("event=takeover_index_dir_failed dir=" + dir.path
+                        + " reason=list_failed");
+                continue;
+            }
+            if (listed == null) {
+                // list() 把 404 / 非 207 / 截断的回应变成 null：这个目录当“没列出来”
+                Logger.w("event=takeover_index_dir_failed dir=" + dir.path
+                        + " reason=list_unavailable");
+                continue;
+            }
+            for (WebDavClient.RemoteEntry entry : listed) {
+                if (entry == null || entry.name == null || entry.name.isEmpty()) continue;
+                if (entry.dir) {
+                    // 点开头的目录（.mgs-hashes 之类）是模块自己的元数据，不是照片
+                    if (entry.name.startsWith(".")) continue;
+                    if (dir.depth >= TAKEOVER_INDEX_MAX_DEPTH) continue;
+                    pending.add(new IndexDir(WebDavClient.joinPath(dir.path, entry.name),
+                            dir.depth + 1));
+                    continue;
+                }
+                if (entries >= TAKEOVER_INDEX_MAX_ENTRIES) break;
+                entries++;
+                List<RemoteHit> hits = index.get(entry.name);
+                if (hits == null) {
+                    hits = new ArrayList<>(1);
+                    index.put(entry.name, hits);
+                }
+                hits.add(new RemoteHit(WebDavClient.joinPath(dir.path, entry.name), entry.size));
+            }
+        }
+        Logger.i("event=takeover_index entries=" + entries + " dirs=" + dirs
+                + " ms=" + (System.currentTimeMillis() - start));
+        return index;
+    }
+
+    /**
+     * 纯解析：文件名 + 相册行登记的字节数 → 远端路径。
+     *
+     * <p>只有“同名、同字节数、而且只有一份”才算命中：瘦身行没有 {@code localFile}，
+     * 这两条同时成立是唯一能证明“远端那一份就是这张照片”的证据。同名同大小出现多份
+     * （换过目录/传过两次）时不猜，计入 {@code remote_ambiguous}。
+     */
+    static RemoteResolve resolveRemotePath(String fileName, long size,
+            Map<String, List<RemoteHit>> index) {
+        if (fileName == null || fileName.isEmpty() || index == null) {
+            return RemoteResolve.missing();
+        }
+        List<RemoteHit> hits = index.get(fileName);
+        if (hits == null || hits.isEmpty()) {
+            return RemoteResolve.missing();
+        }
+        RemoteHit match = null;
+        for (RemoteHit hit : hits) {
+            if (hit == null || hit.remotePath == null || hit.size != size) continue;
+            if (match != null) return RemoteResolve.ambiguous();
+            match = hit;
+        }
+        return match == null ? RemoteResolve.missing() : RemoteResolve.matched(match.remotePath);
+    }
+
+    /** 按精确远端路径在索引里找那一项（同名文件可能分布在多个目录）。 */
+    private static RemoteHit findIndexHit(Map<String, List<RemoteHit>> index, String remotePath) {
+        if (index == null || remotePath == null) return null;
+        int slash = remotePath.lastIndexOf('/');
+        if (slash < 0 || slash >= remotePath.length() - 1) return null;
+        List<RemoteHit> hits = index.get(remotePath.substring(slash + 1));
+        if (hits == null) return null;
+        for (RemoteHit hit : hits) {
+            if (hit != null && remotePath.equals(hit.remotePath)) return hit;
+        }
+        return null;
+    }
+
+    /** 判一行：能证明什么就登记成什么，证明不了就按 {@link TakeoverPlanner} 的结论跳过。 */
+    private static void evaluateTakeoverRow(Config config, OriginalStore store, TakeoverRun run,
+            TakeoverRow row, Long remoteSize, Set<String> registered) {
+        boolean hasSha1 = row.sha1 != null && row.sha1.matches("(?i)[0-9a-f]{40}");
+        if (!hasSha1) {
+            run.skip("skip_no_sha1");
+            logTakeoverItem(row.rowId, "skip_no_sha1", row.remotePath);
+            return;
+        }
+        if (registered.contains(row.remotePath)) {
+            // 已登记过（上传/恢复/上一次接管留下的）：不重复登记，也不去动已有的 sha256
+            run.skip("already_registered");
+            logTakeoverItem(row.rowId, "already_registered", row.remotePath);
+            return;
+        }
+        File local = row.localFile == null ? null : new File(row.localFile);
+        boolean localExists = local != null && local.isFile();
+        long localLength = localExists ? local.length() : 0L;
+        boolean remoteListed = remoteSize != null;
+        TakeoverPlanner.Decision decision = TakeoverPlanner.decide(remoteListed,
+                remoteListed ? remoteSize.longValue() : 0L, row.size, localExists, localLength,
+                true);
+        String name = TakeoverPlanner.describe(decision);
+        if (!TakeoverPlanner.isTake(decision)) {
+            run.skip(name);
+            logTakeoverItem(row.rowId, name, row.remotePath);
+            return;
+        }
+        run.planned++;
+        if (!run.dryRun) {
+            try {
+                boolean written = store.registerTakenOver(config, row.remotePath, row.size,
+                        row.rowId, row.sha1,
+                        decision == TakeoverPlanner.Decision.TAKE_AS_ORIGINAL
+                                ? OriginalStore.LocalState.ORIGINAL.wire()
+                                : OriginalStore.LocalState.REMOTE_ONLY.wire());
+                if (written) {
+                    run.taken++;
+                } else {
+                    run.failed++;
+                    run.count("register_rejected");
+                    Logger.w("event=takeover_register_rejected row=" + row.rowId
+                            + " remote=" + row.remotePath);
+                }
+            } catch (Throwable failure) {
+                run.failed++;
+                run.count("register_failed");
+                Logger.e("event=takeover_register_failed row=" + row.rowId
+                        + " remote=" + row.remotePath, failure);
+            }
+        }
+        logTakeoverItem(row.rowId, name, row.remotePath);
+    }
+
+    /**
+     * 查接管候选行。
+     *
+     * <p>选择条件的每一条都是“远端确实有这张照片”的必要证据：{@code serverId} 非空说明有云
+     * 对象；{@code localFlag = 7} 是本地已同步；{@code length(sha1) = 40} 是完整指纹；
+     * {@code size > 0} 排除占位行。视频默认一起接管，关掉时只取 {@code serverType = 1}。
+     *
+     * <p>{@code localFile} 为空的行照样留下（平板 3.6 上这是主体，连 {@code albumId} 都是 0）：
+     * 路径解析交给 {@link #runTakeover} 的远端索引，这里只负责把证据读全。
+     */
+    private static List<TakeoverRow> readTakeoverRows(Context context, boolean includeVideos)
+            throws IOException {
+        if (context == null || CLOUD_URI == null) {
+            throw new IOException("takeover_provider_unavailable");
+        }
+        // localFlag 的含义随版本变（手机上同步完成是 7，平板 3.6 上是 0/8），
+        // 所以不把它写进选择条件，读出来后在本地按可接受集合过滤，并把实到的分布打出来。
+        String selection = "serverId IS NOT NULL AND size > 0 AND length(sha1) = 40"
+                + (includeVideos ? " AND serverType IN (1, 2)" : " AND serverType = 1");
+        List<TakeoverRow> rows = new ArrayList<>();
+        int flagDropped = 0;
+        Map<Integer, Integer> flagCounts = new java.util.TreeMap<>();
+        Cursor cursor = null;
+        try {
+            cursor = context.getContentResolver().query(CLOUD_URI, TAKEOVER_ROW_COLUMNS,
+                    selection, null, "_id ASC");
+            if (cursor == null) {
+                throw new IOException("takeover_query_failed");
+            }
+            int idColumn = cursor.getColumnIndex("_id");
+            int sha1Column = cursor.getColumnIndex("sha1");
+            int sizeColumn = cursor.getColumnIndex("size");
+            int localColumn = cursor.getColumnIndex("localFile");
+            int nameColumn = cursor.getColumnIndex("fileName");
+            int typeColumn = cursor.getColumnIndex("serverType");
+            int flagColumn = cursor.getColumnIndex("localFlag");
+            int serverColumn = cursor.getColumnIndex("serverId");
+            while (cursor.moveToNext()) {
+                long rowId = idColumn < 0 ? 0L : cursor.getLong(idColumn);
+                if (rowId <= 0L) continue;
+                String localFile = localColumn < 0 || cursor.isNull(localColumn)
+                        ? null : cursor.getString(localColumn);
+                long size = sizeColumn < 0 || cursor.isNull(sizeColumn)
+                        ? 0L : cursor.getLong(sizeColumn);
+                if (size <= 0L) continue;
+                String sha1 = sha1Column < 0 || cursor.isNull(sha1Column)
+                        ? null : cursor.getString(sha1Column);
+                String fileName = nameColumn < 0 || cursor.isNull(nameColumn)
+                        ? null : cursor.getString(nameColumn);
+                int serverType = typeColumn < 0 || cursor.isNull(typeColumn)
+                        ? TAKEOVER_SERVER_TYPE_IMAGE : cursor.getInt(typeColumn);
+                int localFlag = flagColumn < 0 || cursor.isNull(flagColumn)
+                        ? -1 : cursor.getInt(flagColumn);
+                flagCounts.merge(localFlag, 1, Integer::sum);
+                if (!TAKEOVER_ACCEPTED_FLAGS.contains(localFlag)) {
+                    flagDropped++;
+                    continue;
+                }
+                String serverId = serverColumn < 0 || cursor.isNull(serverColumn)
+                        ? null : cursor.getString(serverColumn);
+                // localFile 为空时没有 mtime 可用：按时间分目录的布局只能退回 0（索引里会另找）
+                long mtime = localFile == null || localFile.isEmpty()
+                        ? 0L : new File(localFile).lastModified();
+                rows.add(new TakeoverRow(rowId, sha1, size, localFile, fileName, serverType,
+                        localFlag, serverId, mtime));
+            }
+        } finally {
+            if (cursor != null) {
+                try {
+                    cursor.close();
+                } catch (Throwable ignored) {
+                    // 关游标失败不影响已经读到的行
+                }
+            }
+        }
+        if (!flagCounts.isEmpty()) {
+            Logger.i("event=takeover_flags counts=" + flagCounts + " dropped=" + flagDropped);
+        }
+        return rows;
+    }
+
+    /**
+     * 写一份 takeover 请求（{@code GalleryHooks} 收到 {@code CMD_TAKEOVER} 时调用）。
+     *
+     * <p>请求文件由相册进程自己写：模块 App 只发一条广播，不碰这个 JSON，
+     * 免得两个进程各写一半。
+     */
+    static boolean writeTakeoverRequest(Context context, Config config) {
+        return writeTakeoverRequest(context, config, false);
+    }
+
+    /** 同上，{@code dryRun} 为 true 时只出统计、不写注册表（也不下载任何字节）。 */
+    static boolean writeTakeoverRequest(Context context, Config config, boolean dryRun) {
+        if (context == null || config == null || !config.isReady()) return false;
+        File directory = new File(context.getFilesDir(), DIRECTORY_NAME);
+        if (!directory.isDirectory() && !directory.mkdirs()) {
+            return false;
+        }
+        File requestFile = new File(directory, REQUEST_NAME);
+        try {
+            JSONObject root = new JSONObject();
+            root.put("jobId", "takeover-" + System.currentTimeMillis());
+            root.put("target", OriginalStore.targetKey(config));
+            root.put("mode", TAKEOVER_MODE);
+            root.put("dryRun", dryRun);
+            root.put("includeVideos", true);
+            writeJsonAtomically(requestFile, root);
+            return requestFile.isFile() && requestFile.length() > 0L;
+        } catch (Throwable failure) {
+            Logger.e("event=takeover_request_write_failed", failure);
+            return false;
+        }
+    }
+
+    /** 接管结果：根上只有计数与原因直方图，没有逐项 items（几千行的逐项清单没人读）。 */
+    private static boolean writeTakeoverResult(File resultFile, String jobId, String target,
+            String status, TakeoverRun run) {
+        try {
+            JSONObject root = new JSONObject();
+            root.put("jobId", jobId == null ? "" : jobId);
+            root.put("target", target == null ? "" : target);
+            root.put("status", status);
+            if (!run.reason.isEmpty()) root.put("reason", run.reason);
+            root.put("mode", TAKEOVER_MODE);
+            root.put("dryRun", run.dryRun);
+            root.put("planned", run.planned);
+            root.put("taken", run.taken);
+            root.put("skipped", run.skipped);
+            root.put("failed", run.failed);
+            JSONObject reasons = new JSONObject();
+            for (Map.Entry<String, Integer> entry : run.reasons.entrySet()) {
+                reasons.put(entry.getKey(), entry.getValue().intValue());
+            }
+            root.put("reasons", reasons);
+            writeJsonAtomically(resultFile, root);
+            return resultFile.isFile() && resultFile.length() > 0L;
+        } catch (Throwable failure) {
+            Logger.e("event=metadata_restore_result_write_failed status=io_error");
+            return false;
+        }
+    }
+
+    /** 原子写 JSON：临时文件 + fsync + 改名，读侧永远看不到写了一半的文件。 */
+    private static void writeJsonAtomically(File file, JSONObject root) throws IOException {
+        File temporary = new File(file.getParentFile(), file.getName() + ".tmp");
+        try (FileOutputStream output = new FileOutputStream(temporary, false)) {
+            output.write(root.toString().getBytes(StandardCharsets.UTF_8));
+            output.flush();
+            output.getFD().sync();
+        }
+        try {
+            Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException atomicFailure) {
+            Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private static void logTakeoverItem(long rowId, String decision, String remotePath) {
+        Logger.i("event=takeover_item row=" + rowId + " decision=" + decision + " remote="
+                + (remotePath == null ? "" : remotePath));
+    }
+
     private ItemResult restoreOne(Context context, Config config, OriginalStore store,
             String target, RequestItem item) throws Exception {
         if (!isCurrent(target)) return new ItemResult(item.row, "cancelled", "job_stopped");
         OriginalStore.Record record = store.find(config, item.row, item.sha1);
         if (record == null) return new ItemResult(item.row, "failed", "no_registry_record");
-        if (!target.equals(record.target) || !record.sha256.equalsIgnoreCase(item.sha256)
+        if (!target.equals(record.target) || record.sha256 == null
+                || !record.sha256.equalsIgnoreCase(item.sha256)
                 || record.originalLength != item.length) {
             return new ItemResult(item.row, "failed", "registry_metadata_mismatch");
         }
@@ -367,7 +844,8 @@ public final class MetadataRestoreJob {
         if (!isCurrent(target)) return new ItemResult(item.row, "cancelled", "job_stopped");
         OriginalStore.Record record = store.find(config, item.row, item.sha1);
         if (record == null) return new ItemResult(item.row, "failed", "no_registry_record");
-        if (!target.equals(record.target) || !record.sha256.equalsIgnoreCase(item.sha256)
+        if (!target.equals(record.target) || record.sha256 == null
+                || !record.sha256.equalsIgnoreCase(item.sha256)
                 || record.originalLength != item.length) {
             return new ItemResult(item.row, "failed", "registry_metadata_mismatch");
         }
@@ -2554,6 +3032,10 @@ public final class MetadataRestoreJob {
         if (candidate == null) return CleanupResult.failed("related_file_path_unsafe");
         VerifiedCopy verified = verifyDerivedCopy(row.localFile, record);
         if (verified == null) return CleanupResult.failed("related_file_not_registered");
+        if (record.sha256 == null) {
+            // 接管登记没有摘要：分不清这份副本是不是原图，按 fail-closed 拒绝
+            return CleanupResult.failed("original_digest_unknown");
+        }
         if (record.sha256.equalsIgnoreCase(verified.digest)) {
             return CleanupResult.failed("related_file_is_original");
         }
@@ -2791,9 +3273,25 @@ public final class MetadataRestoreJob {
             throw new IOException("invalid_job_id");
         }
         if (!target.matches("[0-9a-f]{64}")) throw new IOException("invalid_target");
+        // 根上的 mode：缺省是老的逐项模式；只认 "takeover"，别的值整单拒掉（fail-closed：
+        // 一个拼错模式的请求绝不能退化成逐项 restore 去动相册行）。
+        String requestMode = root.has("mode") && !root.isNull("mode")
+                ? root.getString("mode") : "";
+        if (!requestMode.isEmpty() && !TAKEOVER_MODE.equals(requestMode)) {
+            throw new IOException("invalid_request_mode");
+        }
         // 请求根上的 dryRun：缺省 false，只接受布尔。它只影响 migrate_inplace，其余模式忽略。
         boolean dryRun = parseDryRun(root.has("dryRun") && !root.isNull("dryRun")
                 ? root.get("dryRun") : null);
+        if (TAKEOVER_MODE.equals(requestMode)) {
+            // 接管模式自己按相册行枚举，形状与逐项请求完全不同：出现 items 说明请求造错了，
+            // 照老路解析会要求 1..MAX_ITEMS 条逐项清单，最后一条都不执行。
+            if (root.has("items")) throw new IOException("takeover_items_not_allowed");
+            boolean includeVideos = parseIncludeVideos(root.has("includeVideos")
+                    && !root.isNull("includeVideos") ? root.get("includeVideos") : null);
+            return new Request(jobId, target.toLowerCase(Locale.ROOT), new ArrayList<>(),
+                    new ArrayList<>(), dryRun, TAKEOVER_MODE, includeVideos);
+        }
         JSONArray array = root.getJSONArray("items");
         if (array.length() == 0 || array.length() > MAX_ITEMS) {
             throw new IOException("invalid_item_count");
@@ -3058,6 +3556,18 @@ public final class MetadataRestoreJob {
         throw new IOException("invalid_dry_run");
     }
 
+    /**
+     * 请求根上的 includeVideos：缺省（或显式 null）为 true，只接受 JSON 布尔。
+     *
+     * <p>抽成纯函数与 {@link #parseDryRun} 同一个理由：它决定“视频要不要一起接管”，
+     * 解析错了就会把视频行按图片行的尺寸规则去比，结果是一整批误导出的跳过。
+     */
+    static boolean parseIncludeVideos(Object raw) throws IOException {
+        if (raw == null) return true;
+        if (raw instanceof Boolean) return ((Boolean) raw).booleanValue();
+        throw new IOException("invalid_include_videos");
+    }
+
     /** 请求条目模式白名单：老模式逐条保留，本波新增两个原地迁移模式与重复行收拾模式。 */
     static boolean isSupportedItemMode(String mode) {
         return "restore".equals(mode) || "unslim".equals(mode) || "legacy_copies".equals(mode)
@@ -3227,14 +3737,25 @@ public final class MetadataRestoreJob {
         final List<String> tempFiles;
         /** 请求根上的 dryRun：只对 migrate_inplace 有意义，缺省 false。 */
         final boolean dryRun;
+        /** 请求根上的 mode："" 是老逐项模式，{@link #TAKEOVER_MODE} 是自枚举接管。 */
+        final String mode;
+        /** takeover 是否连视频一起接管；其它模式恒为 true（不读）。 */
+        final boolean includeVideos;
 
         Request(String jobId, String target, List<RequestItem> items, List<String> tempFiles,
                 boolean dryRun) {
+            this(jobId, target, items, tempFiles, dryRun, "", true);
+        }
+
+        Request(String jobId, String target, List<RequestItem> items, List<String> tempFiles,
+                boolean dryRun, String mode, boolean includeVideos) {
             this.jobId = jobId;
             this.target = target;
             this.items = items;
             this.tempFiles = tempFiles;
             this.dryRun = dryRun;
+            this.mode = mode == null ? "" : mode;
+            this.includeVideos = includeVideos;
         }
     }
 
@@ -3299,6 +3820,109 @@ public final class MetadataRestoreJob {
     private static final class UnslimState {
         int clearedRows;
         int deletedCopies;
+    }
+
+    /** takeover 的一行候选：相册行字段 + 运行期解析出来的远端路径。 */
+    private static final class TakeoverRow {
+        final long rowId;
+        final String sha1;
+        final long size;
+        final String localFile;
+        final String fileName;
+        final int serverType;
+        final int localFlag;
+        final String serverId;
+        /** 本地文件最后修改时间：按时间分目录的布局拿它当 upload date 的近似。 */
+        final long mtime;
+        String remotePath = "";
+
+        TakeoverRow(long rowId, String sha1, long size, String localFile, String fileName,
+                int serverType, int localFlag, String serverId, long mtime) {
+            this.rowId = rowId;
+            this.sha1 = sha1;
+            this.size = size;
+            this.localFile = localFile;
+            this.fileName = fileName;
+            this.serverType = serverType;
+            this.localFlag = localFlag;
+            this.serverId = serverId;
+            this.mtime = mtime;
+        }
+    }
+
+    /** 远端索引里的一条命中：绝对远端路径 + 列目录时报的字节数。 */
+    static final class RemoteHit {
+        final String remotePath;
+        final long size;
+
+        RemoteHit(String remotePath, long size) {
+            this.remotePath = remotePath;
+            this.size = size;
+        }
+    }
+
+    /** 索引 BFS 里的一个待列目录：路径 + 层数（根目录为第 0 层）。 */
+    private static final class IndexDir {
+        final String path;
+        final int depth;
+
+        IndexDir(String path, int depth) {
+            this.path = path;
+            this.depth = depth;
+        }
+    }
+
+    /** 按文件名解析远端路径的结论：唯一命中、同名多义、还是没有。 */
+    static final class RemoteResolve {
+        enum Status { MATCH, AMBIGUOUS, MISSING }
+
+        final Status status;
+        /** 只有 {@code MATCH} 时非空 */
+        final String remotePath;
+
+        private RemoteResolve(Status status, String remotePath) {
+            this.status = status;
+            this.remotePath = remotePath;
+        }
+
+        static RemoteResolve matched(String remotePath) {
+            return new RemoteResolve(Status.MATCH, remotePath);
+        }
+
+        static RemoteResolve ambiguous() {
+            return new RemoteResolve(Status.AMBIGUOUS, null);
+        }
+
+        static RemoteResolve missing() {
+            return new RemoteResolve(Status.MISSING, null);
+        }
+    }
+
+    /** 接管一趟的计数：{@code planned} 是“本会登记”，{@code taken} 是真的写进去了。 */
+    private static final class TakeoverRun {
+        final boolean dryRun;
+        final Map<String, Integer> reasons = new LinkedHashMap<>();
+        boolean cancelled;
+        /** 整趟失败（查询不了/建不了客户端）的原因；非空时结果 status=failed。 */
+        String reason = "";
+        int planned;
+        int taken;
+        int skipped;
+        int failed;
+
+        TakeoverRun(boolean dryRun) {
+            this.dryRun = dryRun;
+        }
+
+        void count(String name) {
+            Integer previous = reasons.get(name);
+            reasons.put(name, previous == null ? 1 : previous + 1);
+        }
+
+        void skip(String name) {
+            skipped++;
+            count(name);
+        }
     }
 
     /** 一个候选预览路径的行清理结果；reason 非空表示失败。 */

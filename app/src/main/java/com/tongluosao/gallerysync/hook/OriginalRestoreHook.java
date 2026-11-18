@@ -15,7 +15,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,6 +46,10 @@ final class OriginalRestoreHook {
     private static final String LISTENER = "com.miui.gallery.util.cloudimageloader.CloudImageLoadingListener";
     private static final String ERROR_CODE = "com.miui.gallery.error.core.ErrorCode";
     private static final String DOWNLOAD_MENU = "com.miui.gallery.ui.photoPage.bars.menuitem.DownloadOriginal";
+    /** 菜单过滤回调的方法名；各版相册参数表不同，靠 {@link MenuHookSignature} 逐档放宽。 */
+    private static final String MENU_FILTER_METHOD = "onFilterFinished";
+    /** 旧日志里的缺失描述，保持原样，方便继续按它 grep。 */
+    private static final String MENU_FILTER_MISSING = "DownloadOriginal.onFilterFinished/2";
     private static final String MENU_HOLDER = "com.miui.gallery.ui.photoPage.bars.PhotoPageMenuManager$MenuItemHolder";
     private static final String MENU_ITEM_TYPE = "com.miui.gallery.ui.photoPage.bars.PhotoPageMenuManager$MenuItemType";
     /** BaseDataItem 上可能指向本机完整原图的候选路径，顺序即优先级。 */
@@ -1187,7 +1194,25 @@ final class OriginalRestoreHook {
                             return chain.proceed();
                         }
                     });
-            Method filter = menu.getDeclaredMethod("onFilterFinished", item, LinkedHashMap.class);
+            // 各版相册的菜单过滤回调签名不一致（2 参带 LinkedHashMap / 1 参 / 换参数类型），
+            // 先把这个类（含父类）声明的方法都收成签名，再交给 MenuHookSignature 逐档放宽匹配。
+            List<String> declaredSignatures = new ArrayList<>();
+            Map<String, Method> filterMethods = new LinkedHashMap<>();
+            for (Class<?> type = menu; type != null && type != Object.class;
+                    type = type.getSuperclass()) {
+                for (Method declared : type.getDeclaredMethods()) {
+                    String signature = menuSignature(declared);
+                    if (filterMethods.containsKey(signature)) continue;
+                    filterMethods.put(signature, declared);
+                    declaredSignatures.add(signature);
+                }
+            }
+            List<String> filterCandidates =
+                    MenuHookSignature.candidatesFor(MENU_FILTER_METHOD, declaredSignatures);
+            if (filterCandidates.isEmpty()) {
+                throw new NoSuchMethodException(MENU_FILTER_MISSING
+                        + " candidates=" + declaredSignatures);
+            }
             Method refreshItem = menu.getDeclaredMethod("refreshDownloadItem", item,
                     boolean.class, boolean.class);
             Method refreshState = menu.getDeclaredMethod("refreshDownloadItem",
@@ -1203,7 +1228,6 @@ final class OriginalRestoreHook {
             Method isBottomVisible = menuHolder.getDeclaredMethod("isBottomMenuItemVisible",
                     galleryMenuItem);
             Object downloadType = menuItemType.getField("DOWNLOAD_ORIGINAL").get(null);
-            filter.setAccessible(true);
             refreshItem.setAccessible(true);
             refreshState.setAccessible(true);
             isSupport.setAccessible(true);
@@ -1271,31 +1295,73 @@ final class OriginalRestoreHook {
                         }
                         return chain.proceed();
                     });
-            mXposed.hook(filter).setId("gallery_managed_original_menu")
-                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
-                    .intercept(chain -> {
-                        Object result = chain.proceed();
-                        Object dataItem = chain.getArg(0);
-                        if (mOriginHookReady && mImageLoaderHookReady && restorableItem(dataItem)) {
-                            try {
-                                // Keep Gallery's per-item title when initialized, then force the
-                                // visible/enabled state through the overload without its
-                                // isFunctionInit early return.
-                                refreshItem.invoke(chain.getThisObject(), dataItem, true, true);
-                                refreshState.invoke(chain.getThisObject(), true, true);
-                                mMenuHookReady = true;
-                                Logger.d("event=managed_original_menu_enabled");
-                            } catch (Throwable t) {
-                                Logger.w("event=managed_original_menu_enable_failed", t);
+            int filterHooks = 0;
+            for (String signature : filterCandidates) {
+                Method filter = filterMethods.get(signature);
+                if (filter == null) continue;
+                filter.setAccessible(true);
+                String hookId = filterHooks == 0 ? "gallery_managed_original_menu"
+                        : "gallery_managed_original_menu_" + filterHooks;
+                mXposed.hook(filter).setId(hookId)
+                        .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                        .intercept(chain -> {
+                            Object result = chain.proceed();
+                            // 各版参数个数不同：先找声明类型为 BaseDataItem 的那个实参，再找
+                            // 可过滤的 Map 实参；两者都可能缺席，缺席就只做标题/可见性过滤。
+                            Object dataItem = null;
+                            Map<?, ?> filterMap = null;
+                            for (Object arg : chain.getArgs()) {
+                                if (dataItem == null && item.isInstance(arg)) {
+                                    dataItem = arg;
+                                } else if (filterMap == null && arg instanceof Map) {
+                                    filterMap = (Map<?, ?>) arg;
+                                }
                             }
-                        }
-                        return result;
-                    });
+                            if (mOriginHookReady && mImageLoaderHookReady
+                                    && menu.isInstance(chain.getThisObject())
+                                    && restorableItem(dataItem)) {
+                                try {
+                                    // Keep Gallery's per-item title when initialized, then force
+                                    // the visible/enabled state through the overload without its
+                                    // isFunctionInit early return. 2 参签名的 LinkedHashMap 只是
+                                    // Gallery 自己的过滤结果，本模块从不改动它；1 参签名没有 Map
+                                    // 可改，这里同样只做标题/可见性过滤。
+                                    refreshItem.invoke(chain.getThisObject(), dataItem, true, true);
+                                    refreshState.invoke(chain.getThisObject(), true, true);
+                                    mMenuHookReady = true;
+                                    Logger.d("event=managed_original_menu_enabled filter="
+                                            + (filterMap != null ? "map" : "none"));
+                                } catch (Throwable t) {
+                                    Logger.w("event=managed_original_menu_enable_failed", t);
+                                }
+                            }
+                            return result;
+                        });
+                filterHooks++;
+                Logger.i("event=original_restore_menu_hook_bound method="
+                        + MenuHookSignature.methodNameOf(signature)
+                        + "/" + MenuHookSignature.arityOf(signature)
+                        + " signature=" + signature);
+            }
+            if (filterHooks == 0) {
+                throw new NoSuchMethodException(MENU_FILTER_MISSING);
+            }
             mMenuHookReady = true;
-            Logger.i("event=hook_registered method=MenuItemHolder.isBottomMenuItemVisible + BaseMenuItemDelegate.isSupport + DownloadOriginal.onFilterFinished(BaseDataItem,LinkedHashMap)");
+            Logger.i("event=hook_registered method=MenuItemHolder.isBottomMenuItemVisible + BaseMenuItemDelegate.isSupport + DownloadOriginal menu filter/2");
         } catch (Throwable t) {
-            Logger.e("event=original_restore_menu_hook_missing method=DownloadOriginal.onFilterFinished/2", t);
+            Logger.e("event=original_restore_menu_hook_missing method=" + MENU_FILTER_MISSING, t);
         }
+    }
+
+    /** 反射方法转 {@code name(paramType1,paramType2)} 形式的签名，参数类型只留简单名。 */
+    private static String menuSignature(Method method) {
+        StringBuilder sb = new StringBuilder(method.getName()).append('(');
+        Class<?>[] params = method.getParameterTypes();
+        for (int i = 0; i < params.length; i++) {
+            if (i > 0) sb.append(',');
+            sb.append(MenuHookSignature.simpleName(params[i].getTypeName()));
+        }
+        return sb.append(')').toString();
     }
 
     private Request requestForManager(Object manager) {

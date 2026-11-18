@@ -6,9 +6,9 @@ import com.tongluosao.gallerysync.core.Config
  * 设置页每一个可交互项的稳定 id。
  *
  * <p>绝大多数直接复用 [Config] 的落盘键 —— 界面上的那一行就是那条配置，另起一套 id
- * 只会让两边慢慢对不上。剩下三个是纯界面项：测试连接与重置已上传标记两个按钮没有配置，
- * 主题模式的键在 [SettingsModel] 里是私有的，这里照抄同一个字面量，值必须与
- * `SettingsModel.KEY_THEME_MODE` 一致。
+ * 只会让两边慢慢对不上。剩下几个是纯界面项：测试连接、立即接管、重置已上传标记三个按钮
+ * 没有配置；主题模式与“接管”开关的键在 [SettingsModel] 里，这里照抄同一个字面量，
+ * 值必须与那边一致。
  *
  * <p>本文件是纯 Kotlin（不引 Compose / Android），分组因此可以直接单测：
  * 测试只需要枚举 [SECTIONS] 就能核对"每个设置项恰好归到一组"。
@@ -30,11 +30,22 @@ object SettingId {
     val LOCAL_FLAG_MODE = Config.KEY_LOCAL_FLAG_MODE
     val UI_MASK = Config.KEY_UI_MASK
 
+    /**
+     * “接管相册已有照片”的开关，键见 `SettingsModel.KEY_WEBDAV_TAKEOVER`。
+     *
+     * <p>没有对应的 [Config] 常量：真正干活的是相册进程，它只在收到“立即接管”命令时
+     * 才动手，这条开关只决定界面上的按钮可不可用。
+     */
+    const val WEBDAV_TAKEOVER = SettingsModel.KEY_WEBDAV_TAKEOVER
+
     /** 主题模式只有本页读，键见 `SettingsModel.KEY_THEME_MODE`，没有对应的 [Config] 常量 */
     const val THEME_MODE = "ui_theme_mode"
 
     /** 纯界面动作：测试连接。点一下就走，没有任何落盘内容 */
     const val TEST_CONNECTION = "ui:test_connection"
+
+    /** 纯界面动作：立即接管（不下载字节）。只在前面那条开关打开时可用 */
+    const val TAKEOVER_NOW = "ui:takeover_now"
 
     /** 纯界面动作：重置已上传标记。改的是相册那边的表，不是本模块的配置 */
     const val RESET_UPLOADED = "ui:reset_uploaded"
@@ -63,11 +74,13 @@ private val FIELD_IDS = setOf(
 /** 没有落盘键的按钮项 */
 private val ACTION_IDS = setOf(
     SettingId.TEST_CONNECTION,
+    SettingId.TAKEOVER_NOW,
     SettingId.RESET_UPLOADED
 )
 
 /** 纯界面项 id：不在 [SettingsModel.ALL_SETTING_KEYS] 里，因为根本没有配置可写 */
-val UI_ONLY_IDS: List<String> = listOf(SettingId.TEST_CONNECTION, SettingId.RESET_UPLOADED)
+val UI_ONLY_IDS: List<String> =
+    listOf(SettingId.TEST_CONNECTION, SettingId.TAKEOVER_NOW, SettingId.RESET_UPLOADED)
 
 internal fun itemKind(id: String): ItemKind = when (id) {
     in FIELD_IDS -> ItemKind.FIELD
@@ -129,6 +142,8 @@ enum class SettingsSection(val title: String, val items: List<String>) {
             SettingId.REMOTE_LAYOUT,
             SettingId.VERIFY_ASYNC,
             SettingId.SKIP_EXISTING_REMOTE,
+            SettingId.WEBDAV_TAKEOVER,
+            SettingId.TAKEOVER_NOW,
             SettingId.UPLOAD_CONCURRENCY,
             SettingId.MAX_UPLOAD_BYTES
         )

@@ -1,6 +1,7 @@
 package com.tongluosao.gallerysync.core;
 
 import android.content.Context;
+import android.os.SystemClock;
 
 import com.tongluosao.gallerysync.hook.CloudItemReader;
 import com.tongluosao.gallerysync.hook.HostSyncState;
@@ -176,6 +177,8 @@ public final class UploadQueue {
      * 叠起来，又不至于为几张照片再开一堆连接。
      */
     private static final int VERIFY_THREADS = 2;
+    /** 异步复核的总时限：超过就按“长度已确认、字节未回读”记成功，避免慢服务器把复核线程占死。 */
+    private static final long VERIFY_DEADLINE_MS = 30_000L;
     /**
      * 待复核项的积压上限。满了就退回同步复核（发完自己等），宁可这一项慢一点，
      * 也不能让待复核项无上限地堆在内存里。
@@ -1851,6 +1854,17 @@ public final class UploadQueue {
                 long phaseAt = phase("verify_start", index, job.task,
                         "remote=" + job.remotePath + " mode=async");
                 client.requireStoredAs(job.remotePath, job.size);
+                if (SystemClock.elapsedRealtime() - phaseAt > VERIFY_DEADLINE_MS) {
+                    // 服务器慢（冷对象 PROPFIND 可达数十秒）时不能无限占住复核线程：长度已确认就把
+                    // 该项记成功、但不写旁车（摘要必须由字节回读证明，超时不算证明）。
+                    Logger.w("event=verify_deadline_proceed remote=" + job.remotePath
+                            + " elapsed=" + (SystemClock.elapsedRealtime() - phaseAt));
+                    ok = finalizeOk(job.task, job.config, job.remotePath, "verify-timeout-" + index,
+                            job.uploadedSha256, job.size, job.uploadedMtime, false, false);
+                    Logger.i("event=verify_async_done ok=" + ok + " path=" + job.task.path
+                            + " remote=" + job.remotePath + " bytesVerified=false");
+                    continue;
+                }
                 // 长度只是"候选"：字节回读核对过才算合格，不合格按普通失败重传 ——
                 // 它同时也是写远端旁车的前提（旁车摘要来自本地，不能自己证明自己）
                 requireMatchingRemoteBytes(client, job.remotePath, new File(job.task.path),

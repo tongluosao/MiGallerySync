@@ -68,6 +68,14 @@ class SettingsModel : CoroutineScope {
     /** HEIC 优化或下载是否保持原格式 */
     var preserveHeicFormat by mutableStateOf(Config.DEFAULT_PRESERVE_HEIC_FORMAT)
         private set
+    /**
+     * “接管”相册里已有的云端行：只往注册表补登记，一个字节都不下载。
+     *
+     * <p>默认关闭，且“立即接管”按钮只有它开着才可用 —— 接管会改变上传侧对一批老照片的
+     * 判断（登记成 REMOTE_ONLY 后不再上传），必须由用户明确打开。
+     */
+    var webdavTakeover by mutableStateOf(false)
+        private set
     /** 记录方式下标：0 = 与相册共用，1 = 按目标分开记录。对应 [FLAG_MODE_VALUES] */
     var localFlagModeIndex by mutableStateOf(0)
         private set
@@ -93,6 +101,16 @@ class SettingsModel : CoroutineScope {
 
     /** "重置已上传标记"的进行状态；见 [resetUploaded] */
     var resetState by mutableStateOf<ResetState>(ResetState.Idle)
+        private set
+
+    /**
+     * "立即接管"的进行状态；见 [takeoverNow]。
+     *
+     * <p>形状与 [ResetState] 相同：同样是单向广播、同样拿不到相册侧回执，
+     * 所以 [ResetState.Sent] 的语义也只是"命令已发出"，真实计数记在相册侧日志
+     * （`event=takeover_done planned=… taken=…`）。
+     */
+    var takeoverState by mutableStateOf<ResetState>(ResetState.Idle)
         private set
 
     /** 写入失败（service 掉线或 binder 异常）时置真，下一次成功写入清零 */
@@ -177,6 +195,11 @@ class SettingsModel : CoroutineScope {
         writeNow(Config.KEY_PRESERVE_HEIC_FORMAT, checked)
     }
 
+    fun onWebdavTakeoverChange(checked: Boolean) {
+        webdavTakeover = checked
+        writeNow(KEY_WEBDAV_TAKEOVER, checked)
+    }
+
     /** 落盘的是字符串（shared / per_target），不是下标 —— 详见 Config.KEY_LOCAL_FLAG_MODE */
     fun onLocalFlagModeChange(index: Int) {
         localFlagModeIndex = index.coerceIn(0, FLAG_MODE_VALUES.lastIndex)
@@ -240,6 +263,44 @@ class SettingsModel : CoroutineScope {
 
     fun dismissResetResult() {
         resetState = ResetState.Idle
+    }
+
+    /**
+     * 让相册进程把已有的云端行登记进注册表（一个字节都不下载）。
+     *
+     * <p>与 [resetUploaded] 同一条通道（定向广播给相册进程），因为只有相册能读自己的
+     * cloud 表。开关关着时这里直接拒绝 —— 按钮本身也会置灰，这道判断是兜底：
+     * 接管会往注册表里写记录，不能靠界面状态来保证"用户真的打开过"。
+     */
+    fun takeoverNow() {
+        if (takeoverState is ResetState.Running) {
+            return
+        }
+        if (!webdavTakeover) {
+            takeoverState = ResetState.Failed("请先打开「接管相册已有照片」")
+            return
+        }
+        val app = App.application()
+        if (app == null) {
+            takeoverState = ResetState.Failed("应用未就绪")
+            return
+        }
+        takeoverState = ResetState.Running
+        val intent = Intent(ProgressProtocol.ACTION_COMMAND)
+            // 定向到相册：接收器注册在相册进程里，写成本模块就永远送不到
+            .setPackage(ProgressProtocol.TARGET_PACKAGE)
+            .putExtra(ProgressProtocol.EXTRA_COMMAND, ProgressProtocol.CMD_TAKEOVER)
+        try {
+            app.sendBroadcast(intent)
+            takeoverState = ResetState.Sent
+        } catch (t: Throwable) {
+            Logger.w("event=ui_takeover_failed", t)
+            takeoverState = ResetState.Failed(t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    fun dismissTakeoverResult() {
+        takeoverState = ResetState.Idle
     }
 
     // endregion
@@ -387,6 +448,7 @@ class SettingsModel : CoroutineScope {
         preserveHeicFormat = source.getBoolean(
             Config.KEY_PRESERVE_HEIC_FORMAT, Config.DEFAULT_PRESERVE_HEIC_FORMAT
         )
+        webdavTakeover = source.getBoolean(KEY_WEBDAV_TAKEOVER, false)
         localFlagModeIndex = flagModeIndexOf(
             source.getString(Config.KEY_LOCAL_FLAG_MODE, Config.DEFAULT_LOCAL_FLAG_MODE)
         )
@@ -428,6 +490,8 @@ class SettingsModel : CoroutineScope {
 
             Config.KEY_PRESERVE_HEIC_FORMAT -> preserveHeicFormat =
                 source.getBoolean(key, Config.DEFAULT_PRESERVE_HEIC_FORMAT)
+
+            KEY_WEBDAV_TAKEOVER -> webdavTakeover = source.getBoolean(key, false)
 
             Config.KEY_LOCAL_FLAG_MODE -> localFlagModeIndex = flagModeIndexOf(
                 source.getString(key, Config.DEFAULT_LOCAL_FLAG_MODE)
@@ -527,6 +591,7 @@ class SettingsModel : CoroutineScope {
             Config.KEY_REMOTE_LAYOUT,
             Config.KEY_VERIFY_ASYNC,
             Config.KEY_SKIP_EXISTING_REMOTE,
+            KEY_WEBDAV_TAKEOVER,
             Config.KEY_UPLOAD_CONCURRENCY,
             Config.KEY_MAX_UPLOAD_BYTES,
             Config.KEY_PRESERVE_METADATA,
@@ -576,6 +641,13 @@ class SettingsModel : CoroutineScope {
 
         /** 仅界面读取的键，[Config] 不认识它，Hook 侧收到变更事件只会重解析一次 */
         private const val KEY_THEME_MODE = "ui_theme_mode"
+
+        /**
+         * “接管相册已有照片”的开关。同样是仅界面/相册侧读的键：[Config] 不认识它，
+         * 相册进程（`MetadataRestoreJob`）只在收到“立即接管”命令时才动手，
+         * 模块 App 侧只需要这个开关来决定按钮可不可用。
+         */
+        const val KEY_WEBDAV_TAKEOVER = "webdavTakeover"
         private const val DEBOUNCE_MS = 500L
         private const val PROBE_NAME = ".migallerysync_probe"
 

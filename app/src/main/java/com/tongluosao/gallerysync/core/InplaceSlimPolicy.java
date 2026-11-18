@@ -21,13 +21,14 @@ import java.util.Set;
 public final class InplaceSlimPolicy {
 
     /**
-     * 能原地覆盖的扩展名：HEIF 系、JPEG 系与 PNG。
+     * 能原地覆盖的扩展名：只有 HEIF 系与 JPEG 系。
      *
-     * <p>PNG 之所以能加入：它有无损编码器（{@code Bitmap.CompressFormat.PNG}），写回同扩展名
-     * 既不改容器也不丢透明通道。其余容器（webp/bmp/gif/视频）仍一律不许动。
+     * <p>PNG <b>故意不在名单里</b>：它只有无损编码器，重编省不了几个字节，超大图还有 OOM 风险，
+     * 所以“空间优化”对 png 一律跳过 —— 不覆盖原图、不转码、也不搬侧车，原图字节保持不变。
+     * 其余容器（webp/bmp/gif/视频）同样一律不许动。
      */
     private static final Set<String> INPLACE_EXTENSIONS =
-            new HashSet<>(Arrays.asList("heic", "heif", "jpg", "jpeg", "png"));
+            new HashSet<>(Arrays.asList("heic", "heif", "jpg", "jpeg"));
 
     /** 预览码流能被解码重编的格式；认不出来就不敢转码，退回侧车。 */
     private static final Set<String> DECODABLE_PREVIEW_FORMATS =
@@ -37,25 +38,27 @@ public final class InplaceSlimPolicy {
     }
 
     /**
-     * 这个容器能不能原地覆盖：{@code .heic/.heif/.jpg/.jpeg/.png} 可以。
+     * 这个容器能不能原地覆盖：{@code .heic/.heif/.jpg/.jpeg} 可以，{@code .png} 与其它容器不行。
      *
-     * <p>与 {@link #targetFormat(String)} 严格一致 —— 能原地覆盖就一定能编码出目标格式，
-     * 不为“能覆盖但不知道写什么格式”留第二种答案。
+     * <p>注意这里已经<b>不再等价于</b>“{@link #targetFormat(String)} 非空”：{@code .png} 仍能
+     * 描述出目标格式（{@code "png"}），但空间优化已经决定不碰 png 文件，所以这里必须回 false。
      */
     public static boolean canOverwriteInPlace(String fileName) {
-        return targetFormat(fileName) != null;
+        String extension = extension(fileName);
+        return extension != null && INPLACE_EXTENSIONS.contains(extension);
     }
 
     /**
-     * 原地写盘必须使用的编码格式：{@code heic}/{@code heif} → {@code "heic"}，
+     * 目标容器对应的编码格式：{@code heic}/{@code heif} → {@code "heic"}，
      * {@code jpg}/{@code jpeg} → {@code "jpg"}，{@code png} → {@code "png"}，
      * 其它容器（含视频、无扩展名）→ {@code null}。
      *
      * <p>{@code .heif} 也回 {@code "heic"}：HEIF 容器本来就能装 HEVC 静态图，写进去的码流就是
      * heic 编码，文件名保持 {@code .heif} 不变（原地覆盖不改名）。
      *
-     * <p>{@code .png} 回 {@code "png"}（而不是 jpg）：PNG 的透明通道只有 PNG 编码能保住，
-     * 写成 JPEG 会把 alpha 压成白底，那是不可逆的降级。
+     * <p>{@code .png} 回 {@code "png"}（而不是 jpg）：只要还有调用点要产出 png（例如下载高清
+     * 副本的编码选择），就必须写无损 PNG，否则透明通道会被压成白底。但“能不能原地覆盖”是另一个
+     * 问题，见 {@link #canOverwriteInPlace(String)} —— 空间优化不对 png 原地覆盖。
      */
     public static String targetFormat(String fileName) {
         String extension = extension(fileName);
@@ -92,7 +95,7 @@ public final class InplaceSlimPolicy {
         RENAME,
         /** 扩展名不同，但原容器可编码：解码预览后按原格式重编再覆盖原路径。 */
         TRANSCODE,
-        /** 原容器不可原地覆盖，或只能无损重编而不值得转码（webp/bmp/视频/png+有损预览）：继续留在侧车目录。 */
+        /** 原容器不可原地覆盖，或只能无损重编而不值得转码（webp/bmp/视频）：继续留在侧车目录。 */
         SIDECAR,
         /** 没有预览、或预览并不更小：什么都不做。 */
         SKIP
@@ -101,27 +104,33 @@ public final class InplaceSlimPolicy {
     /**
      * 决定一条老侧车预览怎么迁移。
      *
-     * <p>判定顺序（先看“值不值得动”，再看“能不能动”）：
+     * <p>判定顺序（先看“要不要参与”，再看“值不值得动”，最后看“能不能动”）：
      * <ol>
+     *   <li>原图是 {@code .png} → {@link MigrationAction#SKIP}：png 不参与空间优化，
+     *       历史侧车预览原样留着，既不搬也不转码，原图更不会被覆盖；</li>
      *   <li>预览不存在，或并不比原图小 → {@link MigrationAction#SKIP}；</li>
      *   <li>预览与原图同扩展名 → {@link MigrationAction#RENAME}：直接把预览搬到原路径即可，
-     *       码流不变、容器约束不适用（png 这类只能无损写回的容器也安全）；</li>
+     *       码流不变、容器约束不适用；</li>
      *   <li>扩展名不同、原格式可编码（heic/jpg）、且预览码流能解码 → {@link MigrationAction#TRANSCODE}；</li>
-     *   <li>其余情况（webp/视频/png 配一份有损预览/未知预览格式/没有原文件名）→
+     *   <li>其余情况（webp/视频/未知预览格式/没有原文件名）→
      *       {@link MigrationAction#SIDECAR}，宁可继续占侧车目录，也不把不相干的字节写到原路径上。</li>
      * </ol>
      *
-     * <p>png 不参与 {@code TRANSCODE}：它只有无损编码，把有损 JPEG 预览转成 PNG 只会更大，
-     * 而且先降质量再“无损”存下来没有任何收益。png 只走同扩展名的 {@code RENAME}。
+     * <p>png 在第一步就被拦下：它只有无损编码，把有损 JPEG 预览转成 PNG 只会更大，先降质量再
+     * “无损”存下来更没有收益；索性整类跳过。
      *
      * @param previewFormat 预览的实际编码格式，可空；为空时按预览文件名的扩展名判断
      */
     public static MigrationAction migrationAction(String originalName, String previewName,
             String previewFormat, boolean previewExists, boolean previewSmaller) {
+        String originalExtension = extension(originalName);
+        if ("png".equals(originalExtension)) {
+            // png 不参与空间优化：不要 RENAME、不要 TRANSCODE、也不要 SIDECAR
+            return MigrationAction.SKIP;
+        }
         if (!previewExists || !previewSmaller) {
             return MigrationAction.SKIP;
         }
-        String originalExtension = extension(originalName);
         if (originalExtension == null) {
             // 连原文件名都认不出来（空串/null/无扩展名）：不猜，保持侧车原样
             return MigrationAction.SIDECAR;

@@ -922,6 +922,22 @@ public final class GalleryHooks {
                 return;
             }
             mMetadataRestoreJob.start(context, config);
+        } else if (ProgressProtocol.CMD_TAKEOVER.equals(command)) {
+            Context context = HostContext.get(mClassLoader);
+            Config config = mConfig;
+            if (context == null || config == null || !config.isReady()) {
+                Logger.w("event=takeover_skipped reason=no_ready_context");
+                return;
+            }
+            // 请求文件由相册进程自己写：模块 App 只发一条广播，不碰这份 JSON
+            boolean takeoverDryRun = intent != null
+                    && intent.getBooleanExtra("dryRun", false);
+            if (!MetadataRestoreJob.writeTakeoverRequest(context, config, takeoverDryRun)) {
+                Logger.w("event=takeover_skipped reason=request_write_failed");
+                return;
+            }
+            boolean started = mMetadataRestoreJob.start(context, config);
+            Logger.i("event=takeover_started started=" + started);
         } else if (ProgressProtocol.CMD_SLIM_START.equals(command)) {
             startSlimWorker(intent.getIntExtra(ProgressProtocol.EXTRA_CONCURRENCY, DEFAULT_SLIM_CONCURRENCY));
         } else if (ProgressProtocol.CMD_SLIM_STOP.equals(command)) {

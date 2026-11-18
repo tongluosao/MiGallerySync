@@ -58,6 +58,9 @@ public final class OriginalStore {
     private final Object mLock = new Object();
     private final File mFile;
     private final LinkedHashMap<String, Record> mRecords = new LinkedHashMap<>();
+    /** 远端路径索引：接管时逐行查重，线性扫描会退化成 O(n^2)。 */
+    private final java.util.HashMap<String, String> mPathIndex = new java.util.HashMap<>();
+    private boolean mPathIndexReady;
     /** A corrupt registry disables uploads until it can be inspected or repaired. */
     private boolean mHealthy = true;
     private int mBatchDepth;
@@ -123,7 +126,13 @@ public final class OriginalStore {
         /** 老模式：预览放在 {@code <相册>/.gallerysync-slim/} 侧车目录，等待迁移成原地覆盖。 */
         SIDECAR_PREVIEW("sidecar_preview"),
         /** 本地字节对不上任何已知副本：不许上传，等人工确认。 */
-        DAMAGED("damaged");
+        DAMAGED("damaged"),
+        /**
+         * “接管”登记：只知道远端有这份文件（长度与相册行一致），本地既没下载过、也没有
+         * 校验过的字节指纹 —— 因此 {@code sha256} 允许为 null。上传侧按“非 ORIGINAL”处理，
+         * 一律不传，直到有人真的把字节核对一遍再升级成 {@link #ORIGINAL}。
+         */
+        REMOTE_ONLY("remote_only");
 
         private final String mWire;
 
@@ -312,6 +321,26 @@ public final class OriginalStore {
                     previewLocalPath, clean(nextRowId), clean(nextSha1), originalLocalMtime,
                     derivedPaths, Collections.emptySet(), localAliases, derivedHashes, localState,
                     previewLength, previewSha256, previewFormat);
+        }
+
+        /**
+         * 派生出一条“被接管”的记录：补齐相册行身份，必要时改状态，其余字段原样保留。
+         *
+         * <p>状态只在“这条记录本来就没有可信信息”（没有 {@code sha256}、也没有预览记录）
+         * 时才改；已有摘要的记录说明当初真的校验过字节，一次接管登记不能把更强的结论降级成
+         * “只知道远端有”，更不能抹掉原地预览/损坏之类的状态。
+         */
+        private Record withTakenOver(String nextRowId, String nextSha1, LocalState nextState) {
+            Set<String> all = new LinkedHashSet<>(identities);
+            addIdentity(all, nextRowId, nextSha1);
+            LocalState state = localState;
+            if (sha256 == null && previewLength <= 0L && nextState != null) {
+                state = nextState;
+            }
+            return new Record(target, remotePath, originalLength, sha256, originalLocalPath,
+                    previewLocalPath, clean(nextRowId), clean(nextSha1), originalLocalMtime,
+                    derivedPaths, all, localAliases, derivedHashes, state, previewLength,
+                    previewSha256, previewFormat);
         }
 
         private Record withDerivedPath(String path) {
@@ -514,6 +543,158 @@ public final class OriginalStore {
     }
 
     /**
+     * “接管”登记：相册里已经存在的云端行，只补一条注册表记录，<b>不下载任何字节</b>。
+     *
+     * <p>与三个 {@code register*} 入口最大的不同是 <b>{@code sha256} 可以是 null</b>：接管只
+     * 证明了“远端有这么一个大小一致的对象”，一个字节都没读过。所以这里既不抛异常（维护作业
+     * 逐行调用，一行失败不该打断整批），也不拿长度去猜摘要 —— 记录按 {@code localStateWire}
+     * 落成 {@link LocalState#ORIGINAL}（本地文件字节数与远端一致）或
+     * {@link LocalState#REMOTE_ONLY}（只知道远端有）。
+     *
+     * <p>同一远端路径已有记录时只补身份与状态，绝不覆盖已有的 {@code sha256}：那个摘要是当初
+     * 真的读过字节才有的，接管没有资格改它。
+     *
+     * @return 是否写进注册表（参数不合法、注册表不健康、长度冲突、条数上限都返回 false）
+     */
+    public boolean registerTakenOver(Config config, String remotePath, long length, long rowId,
+            String sha1, String localStateWire) {
+        String path = clean(remotePath);
+        if (config == null || path == null || length <= 0L || rowId <= 0L) {
+            return false;
+        }
+        LocalState state = LocalState.fromWire(localStateWire);
+        if (state != LocalState.ORIGINAL && state != LocalState.REMOTE_ONLY) {
+            // 接管只产出这两种结论；别的状态说明调用方传错了，按“有疑问就跳过”处理
+            Logger.w("event=original_store_takeover_skipped reason=invalid_state state="
+                    + localStateWire);
+            return false;
+        }
+        String target = targetKey(config);
+        String id = Long.toString(rowId);
+        String hash = clean(sha1);
+        if (hash != null) {
+            hash = hash.toLowerCase(Locale.US);
+        }
+        synchronized (mLock) {
+            if (!mHealthy) {
+                Logger.w("event=original_store_takeover_skipped reason=registry_unhealthy");
+                return false;
+            }
+            Record existing = recordForRemotePathLocked(target, path);
+            Record record;
+            if (existing != null) {
+                if (existing.originalLength != length) {
+                    // 同一路径登记过另一个长度：远端这份可能被换过，宁可不碰
+                    Logger.w("event=original_store_takeover_skipped reason=length_conflict path="
+                            + path);
+                    return false;
+                }
+                record = existing.withTakenOver(id, hash, state);
+            } else {
+                if (mRecords.size() >= MAX_RECORDS) {
+                    return false;
+                }
+                record = new Record(target, path, length, null, null, null, id, hash, 0L,
+                        Collections.emptySet(), Collections.emptySet(), Collections.emptySet(),
+                        Collections.emptyMap(), state, 0L, null, null);
+            }
+            String key = recordKey(record);
+            if (existing != null) {
+                String staleKey = recordKey(existing);
+                if (!staleKey.equals(key)) {
+                    mRecords.remove(staleKey);
+                }
+            }
+            putRecordLocked(key, record);
+            saveQuietlyLocked();
+            return true;
+        }
+    }
+
+    /**
+     * 这个 target 下已经登记过的远端路径：接管时用来跳过重复登记。
+     *
+     * <p>返回的是快照副本，调用方随便用；顺序保持注册表内的插入序，便于日志复现。
+     */
+    public java.util.Set<String> remotePathsForTarget(Config config) {
+        Set<String> paths = new LinkedHashSet<>();
+        if (config == null) {
+            return paths;
+        }
+        String target = targetKey(config);
+        synchronized (mLock) {
+            for (Record record : mRecords.values()) {
+                if (target.equals(record.target)) {
+                    paths.add(record.remotePath);
+                }
+            }
+        }
+        return paths;
+    }
+
+    private Record recordForRemotePathLocked(String target, String remotePath) {
+        String indexKey = pathKey(target, remotePath);
+        if (indexKey == null) {
+            return null;
+        }
+        if (!mPathIndexReady) {
+            rebuildPathIndexLocked();
+        }
+        String key = mPathIndex.get(indexKey);
+        Record hit = key == null ? null : mRecords.get(key);
+        if (hit != null && target.equals(hit.target) && remotePath.equals(hit.remotePath)) {
+            return hit;
+        }
+        // 索引过期（记录换过路径）时退回线性扫描，并顺手修好索引，避免下次再扫
+        for (java.util.Map.Entry<String, Record> entry : mRecords.entrySet()) {
+            Record record = entry.getValue();
+            if (target.equals(record.target) && remotePath.equals(record.remotePath)) {
+                mPathIndex.put(indexKey, entry.getKey());
+                return record;
+            }
+        }
+        return null;
+    }
+
+    private static String pathKey(String target, String remotePath) {
+        if (target == null || remotePath == null) {
+            return null;
+        }
+        return target + '\u0000' + remotePath;
+    }
+
+    private void rebuildPathIndexLocked() {
+        mPathIndex.clear();
+        for (java.util.Map.Entry<String, Record> entry : mRecords.entrySet()) {
+            Record record = entry.getValue();
+            String indexKey = pathKey(record.target, record.remotePath);
+            if (indexKey != null) {
+                mPathIndex.put(indexKey, entry.getKey());
+            }
+        }
+        mPathIndexReady = true;
+    }
+
+    private void putRecordLocked(String key, Record record) {
+        mRecords.put(key, record);
+        if (mPathIndexReady && record != null) {
+            String indexKey = pathKey(record.target, record.remotePath);
+            if (indexKey != null) {
+                mPathIndex.put(indexKey, key);
+            }
+        }
+    }
+
+    /** 落盘但不抛：接管是一条“尽力而为”的补登记，写不进去只记日志，绝不打断整批。 */
+    private void saveQuietlyLocked() {
+        try {
+            saveLocked();
+        } catch (IOException failure) {
+            Logger.w("event=original_store_takeover_save_failed", failure);
+        }
+    }
+
+    /**
      * Confirm an old backup that predates the registry. A size match alone is insufficient: the
      * remote object must still hold the same bytes as the current local original.
      *
@@ -584,7 +765,7 @@ public final class OriginalStore {
                 Record record = entry.getValue();
                 if (containsLocalPath(record, path)) {
                     Record updated = record.withIdentity(rowId, sha1);
-                    mRecords.put(entry.getKey(), updated);
+                    putRecordLocked(entry.getKey(), updated);
                     saveLocked();
                     return true;
                 }
@@ -624,7 +805,7 @@ public final class OriginalStore {
                 if (!local.equals(record.originalLocalPath) && !record.derivedPaths.contains(local)) {
                     continue;
                 }
-                mRecords.put(entry.getKey(), record.withReboundIdentity(id,
+                putRecordLocked(entry.getKey(), record.withReboundIdentity(id,
                         hash == null ? null : hash.toLowerCase(Locale.US)));
                 saveLocked();
                 return true;
@@ -662,7 +843,7 @@ public final class OriginalStore {
                 return false;
             }
             Record updated = current.withRenamedDerivedAlias(path, rowId, sha1);
-            mRecords.put(key, updated);
+            putRecordLocked(key, updated);
             saveLocked();
             return true;
         }
@@ -844,6 +1025,11 @@ public final class OriginalStore {
         if (record == null || !targetKey(config).equals(record.target)) {
             throw new IOException("registered remote original is no longer available");
         }
+        if (record.sha256 == null || record.sha256.length() != 64) {
+            // 接管登记的原图只有远端长度、没有摘要：没有可比对的指纹就不往相册里写字节
+            // （fail-closed）。要恢复只能先走一次真正的校验把摘要补上。
+            throw new IOException("registered original has no digest");
+        }
         PathLease restoreLease = lockPath(destination, true);
         try {
         RestoreDestinationSnapshot initial = snapshotRestoreDestination(record, destination);
@@ -1012,7 +1198,7 @@ public final class OriginalStore {
             Record latest = mRecords.get(recordKey(record));
             if (latest != null) {
                 Record restored = latest.withRestoredLocal(destination);
-                mRecords.put(recordKey(restored), restored);
+                putRecordLocked(recordKey(restored), restored);
                 saveLocked();
             }
         }
@@ -1041,7 +1227,7 @@ public final class OriginalStore {
             if (fingerprintCurrentBytes && path.isFile()) {
                 updated = updated.withDerivedHash(sha256(path), path.length());
             }
-            mRecords.put(recordKey(updated), updated);
+            putRecordLocked(recordKey(updated), updated);
             saveLocked();
             return true;
         }
@@ -1154,7 +1340,7 @@ public final class OriginalStore {
                     return null;
                 }
                 Record updated = latest.withRestoredLocal(destination, true);
-                mRecords.put(recordKey(updated), updated);
+                putRecordLocked(recordKey(updated), updated);
                 saveLocked();
                 return updated;
             }
@@ -1197,7 +1383,7 @@ public final class OriginalStore {
                     updated = updated.withDerivedPath(path)
                             .withDerivedHash(digest.toLowerCase(Locale.US), previewLength);
                 }
-                mRecords.put(recordKey(updated), updated);
+                putRecordLocked(recordKey(updated), updated);
                 saveLocked();
                 return updated;
             }
@@ -1216,7 +1402,8 @@ public final class OriginalStore {
         Record matched = null;
         for (Record record : mRecords.values()) {
             if (target.equals(record.target) && record.remotePath.equals(expected.remotePath)
-                    && record.sha256.equals(expected.sha256)) {
+                    // 摘要可能是 null（接管登记）：用 Objects.equals 而不是 equals 链
+                    && java.util.Objects.equals(record.sha256, expected.sha256)) {
                 matched = record;
             }
         }
@@ -1297,7 +1484,8 @@ public final class OriginalStore {
                     // Catch same-size replacements too. The worker calls this again immediately
                     // before PUT, so an already queued optimized copy cannot slip through.
                     try {
-                        if (!record.sha256.equals(sha256(candidate))) {
+                        // 接管登记没有摘要：这条路径只能按“说不清”挡掉（fail-closed）
+                        if (record.sha256 == null || !record.sha256.equals(sha256(candidate))) {
                             return true;
                         }
                     } catch (IOException e) {
@@ -1509,7 +1697,7 @@ public final class OriginalStore {
             }
             String key = recordKey(record);
             Record existing = mRecords.get(key);
-            mRecords.put(key, existing == null ? record : merge(existing, record));
+            putRecordLocked(key, existing == null ? record : merge(existing, record));
             saveLocked();
         }
     }
@@ -1538,7 +1726,9 @@ public final class OriginalStore {
         String previewFormat = incoming.previewFormat == null
                 ? old.previewFormat : incoming.previewFormat;
         return new Record(incoming.target, incoming.remotePath, incoming.originalLength,
-                incoming.sha256, incoming.originalLocalPath == null ? old.originalLocalPath
+                // 接管登记没有摘要（null）：不能让一次补登记把已校验过的远端 SHA-256 抹掉
+                incoming.sha256 == null ? old.sha256 : incoming.sha256,
+                incoming.originalLocalPath == null ? old.originalLocalPath
                         : incoming.originalLocalPath,
                 incoming.previewLocalPath == null ? old.previewLocalPath
                         : incoming.previewLocalPath,
@@ -1601,7 +1791,9 @@ public final class OriginalStore {
                 item.put("target", record.target);
                 item.put("remote", record.remotePath);
                 item.put("length", record.originalLength);
-                item.put("sha256", record.sha256);
+                // 接管登记没有摘要：写空串（org.json 的 put(name, null) 会直接删掉这个键，
+                // 读侧就分不出“没有这个键”和“值为 null”，而空串是稳定的）。
+                item.put("sha256", safe(record.sha256));
                 item.put("original", nullable(record.originalLocalPath));
                 item.put("preview", nullable(record.previewLocalPath));
                 item.put("row", nullable(record.rowId));
@@ -1739,23 +1931,43 @@ public final class OriginalStore {
                 String previewFormat = clean(item.optString("preview_format", ""));
                 Record record = new Record(item.optString("target", ""),
                         item.optString("remote", ""), item.optLong("length", 0L),
-                        item.optString("sha256", ""), clean(item.optString("original", "")),
+                        readDigest(item.optString("sha256", ""), state),
+                        clean(item.optString("original", "")),
                         clean(item.optString("preview", "")),
                         clean(item.optString("row", "")), clean(item.optString("sha1", "")),
                         item.optLong("mtime", 0L), derived, identities, aliases, hashes, state,
                         previewLength, previewSha256, previewFormat);
+                // 只有“接管登记”的两个状态允许没有摘要：ORIGINAL 表示“本地字节数与远端一致，
+                // 但一个字节都没校验过”，REMOTE_ONLY 表示“只知道远端有”。这两种记录照样被
+                // isProtectedUpload 拦上传、被 verifyRemote 判成“没验证过”，所以缺摘要不等于放行；
+                // 其余状态（预览/写入中途/损坏）声称的是“校验过的字节”，缺摘要只能说明文件坏了。
+                boolean digestOk = record.sha256 != null ? record.sha256.length() == 64
+                        : state == LocalState.ORIGINAL || state == LocalState.REMOTE_ONLY;
                 if (record.target.isEmpty() || record.remotePath.isEmpty()
-                        || record.originalLength <= 0 || record.sha256.length() != 64) {
+                        || record.originalLength <= 0 || !digestOk) {
                     throw new IOException("invalid original registry record");
                 }
                 String key = recordKey(record);
                 Record old = mRecords.get(key);
-                mRecords.put(key, old == null ? record : merge(old, record));
+                putRecordLocked(key, old == null ? record : merge(old, record));
             }
         } catch (Throwable t) {
             mHealthy = false;
             Logger.e("event=original_store_load_failed", t);
         }
+    }
+
+    /**
+     * 读摘要：空串（含缺失键与旧版本写出的 {@code "null"}）在“接管登记”的状态下按 null 处理；
+     * 其余状态原样返回，交给 {@link #load()} 后面的校验把整表判成不健康 —— 普通记录缺摘要
+     * 说明文件已经被写坏，不能悄悄降级成“没有摘要”。
+     */
+    private static String readDigest(String raw, LocalState state) {
+        String digest = clean(raw);
+        if (digest == null) {
+            return state == LocalState.ORIGINAL || state == LocalState.REMOTE_ONLY ? null : raw;
+        }
+        return digest;
     }
 
     private void requireHealthyLocked() throws IOException {
@@ -1785,6 +1997,10 @@ public final class OriginalStore {
      * （{@code SlimHook} 已经按失败处理），绝不 fail-open。
      */
     private boolean verifyRemote(Record record, Config config) throws IOException {
+        if (record.sha256 == null || record.sha256.length() != 64) {
+            // 接管登记没有摘要：没有可校验的期望值，直接按“没验证过”处理
+            return false;
+        }
         File tempDir = new File(mFile.getParentFile(), "original_verify");
         if (!tempDir.exists() && !tempDir.mkdirs()) {
             throw new IOException("cannot create original verification directory");
@@ -2073,7 +2289,9 @@ public final class OriginalStore {
     }
 
     private static String recordKey(Record record) {
-        return record.target + "\n" + record.remotePath + "\n" + record.sha256;
+        // sha256 可能是 null（接管登记）：用 safe() 让“没有摘要”这条记录在内存与落盘后
+        // 拿到同一个键，否则 reload 之后键变了，记录会被当成另一条。
+        return record.target + "\n" + record.remotePath + "\n" + safe(record.sha256);
     }
 
     private static String canonical(File file) throws IOException {
