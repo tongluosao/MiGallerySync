@@ -18,7 +18,10 @@ public class DownloadFailurePolicyTest {
     public void threeKindsAreDistinct() {
         assertEquals(DownloadFailurePolicy.Kind.RETRYABLE,
                 DownloadFailurePolicy.Cause.TRANSPORT.kind());
-        assertEquals(DownloadFailurePolicy.Kind.RETRYABLE,
+        // 有意变更：INVALID_PAYLOAD 从 RETRYABLE 改成 TERMINAL（见 Cause 上的注释）。
+        // 全 0 / 签名对不上是"服务端那份对象本身坏了"，等一分钟再下一遍不会变好；
+        // 这一类改由 DamagedRemotes 第一次确认就记账，自动排期直接跳过。
+        assertEquals(DownloadFailurePolicy.Kind.TERMINAL,
                 DownloadFailurePolicy.Cause.INVALID_PAYLOAD.kind());
         assertEquals(DownloadFailurePolicy.Kind.TERMINAL,
                 DownloadFailurePolicy.Cause.CONTENT_MISMATCH.kind());
@@ -28,6 +31,27 @@ public class DownloadFailurePolicyTest {
                 DownloadFailurePolicy.Cause.NOT_FOUND.kind());
         assertEquals(DownloadFailurePolicy.Kind.ABSENT,
                 DownloadFailurePolicy.Cause.PROBE_MISSING.kind());
+    }
+
+    @Test
+    public void contentDamageIsExactlyTheTwoByteLevelCauses() {
+        // 记账判据只认"字节本身坏了"：全 0/签名不符 + 摘要对不上。
+        assertTrue(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.INVALID_PAYLOAD));
+        assertTrue(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.CONTENT_MISMATCH));
+        // 会自愈的一律不算：传输、停滞、5xx、403、长度不符（可能是这次截断）……
+        assertFalse(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.TRANSPORT));
+        assertFalse(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.STALLED));
+        assertFalse(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.LENGTH_MISMATCH));
+        assertFalse(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.EMPTY_PAYLOAD));
+        assertFalse(DownloadFailurePolicy.isContentDamage(
+                DownloadFailurePolicy.Cause.AUTH));
+        assertFalse(DownloadFailurePolicy.isContentDamage(null));
     }
 
     @Test

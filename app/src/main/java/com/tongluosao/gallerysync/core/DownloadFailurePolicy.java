@@ -68,8 +68,17 @@ public final class DownloadFailurePolicy {
         IO("io", Kind.RETRYABLE),
         /** 下完是 0 字节。 */
         EMPTY_PAYLOAD("empty_payload", Kind.RETRYABLE),
-        /** 下完是空/全 0/缺签名的内容：整份下来也过不了登记闸。 */
-        INVALID_PAYLOAD("invalid_payload", Kind.RETRYABLE),
+        /**
+         * 下完是空/全 0/缺签名的内容：整份下来也过不了登记闸。
+         *
+         * <p><b>语义变更（有意，不是放宽）</b>：这一类从 {@link Kind#RETRYABLE} 改成
+         * {@link Kind#TERMINAL}。全 0 字节、签名对不上是<b>服务端那份对象本身</b>坏了 ——
+         * 等一分钟再下一遍，服务端不会因此把字节变好。实测（2026-11）4 个坏对象一共产生
+         * 24 条失败标记、每次重下整份对象，全部是白烧的带宽；现在归终态 (30min 起退避)，
+         * 并由 {@link DamagedRemotes} 在第一次确认时记账、后续自动排期直接跳过。
+         * 网络截断那种"这次坏了下次可能好"的情况仍然落 {@link #LENGTH_MISMATCH}（可重试）。
+         */
+        INVALID_PAYLOAD("invalid_payload", Kind.TERMINAL),
         /** 下完长度与远端声明不一致（截断）。 */
         LENGTH_MISMATCH("length_mismatch", Kind.RETRYABLE),
         /** 长度对、摘要不对：内容被中间层改写（代理返回全 0 就是这一类）。 */
@@ -101,6 +110,18 @@ public final class DownloadFailurePolicy {
     /** 该原因的默认种类；没有原因时按可重试处理（宁可多试一次，也不误判成终态）。 */
     public static Kind kindOf(Cause cause) {
         return cause == null ? Kind.RETRYABLE : cause.kind();
+    }
+
+    /**
+     * 这次失败是不是"远端那份字节本身就是坏的"（内容损坏）。
+     *
+     * <p>两类：{@link Cause#INVALID_PAYLOAD}（全 0 / 签名对不上，见
+     * {@link DownloadedPayloadGate}）与 {@link Cause#CONTENT_MISMATCH}（长度对、摘要对不上，
+     * 中间层改写了内容）。这两类不会自愈，记账之后自动排期必须跳过；传输/超时/403/长度
+     * 不符一律不算 —— 那些等一会儿就好了，记进来会把本来能下回来的照片永久挡住。
+     */
+    public static boolean isContentDamage(Cause cause) {
+        return cause == Cause.INVALID_PAYLOAD || cause == Cause.CONTENT_MISMATCH;
     }
 
     /**

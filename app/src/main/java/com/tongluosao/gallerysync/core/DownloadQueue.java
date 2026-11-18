@@ -53,7 +53,7 @@ import java.util.function.BooleanSupplier;
  * 而相册里的文件是用户的东西，模块替它删错的代价无法挽回。所以这里只有"多了就取回来"。
  *
  * <p>计划线程只响应相册自己的批量下载检查事件。每个事件最多连续枚举
- * {@link #MAX_BATCH_ROUNDS} 轮，每轮最多认下 {@link #MAX_DOWNLOADS_PER_ROUND} 个文件；
+ * {@link #MAX_BATCH_ROUNDS} 轮（车道多时自动放宽），每轮最多认下 {@code planCapFor(并发行数)} 个文件；
  * 没有相册事件时不会自行扫描远端。
  *
  * <p>运行在相册进程，全部 IO 在自有后台线程，绝不阻塞相册的同步线程。
@@ -85,8 +85,18 @@ public final class DownloadQueue {
 
     /** 一轮最多走几个目录（含子目录），防止一次枚举把整棵树拉下来 */
     private static final int MAX_DIRS_PER_ROUND = 200;
-    /** 一轮最多认下几个文件 */
-    private static final int MAX_DOWNLOADS_PER_ROUND = 200;
+    /**
+     * 一轮最多认下几个文件的<b>基准值</b>（6 路并发时）。
+     *
+     * <p>这个数字必须随并发放大：10~16 路时 200 条只够跑十几秒，队列随即见底，
+     * "计划量"就成了新的瓶颈（真机表现是 {@code queued=} 反复归零、worker 长时间
+     * 停在 {@code mLock.wait()}）。见 {@link #planCapFor(int)}。
+     */
+    private static final int BASE_DOWNLOADS_PER_ROUND = 200;
+    /** 计划量上限：再大只是把整棵树一次拉进内存，收益已经为零。 */
+    private static final int MAX_DOWNLOADS_PER_ROUND_CAP = 600;
+    /** 计划量的换算基准并发数：{@code 200 * concurrency / 6}。 */
+    private static final int PLAN_BASE_CONCURRENCY = 6;
     /** 目录下钻深度上限 */
     private static final int MAX_DEPTH = 4;
     /** 同一个远端路径连续失败几次就不再重试（下一轮还会遇到，只是不再计入本轮） */
@@ -99,6 +109,16 @@ public final class DownloadQueue {
 
     /** One native event may continue through a bounded number of productive listing rounds. */
     private static final int MAX_BATCH_ROUNDS = 8;
+    /** 并发放大之后批次轮数的上限：再多的轮次只会把同一次相册事件拖长。 */
+    private static final int MAX_BATCH_ROUNDS_CAP = 16;
+    /**
+     * 自动下载车道比"配置路数"多出来的余量。
+     *
+     * <p>车道数直接等于配置值时，任何一条在跑"非传输"步骤（算摘要、写注册表、等
+     * provider 锁）的那一路都占着一个并发位，真正在传输的任务数永远达不到设置值。
+     * 多开两路，领任务/收尾的那点空档才被填满。
+     */
+    private static final int AUTO_LANE_HEADROOM = 2;
 
     /** 下载 worker 的路数：下载的瓶颈几乎总在远端带宽，两路足够叠起等待 */
     private static final int THREADS = 2;
@@ -165,8 +185,12 @@ public final class DownloadQueue {
      * 把另一边饿死。这里各走各的通道，唯一共享的是 {@link #mLock} 保护的队列与账本。
      */
     private final Thread[] mAutoWorkers = new Thread[Config.MAX_DOWNLOAD_CONCURRENCY];
-    /** 当前生效的自动下载路数；调小时旧线程按“下标越界”自己退出 */
+    /** 当前生效的自动下载车道数（= 配置路数 + {@link #AUTO_LANE_HEADROOM}）；调小时旧线程按下标越界自己退出 */
     private volatile int mAutoConcurrency;
+    /** 当前生效的"每轮最多认下几条"：随并发放大，见 {@link #planCapFor(int)}。 */
+    private volatile int mPlanCap = BASE_DOWNLOADS_PER_ROUND;
+    /** 当前生效的"一次原生事件最多枚举几轮"：随车道数放大，见 {@link #batchRoundsFor(int)}。 */
+    private volatile int mBatchRounds = MAX_BATCH_ROUNDS;
     /** 路数改动的互斥：setConfig 与构造器都可能调用，不能同时开同一个下标 */
     private final Object mAutoGate = new Object();
     /**
@@ -192,9 +216,15 @@ public final class DownloadQueue {
      *
      * <p>为什么要单独记账：连接卡死时读循环一个字节都不会来，进度回调永远不会触发，
      * worker 只能等 socket 自己超时（{@code READ_TIMEOUT_MAX} 是分钟级）。有了这张表，
-     * 看门狗可以在 {@link DownloadProgressPolicy#STALL_MS} 之后主动关掉那条连接。
+     * 看门狗可以在 {@link StallPolicy} 的截止时间之后主动关掉那条连接。
      */
     private final Map<String, Long> mLastByteAt = new HashMap<>();
+    /** 正在传输的远端路径 → 这一轮传输开始的时刻：首字节阶段按它算"等了多久"。 */
+    private final Map<String, Long> mTransferStartedAt = new HashMap<>();
+    /** 正在传输的远端路径 → 这一轮已收到的字节数：0 表示还在等首字节。 */
+    private final Map<String, Long> mTransferredBytes = new HashMap<>();
+    /** 正在传输的远端路径 → 对象总长（进度回调给的 total，未知为 0）。 */
+    private final Map<String, Long> mTransferTotals = new HashMap<>();
     /** 正在传输的远端路径 → 承载它的连接，停滞时由看门狗关闭 */
     private final Map<String, WebDavClient> mActiveClients = new HashMap<>();
     /**
@@ -404,28 +434,71 @@ public final class DownloadQueue {
      * 已经按收缩退出了，再调大时必须补开，否则那条通道就永久消失了。
      */
     private void applyAutoConcurrency(int requested) {
-        int target = Config.clampDownloadConcurrency(requested);
+        int concurrency = Config.clampDownloadConcurrency(requested);
+        // 车道 = 配置路数 + 余量：保证"真正同时在传输的任务数"能等于用户设置，而不是
+        // 被"某一路在算摘要/写注册表"这种非传输步骤占掉并发位。
+        int lanes = autoLaneCount(concurrency);
+        int planCap = planCapFor(concurrency);
+        int rounds = batchRoundsFor(lanes);
         int previous;
+        boolean startLanes;
         synchronized (mAutoGate) {
             previous = mAutoConcurrency;
-            if (target == previous) {
-                return;
-            }
-            mAutoConcurrency = target;
-            for (int index : lanesToStart(target, mAutoWorkers)) {
-                Thread worker = new Thread(() -> autoWorkerLoop(index),
-                        "MiGallerySync-autodl-" + index);
-                // daemon：下载线程绝不能拖住相册进程不让它退出
-                worker.setDaemon(true);
-                mAutoWorkers[index] = worker;
-                worker.start();
+            startLanes = lanes != previous;
+            mAutoConcurrency = lanes;
+            mPlanCap = planCap;
+            mBatchRounds = rounds;
+            if (startLanes) {
+                for (int index : lanesToStart(lanes, mAutoWorkers)) {
+                    Thread worker = new Thread(() -> autoWorkerLoop(index),
+                            "MiGallerySync-autodl-" + index);
+                    // daemon：下载线程绝不能拖住相册进程不让它退出
+                    worker.setDaemon(true);
+                    mAutoWorkers[index] = worker;
+                    worker.start();
+                }
             }
         }
-        Logger.i("event=auto_download_concurrency n=" + target + " previous=" + previous);
+        Logger.i("event=auto_download_concurrency n=" + lanes + " previous=" + previous
+                + " concurrency=" + concurrency + " plan_cap=" + planCap
+                + " batch_rounds=" + rounds);
         synchronized (mLock) {
             // 调大之后新开的那几路要立刻能领到已经在排队的项
             mLock.notifyAll();
         }
+    }
+
+    /**
+     * 自动下载车道数：配置路数 + {@link #AUTO_LANE_HEADROOM}，不超过硬上限。
+     *
+     * <p>抽成纯函数是为了直接单测：设置 8 路时真机必须能同时看到 8 条在传，而不是
+     * "8 路里总有 1~2 路在非传输步骤上"从而只跑起 6 条。
+     */
+    static int autoLaneCount(int concurrency) {
+        int wanted = Math.max(1, concurrency) + AUTO_LANE_HEADROOM;
+        return Math.min(Config.MAX_DOWNLOAD_CONCURRENCY, wanted);
+    }
+
+    /**
+     * 每轮计划量：{@code 200 * concurrency / 6}，夹在 200..600。
+     *
+     * <p>基准 6 路时仍是 200（与改动前完全一致），16 路时 533 —— 大约够最忙的一路跑
+     * 40 秒以上，队列不会在枚举/回调之间反复见底。
+     */
+    static int planCapFor(int concurrency) {
+        int value = BASE_DOWNLOADS_PER_ROUND * Math.max(1, concurrency) / PLAN_BASE_CONCURRENCY;
+        return Math.max(BASE_DOWNLOADS_PER_ROUND, Math.min(MAX_DOWNLOADS_PER_ROUND_CAP, value));
+    }
+
+    /**
+     * 一次原生事件里最多连续枚举几轮：车道超过基准后每多 2 路加一轮，上限 16。
+     *
+     * <p>轮数是"同一次相册事件里连续拉几批"的上限，计划量上限（{@link #planCapFor}）
+     * 已经限住了总条数；这里只是让 10~16 路时有足够的批次把队列填满。
+     */
+    static int batchRoundsFor(int lanes) {
+        int extra = Math.max(0, lanes - Config.DEFAULT_DOWNLOAD_CONCURRENCY) / 2;
+        return Math.min(MAX_BATCH_ROUNDS_CAP, MAX_BATCH_ROUNDS + extra);
     }
 
     private volatile BooleanSupplier mHighQualityPolicy = () -> false;
@@ -805,7 +878,8 @@ public final class DownloadQueue {
                 } catch (Throwable t) {
                     Logger.w("event=auto_download_plan_failed phase=registry detail=" + t);
                 }
-                for (int round = 0; round < MAX_BATCH_ROUNDS && mRunning; round++) {
+                int rounds = mBatchRounds;
+                for (int round = 0; round < rounds && mRunning; round++) {
                     if (!isWorkCurrent(config, generation)) {
                         break;
                     }
@@ -828,8 +902,8 @@ public final class DownloadQueue {
                     if (added <= 0) {
                         break;
                     }
-                    if (round == MAX_BATCH_ROUNDS - 1) {
-                        Logger.i("event=download_batch_limit rounds=" + MAX_BATCH_ROUNDS);
+                    if (round == rounds - 1) {
+                        Logger.i("event=download_batch_limit rounds=" + rounds);
                     }
                 }
                 // 第二遍注册表计划：这时目录名单已经被上面的枚举填满，注册表行的
@@ -886,15 +960,23 @@ public final class DownloadQueue {
         return enqueue(found, generation);
     }
 
-    /** @return 真正进了队列的条数（已排过/已落地的会被跳过） */
+    /** @return 真正进了队列的条数（已排过/已落地/已判内容损坏的会被跳过） */
     private int enqueue(List<Pending> found, int generation) {
         int added = 0;
+        int damaged = 0;
         synchronized (mLock) {
             if (generation != mWorkGeneration || !mRunning) {
                 return 0;
             }
             for (Pending pending : found) {
                 if (isScheduledLocked(pending.remotePath)) {
+                    continue;
+                }
+                if (pending.autoDownload && mDamagedRemotes.isDamaged(pending.target,
+                        pending.remotePath)) {
+                    // 内容损坏是**当场止损**：台账刚写下（同一个计划批次里别的尝试撞出来的）
+                    // 或上一轮写下的，都别再让它进队列占一个并发位。
+                    damaged++;
                     continue;
                 }
                 mPending.add(pending);
@@ -906,7 +988,7 @@ public final class DownloadQueue {
             mLock.notifyAll();
         }
         Logger.i("event=download_round_planned found=" + found.size() + " added=" + added
-                + " queued=" + mPending.size());
+                + " damaged=" + damaged + " queued=" + mPending.size());
         return added;
     }
 
@@ -914,7 +996,7 @@ public final class DownloadQueue {
     private void walk(WebDavClient client, String remoteDir, String relativeDir, int depth,
             List<Pending> out, Config config, String target, boolean highQuality,
             int generation, HostRows hostRows) {
-        if (depth > MAX_DEPTH || out.size() >= MAX_DOWNLOADS_PER_ROUND
+        if (depth > MAX_DEPTH || out.size() >= mPlanCap
                 || !isPolicyCurrent(generation)) {
             return;
         }
@@ -940,7 +1022,7 @@ public final class DownloadQueue {
         mProbeCache.putListing(remoteDir, listedFiles);
         int dirs = 0;
         for (WebDavClient.RemoteEntry entry : entries) {
-            if (out.size() >= MAX_DOWNLOADS_PER_ROUND || dirs >= MAX_DIRS_PER_ROUND
+            if (out.size() >= mPlanCap || dirs >= MAX_DIRS_PER_ROUND
                     || !isPolicyCurrent(generation)) {
                 return;
             }
@@ -1024,7 +1106,7 @@ public final class DownloadQueue {
      * <p>安全条件全部在 {@link AutoDownloadPolicy} 里（纯函数、可单测），这里只负责查状态、
      * 记账与写日志。判据按条数汇总，不逐行刷屏：1.2 万条里绝大多数是"已经不是 REMOTE_ONLY"。
      *
-     * @param out 与本轮远端枚举共用的待下载列表，总数同样不得越过 {@link #MAX_DOWNLOADS_PER_ROUND}
+     * @param out 与本轮远端枚举共用的待下载列表，总数同样不得越过 {@link #planCapFor(int)}
      * @param phase 这一遍跑在枚举之前（{@code registry}）还是之后（{@code after_walk}），只进日志
      */
     private void planAutoDownloads(Config config, int generation, List<Pending> out, String phase) {
@@ -1061,7 +1143,7 @@ public final class DownloadQueue {
         int suppressed = 0;
         int damaged = 0;
         for (OriginalStore.Record record : records) {
-            if (!isPolicyCurrent(generation) || planned >= MAX_DOWNLOADS_PER_ROUND) {
+            if (!isPolicyCurrent(generation) || planned >= mPlanCap) {
                 // 本轮额度用完就停：剩下的下个相册事件再说，不能一次把 1.2 万条都过一遍
                 break;
             }
@@ -1108,7 +1190,7 @@ public final class DownloadQueue {
                     true, wifi, true,
                     record.getLocalState() == OriginalStore.LocalState.REMOTE_ONLY,
                     scheduled, done, exists, existingLength, record.originalLength,
-                    failures, MAX_FAIL_PER_PATH, planned, MAX_DOWNLOADS_PER_ROUND);
+                    failures, MAX_FAIL_PER_PATH, planned, mPlanCap);
             if (decision == AutoDownloadPolicy.Decision.PLAN) {
                 if (!queued.add(record.remotePath)) {
                     continue;
@@ -1147,8 +1229,11 @@ public final class DownloadQueue {
                     + " phase=" + phase);
         }
         if (planned > 0) {
+            // parallel= 车道数、queued= 排完这批之后队列里一共多少条：两个数一起看才能
+            // 分清"下了几张"少是路数没生效还是队列见底（queued 反复归零 = 计划量不够）。
             Logger.i("event=auto_download_planned count=" + planned
                     + " phase=" + phase + " queued=" + out.size()
+                    + " parallel=" + mAutoConcurrency + " plan_cap=" + mPlanCap
                     + " catalog=" + records.size());
             // 这批任务会被几路自动下载并行执行、以及本轮总共排了多少：
             // 单看"下了几张"分不清是路数没生效还是服务端慢，这两个数字能分开
@@ -1577,6 +1662,16 @@ public final class DownloadQueue {
         if (mInflight.contains(pending.remotePath)) {
             return null;
         }
+        if (pending.autoDownload && mDamagedRemotes.isDamaged(pending.target,
+                pending.remotePath)) {
+            // 台账已经判过这份内容是坏的：计划侧通常早就拦下了，这里兜住"计划之后、领取之前"
+            // 才被另一条尝试确认损坏的竞态。手动"下载原图"不过这条判据（显式意图可以再试一次）。
+            it.remove();
+            mPendingVersion++;
+            Logger.w("event=download_damaged_inflight path=" + pending.remotePath + " count=0"
+                    + " bytes=" + pending.size + " reason=already_marked");
+            return null;
+        }
         Integer failures = mFailures.get(pending.remotePath);
         if (failures != null && failures >= MAX_FAIL_PER_PATH) {
             it.remove();
@@ -1759,13 +1854,13 @@ public final class DownloadQueue {
                 }
             }
             WebDavClient client = clientFor(config, index);
-            markTransferStarted(pending.remotePath, client);
+            markTransferStarted(pending.remotePath, client, size);
             client.setProgressListener((done, total) -> {
                 // 每 64KB 一次。发布器自己按 2Hz 发帧，这里只负责两件事：
                 // 1) 把数字塞给进度页；2) 按 256KB / 500ms 记一行可对账的字节进度，
                 //    并刷新停滞看门狗的心跳。日志节流做成纯函数，边界可单测。
                 long now = SystemClock.elapsedRealtime();
-                markTransferByte(pending.remotePath, now);
+                markTransferByte(pending.remotePath, now, done);
                 if (!isWorkCurrent(config, generation)) {
                     client.close();
                     return;
@@ -1798,7 +1893,7 @@ public final class DownloadQueue {
                 }
                 raw = File.createTempFile("original-", ".tmp", rawDir);
                 try {
-                    client.get(pending.remotePath, raw);
+                    transferWithStallRetry(client, pending, raw);
                 } finally {
                     client.setProgressListener(null);
                 }
@@ -1898,7 +1993,7 @@ public final class DownloadQueue {
                 }
                 raw = File.createTempFile("original-", ".tmp", rawDir);
                 try {
-                    client.get(pending.remotePath, raw);
+                    transferWithStallRetry(client, pending, raw);
                 } finally {
                     client.setProgressListener(null);
                 }
@@ -2060,6 +2155,39 @@ public final class DownloadQueue {
                     + " path=" + dest.getAbsolutePath());
         }
         return rowUpdated;
+    }
+
+    /**
+     * 传输一次；被停滞看门狗中止时，先作废直链、在**同一路径**上用标准 WebDAV 路径再试一次。
+     *
+     * <p>这是任务一的核心回路。真机的 {@code stalled} 几乎全落在 302 直链上
+     * （{@code SocketException: Socket closed} + {@code reason=no_bytes_for_60000ms}）：
+     * 直链只是省一次握手，签名过期或后端对直连路径不吐字节时，它会把整次下载拖到 socket
+     * 超时，而缓存 3 分钟内每次重试都命中同一条坏地址。次次按满额记失败之后，一个本来
+     * 能下成的对象就变成永久失败。
+     *
+     * <p>所以停滞不再直接记账：作废这条直链（下一次 {@link WebDavClient#get} 一定走原始
+     * 路径并重新拿直链），原地重试一次。重试若再停滞，标记会被看门狗重新写下，外层
+     * catch 照旧按 {@code STALLED} 记满额失败。
+     */
+    private void transferWithStallRetry(WebDavClient client, Pending pending, File raw)
+            throws IOException {
+        try {
+            client.get(pending.remotePath, raw);
+            return;
+        } catch (IOException first) {
+            if (!consumeStalled(pending.remotePath)) {
+                throw first;
+            }
+            // 直链缓存必须在这里作废：看门狗可能只关了连接、没来得及清缓存
+            client.invalidateCachedDirectUrl(pending.remotePath, "stalled");
+            Logger.w("event=download_retry_after_stall attempt=2 path=" + pending.remotePath
+                    + " bytes=" + pending.size + " reason=" + first.getMessage()
+                    + " direct=" + client.lastGetUsedDirectUrl());
+            // 重新登记心跳：上一轮的心跳已被看门狗摘掉，不登记的话重试期间不会被再次监视
+            markTransferStarted(pending.remotePath, client, pending.size);
+            client.get(pending.remotePath, raw);
+        }
     }
 
     private static void cleanupUnpublished(File raw, File staged, File compressed) {
@@ -3314,12 +3442,47 @@ public final class DownloadQueue {
                     + " attempts=" + count + " reason=" + reason);
         }
         if (DamagedRemotes.isContentDamage(cause)) {
-            // 内容类损坏（长度对、字节全 0 / 摘要对不上）不会自愈：记进台账，后续自动排期
-            // 一律跳过这个远端路径。网络/超时/403 等一律不记 —— 那些等一会儿就好了。
+            // 内容类损坏（长度对、字节全 0 / 摘要对不上）不会自愈：**第一次确认**就记进台账，
+            // 并当场把本次计划内所有同路径项判死 —— 旧实现要等失败次数攒到上限（真机上同一个
+            // 对象被重下 6 次、4 个对象写出 24 条标记）才停手，中间那几次全是白烧的带宽。
+            // 网络/超时/403 等一律不记 —— 那些等一会儿就好了。
             // 手动"下载原图"仍可尝试一次；真下成了由 markDone 之后的 forget 撤销记录。
             mDamagedRemotes.markDamaged(pending.target, pending.remotePath, cause.wire(),
                     pending.size);
+            int[] dropped;
+            synchronized (mLock) {
+                dropped = dropDamagedLocked(pending.remotePath);
+            }
+            Logger.w("event=download_damaged_inflight path=" + pending.remotePath
+                    + " count=" + dropped[0] + " removed=" + dropped[1]
+                    + " bytes=" + pending.size + " reason=" + cause.wire()
+                    + " row=" + rowLabel(pending));
         }
+    }
+
+    /**
+     * 把"这次计划里还排着的同路径项"全部摘掉（含当前这一条）。
+     *
+     * <p>内容损坏是<b>对象级</b>结论：同一个远端路径在同一轮计划里被排了多次（注册表一遍 +
+     * 目录枚举一遍、或两轮之间又在别的相位排进来），第一份字节确认是坏的，别的尝试就没有
+     * 任何理由再去握一次手、下一份相同的坏字节。
+     *
+     * @return {@code [0] = 被一并摘掉的其它任务数（不含当前）, [1] = 摘掉的总条数}
+     */
+    private int[] dropDamagedLocked(String remotePath) {
+        int total = 0;
+        Iterator<Pending> it = mPending.iterator();
+        while (it.hasNext()) {
+            if (!remotePath.equals(it.next().remotePath)) {
+                continue;
+            }
+            it.remove();
+            total++;
+        }
+        if (total > 0) {
+            mPendingVersion++;
+        }
+        return new int[] {Math.max(0, total - 1), total};
     }
 
     /**
@@ -3382,18 +3545,28 @@ public final class DownloadQueue {
 
     // ------------------------------------------------------- 字节进度与停滞看门狗
 
-    /** 这条项开始传输：登记它的连接，供停滞看门狗在必要时关闭。 */
-    private void markTransferStarted(String remotePath, WebDavClient client) {
+    /** 这条项开始一轮传输：登记连接、起算时刻与总长，供停滞看门狗判定阶段与处置。 */
+    private void markTransferStarted(String remotePath, WebDavClient client, long totalBytes) {
         synchronized (mLock) {
-            mLastByteAt.put(remotePath, SystemClock.elapsedRealtime());
+            long now = SystemClock.elapsedRealtime();
+            mLastByteAt.put(remotePath, now);
+            mTransferStartedAt.put(remotePath, now);
+            mTransferredBytes.put(remotePath, 0L);
+            mTransferTotals.put(remotePath, Math.max(totalBytes, 0L));
             mActiveClients.put(remotePath, client);
         }
     }
 
-    /** 收到字节：刷新心跳。回调在传输线程上跑，只碰受锁保护的 Map。 */
-    private void markTransferByte(String remotePath, long now) {
+    /** 收到字节：刷新心跳、阶段（首字节 → 空闲）与字节数。回调在传输线程上跑。 */
+    private void markTransferByte(String remotePath, long now, long done) {
         synchronized (mLock) {
+            if (!mTransferStartedAt.containsKey(remotePath)) {
+                // 看门狗刚处置完这一条、传输线程又继续读到了字节（典型是"直链失效 → 内部
+                // 退回标准路径"那一次）：把这一轮重新起算，别拿旧的起点误判第二次停滞。
+                mTransferStartedAt.put(remotePath, now);
+            }
             mLastByteAt.put(remotePath, now);
+            mTransferredBytes.put(remotePath, Math.max(done, 0L));
         }
     }
 
@@ -3401,18 +3574,59 @@ public final class DownloadQueue {
     private void markTransferEnded(String remotePath) {
         synchronized (mLock) {
             mLastByteAt.remove(remotePath);
+            mTransferStartedAt.remove(remotePath);
+            mTransferredBytes.remove(remotePath);
+            mTransferTotals.remove(remotePath);
             mActiveClients.remove(remotePath);
             // 正常收尾就说明没有被看门狗判定过停滞；残留标记只会让下一次尝试误分类
             mStalledPaths.remove(remotePath);
         }
     }
 
+    /** 取走"这次传输被看门狗判过停滞"的标记（取走即清，不污染下一次尝试）。 */
+    private boolean consumeStalled(String remotePath) {
+        synchronized (mLock) {
+            return mStalledPaths.remove(remotePath);
+        }
+    }
+
+    /** 只看不取：重试之前用它判断"还要不要按停滞处理"。 */
+    private boolean isStalledMarked(String remotePath) {
+        synchronized (mLock) {
+            return mStalledPaths.contains(remotePath);
+        }
+    }
+
+    /** 看门狗这一轮要处置的一条传输。 */
+    private static final class StallHit {
+        final String remotePath;
+        final boolean hasBytes;
+        final long elapsed;
+        final long bytes;
+        final long total;
+        final WebDavClient client;
+        final StallPolicy.Action action;
+
+        StallHit(String remotePath, boolean hasBytes, long elapsed, long bytes, long total,
+                WebDavClient client, StallPolicy.Action action) {
+            this.remotePath = remotePath;
+            this.hasBytes = hasBytes;
+            this.elapsed = elapsed;
+            this.bytes = bytes;
+            this.total = total;
+            this.client = client;
+            this.action = action;
+        }
+    }
+
     /**
-     * 停滞看门狗：每 {@link #WATCHDOG_INTERVAL_MS} 扫一次"最后收到字节到现在多久"。
+     * 停滞看门狗：每 {@link #WATCHDOG_INTERVAL_MS} 扫一次"这一轮传输等了多久"。
      *
      * <p>为什么不能只靠 socket 超时：WebDavClient 的直连 302 缓存路径在服务端不吐字节时
      * 会一直挂到 {@code READ_TIMEOUT_MAX}（分钟级），而且缓存 3 分钟内每次重试都卡同一条。
-     * 队列能做的只有一件事 —— 到点主动关掉那条连接，让读循环抛异常走失败记账。
+     * 队列能做的只有到点主动处置 —— 而处置方式由 {@link StallPolicy} 按<b>阶段</b>决定：
+     * 首字节阶段（20s）与空闲阶段（90s）是两条不同的截止线，大文件按总长放宽；
+     * 走签名直链的那条先作废直链、退回标准路径，走标准路径的才直接关连接。
      */
     private void watchdogLoop() {
         while (mRunning) {
@@ -3427,43 +3641,57 @@ public final class DownloadQueue {
                 }
             }
             long now = SystemClock.elapsedRealtime();
-            List<String> stalled = new ArrayList<>();
-            Map<String, WebDavClient> clientsByPath = new HashMap<>();
+            List<StallHit> hits = new ArrayList<>();
             synchronized (mLock) {
                 for (Map.Entry<String, Long> entry : mLastByteAt.entrySet()) {
+                    String remotePath = entry.getKey();
+                    Long bytes = mTransferredBytes.get(remotePath);
+                    long received = bytes == null ? 0L : bytes;
+                    boolean hasBytes = received > 0L;
                     Long last = entry.getValue();
-                    if (last == null
-                            || !DownloadProgressPolicy.stalled(last, now,
-                                    DownloadProgressPolicy.STALL_MS)) {
+                    Long started = mTransferStartedAt.get(remotePath);
+                    long anchor = hasBytes
+                            ? (last == null ? now : last)
+                            : (started == null ? (last == null ? now : last) : started);
+                    long elapsed = now - anchor;
+                    Long total = mTransferTotals.get(remotePath);
+                    long totalBytes = total == null ? 0L : total;
+                    WebDavClient client = mActiveClients.get(remotePath);
+                    boolean direct = client != null && client.lastGetUsedDirectUrl();
+                    StallPolicy.Action action = StallPolicy.stallAction(hasBytes, elapsed,
+                            totalBytes, direct);
+                    if (action == StallPolicy.Action.WAIT) {
                         continue;
                     }
-                    stalled.add(entry.getKey());
-                    WebDavClient client = mActiveClients.get(entry.getKey());
-                    if (client != null) {
-                        clientsByPath.put(entry.getKey(), client);
-                    }
-                }
-            }
-            for (String remotePath : stalled) {
-                long last;
-                synchronized (mLock) {
-                    Long at = mLastByteAt.get(remotePath);
-                    last = at == null ? now : at;
-                    // 先摘掉心跳，避免同一项被连续关两次
+                    hits.add(new StallHit(remotePath, hasBytes, elapsed, received, totalBytes,
+                            client, action));
+                    // 先摘掉心跳，避免同一项被连续处置两次
                     mLastByteAt.remove(remotePath);
+                    mTransferStartedAt.remove(remotePath);
+                    mTransferredBytes.remove(remotePath);
+                    mTransferTotals.remove(remotePath);
                     mActiveClients.remove(remotePath);
                     // 留下"这次是停滞"的标记，供 download() 的失败分类使用
                     mStalledPaths.add(remotePath);
                 }
-                Logger.w("event=download_stalled row=unknown path=" + remotePath
-                        + " elapsed=" + Math.max(0L, now - last)
-                        + " reason=no_bytes_for_" + DownloadProgressPolicy.STALL_MS + "ms");
-                WebDavClient client = clientsByPath.get(remotePath);
-                if (client != null) {
-                    // close() 让正在阻塞的读立即返回，get() 随即抛 IOException，
-                    // 由 download() 的 catch 归成可重试失败（次数只增、冷却递增）。
-                    client.close();
+            }
+            for (StallHit hit : hits) {
+                Logger.w("event=download_stalled row=unknown path=" + hit.remotePath
+                        + " phase=" + StallPolicy.phaseOf(hit.hasBytes).wire()
+                        + " elapsed=" + Math.max(0L, hit.elapsed)
+                        + " bytes=" + hit.bytes + "/" + hit.total
+                        + " action=" + hit.action.name().toLowerCase(Locale.US));
+                WebDavClient client = hit.client;
+                if (client == null) {
+                    continue;
                 }
+                if (hit.action == StallPolicy.Action.RETRY_WITHOUT_DIRECT) {
+                    // 直链先作废：否则 download() 的同路径重试还会命中同一条挂住的签名地址
+                    client.invalidateCachedDirectUrl(hit.remotePath, "stalled");
+                }
+                // close() 让正在阻塞的读立即返回，get() 随即抛 IOException：
+                // 直链路径会内部退回标准 WebDAV 路径再试一次，标准路径则由 download() 记账。
+                client.close();
             }
         }
     }

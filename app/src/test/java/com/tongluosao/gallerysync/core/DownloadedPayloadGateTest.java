@@ -156,7 +156,10 @@ public class DownloadedPayloadGateTest {
             fail("all-zero payload must be rejected");
         } catch (DownloadFailurePolicy.PayloadException e) {
             assertEquals(DownloadFailurePolicy.Cause.INVALID_PAYLOAD, e.cause());
-            assertEquals(DownloadFailurePolicy.Kind.RETRYABLE, e.kind());
+            // 有意变更：内容损坏从 RETRYABLE 改成 TERMINAL（服务端那份字节不会自己变好）。
+            // 队列侧在第一次确认时就写 DamagedRemotes 并让同路径任务直接退出，
+            // 这里把"分类语义"钉死在终态，避免以后又退回"每分钟重下一份"。
+            assertEquals(DownloadFailurePolicy.Kind.TERMINAL, e.kind());
             assertTrue(e instanceof IOException);
             assertTrue(e.getMessage().contains("reason=all_zero"));
             assertTrue(e.getMessage().contains("dest=" + dest.getAbsolutePath()));

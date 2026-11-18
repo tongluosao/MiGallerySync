@@ -126,6 +126,23 @@ public final class WebDavClient {
     /** 直链 → 它最初来自哪个请求地址，用于失效时反查。 */
     private static final Map<String, String> sDirectSources = new ConcurrentHashMap<>();
     /**
+     * 最近一次 {@link #get} 是否走的是缓存的 302 签名直链。
+     *
+     * <p>停滞看门狗要靠它决定处置：直链停滞 = "作废直链、退回 WebDAV 路径再试一次"，
+     * 标准路径停滞 = 直接关连接按失败记账。不能只看缓存里有没有条目 —— 直链可能在
+     * 本次传输中途就被内部回落掉了。
+     */
+    private volatile boolean mLastGetUsedDirectUrl;
+    /**
+     * 本次 {@link #get} 真正在读字节的派生连接（302 跳转后的存储客户端 / 直链客户端）。
+     *
+     * <p>它们各自持有自己的 socket，不在本实例的 {@code mSocket} 上。看门狗要中止"这一条
+     * 传输"时只会调本实例的 {@link #close()} —— 不把子连接一起关掉，阻塞的读仍然会挂到
+     * {@code READ_TIMEOUT_MAX}（真机 22 条 {@code stalled} 的现场就是这样：连接被关了，
+     * socket 却还在读）。
+     */
+    private volatile WebDavClient mActiveChildClient;
+    /**
      * 目录列表（PROPFIND Depth 1）响应体的上限。
      *
      * <p>默认那点额度（{@link #DETAIL_LIMIT} 级别）只够看错误原因，拿它列目录会被截断成
@@ -321,6 +338,42 @@ public final class WebDavClient {
             return null;
         }
         return entry[0];
+    }
+
+    /**
+     * 作废一条远端路径的直链缓存，供"这次传输停滞了"的调用方使用。
+     *
+     * <p>看门狗判定停滞时调用它：直链只是省一次握手，它坏了不代表远端没有这个对象，
+     * 下一次 {@link #get} 必须退回原始 WebDAV 路径重新换一条直链，而不是继续拿这条
+     * 挂住的签名地址重试（那只会再挂一次）。
+     *
+     * @param reason 进日志的稳定标识（{@code stalled} / {@code timeout} 一类）
+     * @return 是否真的存在一条直链缓存被作废
+     */
+    public boolean invalidateCachedDirectUrl(String remotePath, String reason) {
+        if (remotePath == null || remotePath.isEmpty()) {
+            return false;
+        }
+        try {
+            URL url = new URL(mBaseUrl + encodePath(remotePath));
+            String requestUrl = url.toString();
+            boolean hadDirect = cachedDirectUrl(requestUrl) != null;
+            invalidateDirectUrl(requestUrl);
+            if (hadDirect) {
+                Logger.w("event=direct_url_invalidated reason="
+                        + (reason == null || reason.isEmpty() ? "unknown" : reason)
+                        + " path=" + url.getPath());
+            }
+            return hadDirect;
+        } catch (IOException e) {
+            // 地址本身拼不出来：没有直链可作废，也不影响调用方的重试
+            return false;
+        }
+    }
+
+    /** 最近一次 {@code get()} 是否走了签名直链（停滞处置据此决定"先退直链"还是直接中止）。 */
+    public boolean lastGetUsedDirectUrl() {
+        return mLastGetUsedDirectUrl;
     }
 
     /** 直链失效（过期签名、被拒）时同时清掉正反两张表。 */
@@ -1061,10 +1114,12 @@ public final class WebDavClient {
             int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
             String target = url.getFile().isEmpty() ? "/" : url.getFile();
             boolean reused = mSocket != null;
+            mLastGetUsedDirectUrl = false;
             Long viaDirect = getViaCachedDirectUrl(url, tmp);
             if (viaDirect != null) {
                 // 直链命中：一次连接、一个请求就把体收回来了，没有 302 那一跳，
                 // 也就不需要为"问跳转"再握一次手
+                mLastGetUsedDirectUrl = true;
                 received = viaDirect;
             } else {
                 try {
@@ -1130,18 +1185,61 @@ public final class WebDavClient {
             WebDavClient directClient = new WebDavClient(
                     protocol + "://" + direct.getAuthority(), null);
             directClient.setProgressListener(mProgressListener);
+            mActiveChildClient = directClient;
             try {
                 int directPort = direct.getPort() < 0 ? direct.getDefaultPort() : direct.getPort();
-                return directClient.getOnce(direct.getHost(), directPort,
+                long written = directClient.getOnce(direct.getHost(), directPort,
                         direct.getFile().isEmpty() ? "/" : direct.getFile(), tmp, 5);
+                if (written <= 0L && tmp.length() <= 0L) {
+                    // 后端对直连路径回了一个"成功但没有体"的响应：这种连接不会报错，
+                    // 只会安静地留个 0 字节临时件，必须当成直链失效退回标准路径。
+                    throw new IOException("direct response had no body");
+                }
+                return written;
             } finally {
+                if (mActiveChildClient == directClient) {
+                    mActiveChildClient = null;
+                }
                 directClient.close();
             }
         } catch (IOException | RuntimeException e) {
             invalidateDirectUrl(cached);
-            Logger.d("event=get_direct_miss reason=" + e.getClass().getSimpleName());
+            String reason = directFailureReason(e);
+            Logger.w("event=direct_url_invalidated reason=" + reason
+                    + " path=" + requestUrl.getPath());
+            Logger.d("event=get_direct_miss reason=" + reason);
             return null;
         }
+    }
+
+    /**
+     * 直链失败的原因标签（进日志，抓日志靠它分类）。
+     *
+     * <p>停滞现场抛出来的往往只是 {@code SocketException: Socket closed}（连接被看门狗
+     * 关掉）或 {@code SocketTimeoutException}，从异常文本上分不清是签名过期、服务端不吐
+     * 字节还是后端对直连路径回了空响应；按类型拆成稳定标签之后，{@code direct_url_invalidated}
+     * 的 reason 分布能直接回答"直链到底坏在哪"。
+     */
+    static String directFailureReason(Throwable failure) {
+        if (failure == null) {
+            return "unknown";
+        }
+        if (failure instanceof java.net.SocketTimeoutException) {
+            return "timeout";
+        }
+        if (failure instanceof java.net.SocketException) {
+            String message = failure.getMessage();
+            return message != null && message.toLowerCase(Locale.US).contains("closed")
+                    ? "socket_closed" : "socket_error";
+        }
+        if (failure instanceof HttpStatusException) {
+            return "http_" + ((HttpStatusException) failure).code;
+        }
+        String message = failure.getMessage();
+        if (message != null && message.toLowerCase(Locale.US).contains("no body")) {
+            return "empty_response";
+        }
+        return failure.getClass().getSimpleName().toLowerCase(Locale.US);
     }
 
     private long getOnce(String host, int port, String target, File tmp, int redirectsLeft)
@@ -1172,11 +1270,16 @@ public final class WebDavClient {
             String origin = next.getProtocol() + "://" + next.getAuthority();
             WebDavClient redirected = new WebDavClient(origin, auth);
             redirected.setProgressListener(mProgressListener);
+            // 真正读体的是这条派生连接：看门狗关本实例时必须能连带关掉它
+            mActiveChildClient = redirected;
             try {
                 int nextPort = next.getPort() < 0 ? next.getDefaultPort() : next.getPort();
                 return redirected.getOnce(next.getHost(), nextPort,
                         next.getFile().isEmpty() ? "/" : next.getFile(), tmp, redirectsLeft - 1);
             } finally {
+                if (mActiveChildClient == redirected) {
+                    mActiveChildClient = null;
+                }
                 redirected.close();
             }
         }
@@ -2135,6 +2238,12 @@ public final class WebDavClient {
 
     /** 释放复用中的连接。队列不再上传、或目标变了就该调一次，别把相册进程的 socket 一直挂着 */
     public void close() {
+        // 正在读字节的派生连接（302 后的存储客户端/直链客户端）也要一起关：只关本实例
+        // 那条 socket，阻塞中的读会继续挂到分钟级超时，看门狗等于没生效。
+        WebDavClient child = mActiveChildClient;
+        if (child != null && child != this) {
+            child.close();
+        }
         dropConnection();
     }
 

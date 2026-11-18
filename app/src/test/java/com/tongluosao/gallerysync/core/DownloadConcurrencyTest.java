@@ -24,12 +24,13 @@ import java.util.concurrent.CountDownLatch;
 public class DownloadConcurrencyTest {
 
     @Test
-    public void defaultIsSixAndCeilingIsEight() {
-        // 行为变更（有意的配置调整，不是放宽断言）：下载的瓶颈是"每对象一次握手"的等待，
-        // 真机实测 6 路明显优于 3 路，7/8 收益迅速变平。上传默认仍是 3（每个对象要跟相册
-        // provider 抢锁），下载传输期间不持 provider 锁，所以可以开得比上传多。
-        assertEquals(6, Config.DEFAULT_DOWNLOAD_CONCURRENCY);
-        assertEquals(8, Config.MAX_DOWNLOAD_CONCURRENCY);
+    public void defaultIsEightAndCeilingIsSixteen() {
+        // 行为变更（有意的配置调整，不是放宽断言）：下载的瓶颈是"每对象一次握手"的等待。
+        // 6 路真机验证有效，但一批几百个对象时 6 路仍会在枚举与收尾之间见底；上调到
+        // 默认 8、上限 16，并配合车道余量（+2）与按并发换算的计划量（200 * n / 6，上限 600）。
+        // 上传默认仍是 3（每个对象要跟相册 provider 抢锁），下载传输期间不持 provider 锁。
+        assertEquals(8, Config.DEFAULT_DOWNLOAD_CONCURRENCY);
+        assertEquals(16, Config.MAX_DOWNLOAD_CONCURRENCY);
         assertEquals("download_concurrency", Config.KEY_DOWNLOAD_CONCURRENCY);
     }
 
@@ -48,10 +49,40 @@ public class DownloadConcurrencyTest {
     }
 
     @Test
-    public void valuesAboveCeilingAreClampedToEight() {
-        assertEquals(8, Config.clampDownloadConcurrency(9));
-        assertEquals(8, Config.clampDownloadConcurrency(99));
-        assertEquals(8, Config.clampDownloadConcurrency(Integer.MAX_VALUE));
+    public void valuesAboveCeilingAreClampedToSixteen() {
+        assertEquals(16, Config.clampDownloadConcurrency(17));
+        assertEquals(16, Config.clampDownloadConcurrency(99));
+        assertEquals(16, Config.clampDownloadConcurrency(Integer.MAX_VALUE));
+    }
+
+    @Test
+    public void lanesCarryHeadroomSoRunningTasksMatchTheSetting() {
+        // 车道 = 配置路数 + 2 余量（那两路用来填"某一路在算摘要/写注册表"的空档），
+        // 未到上限时严格等于"设置值 + 2"，到上限被夹住。
+        assertEquals(3, DownloadQueue.autoLaneCount(1));
+        assertEquals(10, DownloadQueue.autoLaneCount(8));
+        assertEquals(14, DownloadQueue.autoLaneCount(12));
+        assertEquals(Config.MAX_DOWNLOAD_CONCURRENCY, DownloadQueue.autoLaneCount(16));
+        assertEquals(Config.MAX_DOWNLOAD_CONCURRENCY, DownloadQueue.autoLaneCount(400));
+    }
+
+    @Test
+    public void planCapScalesWithConcurrencyAndStaysBounded() {
+        // 6 路时与改动前完全一致（200），16 路时 533，任何输入都不越过 600 下限/上限。
+        assertEquals(200, DownloadQueue.planCapFor(6));
+        assertEquals(200, DownloadQueue.planCapFor(1));
+        assertEquals(266, DownloadQueue.planCapFor(8));
+        assertEquals(533, DownloadQueue.planCapFor(16));
+        assertEquals(600, DownloadQueue.planCapFor(64));
+    }
+
+    @Test
+    public void batchRoundsGrowOnlyAboveTheDefaultConcurrency() {
+        assertEquals(8, DownloadQueue.batchRoundsFor(8));
+        assertEquals(8, DownloadQueue.batchRoundsFor(9));
+        assertEquals(9, DownloadQueue.batchRoundsFor(10));
+        assertEquals(10, DownloadQueue.batchRoundsFor(12));
+        assertEquals(12, DownloadQueue.batchRoundsFor(16));
     }
 
     @Test

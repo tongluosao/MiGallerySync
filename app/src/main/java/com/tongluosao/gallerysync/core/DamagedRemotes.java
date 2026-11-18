@@ -308,16 +308,9 @@ public final class DamagedRemotes {
      * 一次性的，记进来会把本来能下回来的照片永久挡住。
      */
     static boolean isContentDamage(DownloadFailurePolicy.Cause cause) {
-        if (cause == null) {
-            return false;
-        }
-        switch (cause) {
-            case INVALID_PAYLOAD:
-            case CONTENT_MISMATCH:
-                return true;
-            default:
-                return false;
-        }
+        // 判据只有一处（{@link DownloadFailurePolicy#isContentDamage}）：语义比"哪个类记得更全"
+        // 重要 —— 计划侧、记账侧、单测必须对"什么叫内容损坏"给出同一个答案。
+        return DownloadFailurePolicy.isContentDamage(cause);
     }
 
     /**

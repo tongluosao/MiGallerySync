@@ -177,19 +177,28 @@ public final class Config {
      */
     public static final boolean DEFAULT_AUTO_DOWNLOAD = true;
     /**
-     * 自动下载默认 6 路。
+     * 自动下载默认 8 路（2026-11 由 6 上调）。
      *
      * <p>下载的瓶颈是"每对象一次握手"的等待（PROPFIND/GET 各一个往返），不是带宽，
-     * 所以实际吞吐基本随路数线性上升：真机实测 6 路明显优于 3 路，再高（7、8）收益
-     * 迅速变平，而且对自建 WebDAV 或挂载型后端（OpenList 一类）开始有压测嫌疑。
+     * 所以实际吞吐基本随路数线性上升：真机实测 6 路明显优于 3 路，而 6→8 的收益在
+     * "一整批几百个对象"的场景里仍然可测（每对象几百毫秒的握手被更多路并行摊平）。
+     * 每条连接都受 {@code StallPolicy} 的首字节/空闲双阈值约束，坏连接不会因为路数变多
+     * 而多占通道。
      *
      * <p>这里与上传默认值（3）故意不同：上传每个对象要做一次相册 provider 查询再写
-     * 一次 DB 行，6 路会与相册自己的操作抢锁；下载只在<b>收尾</b>写一次行，传输期间
+     * 一次 DB 行，8 路会与相册自己的操作抢锁；下载只在<b>收尾</b>写一次行，传输期间
      * 不持有 provider 锁，所以可以开得比上传多。
      */
-    public static final int DEFAULT_DOWNLOAD_CONCURRENCY = 6;
-    /** 与 {@link #MAX_UPLOAD_CONCURRENCY} 同口径：再高对服务端就是压测，收益已经很小 */
-    public static final int MAX_DOWNLOAD_CONCURRENCY = 8;
+    public static final int DEFAULT_DOWNLOAD_CONCURRENCY = 8;
+    /**
+     * 自动下载路数上限（2026-11 由 8 上调到 16）。
+     *
+     * <p>10~16 路是留给"自建 WebDAV + 大目录"的场景：多数时间花在等首字节与 302 跳转上，
+     * 单路连接远没有把上行/下行跑满。车道数会再多给 2 路余量（见
+     * {@code DownloadQueue.autoLaneCount}），计划量也按并发换算（{@code 200 * n / 6}，
+     * 上限 600），否则队列会在枚举与回调之间反复见底。
+     */
+    public static final int MAX_DOWNLOAD_CONCURRENCY = 16;
     /** 默认与相册共用一条记录：升级后行为不变，不想让相册那条记录被改的人自己去开分开记录 */
     public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
 
