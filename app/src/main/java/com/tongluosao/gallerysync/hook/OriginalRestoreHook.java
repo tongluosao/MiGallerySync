@@ -115,6 +115,7 @@ final class OriginalRestoreHook {
     private volatile boolean mVideoPlaybackHookReady;
     private volatile boolean mVideoErrorHookReady;
     private volatile boolean mMenuHookReady;
+    private volatile boolean mMenuClickHookReady;
 
     OriginalRestoreHook(XposedInterface xposed, ClassLoader loader) {
         mXposed = xposed;
@@ -156,6 +157,7 @@ final class OriginalRestoreHook {
         installCloudLoaderHook();
         installVideoPlaybackRestoreHook();
         installMenuHook();
+        installManagedOriginalClickHook();
     }
 
     private void installDownloadContextHook() {
@@ -1353,6 +1355,140 @@ final class OriginalRestoreHook {
         }
     }
 
+    /**
+     * 平板相册的“下载原图”直接落在 {@code DownloadOriginal.onClick(BaseDataItem)} 上，不像手机端
+     * 那样必经 {@code PhotoPageItem$DownloadManager.downloadOrigin(DownloadType)}
+     * → {@code CloudImageLoader.loadImage(...)}（后者由 {@link #installCloudLoaderHook()} 接管）。
+     * 这里在点击入口再判一次同一张注册表：命中登记的行绝不放行到小米云，改为复用
+     * {@link OriginalStore#restoreOriginal} 在后台把原件写回原路径；未登记（或模块未就绪）的行原样
+     * 放行，与未装模块时完全一致。任何反射/线程异常都回落到 {@code chain.proceed()}，不会让用户
+     * 点了没反应。
+     */
+    private void installManagedOriginalClickHook() {
+        try {
+            Class<?> menu = mLoader.loadClass(DOWNLOAD_MENU);
+            Class<?> item = mLoader.loadClass("com.miui.gallery.model.BaseDataItem");
+            Method click;
+            try {
+                click = menu.getDeclaredMethod("onClick", item);
+            } catch (NoSuchMethodException declaredMissing) {
+                // 个别版本把 onClick 声明在父类 BaseMenuItemDelegate 上
+                click = menu.getMethod("onClick", item);
+            }
+            click.setAccessible(true);
+            mXposed.hook(click).setId("gallery_managed_original_click")
+                    .setExceptionMode(XposedInterface.ExceptionMode.DEFAULT)
+                    .intercept(chain -> {
+                        Object dataItem = chain.getArg(0);
+                        if (dataItem == null) {
+                            Logger.d("event=managed_original_click_passthrough");
+                            return chain.proceed();
+                        }
+                        try {
+                            ClickRequest request = clickRestoreForItem(dataItem);
+                            if (request == null) {
+                                Logger.d("event=managed_original_click_passthrough");
+                                return chain.proceed();
+                            }
+                            Logger.i("event=managed_original_click_restore row="
+                                    + request.record.rowId + " remote=" + request.record.remotePath);
+                            if (!restoreClickOffThread(request)) {
+                                Logger.w("event=managed_original_click_fallback"
+                                        + " reason=worker_unavailable row=" + request.record.rowId);
+                                return chain.proceed();
+                            }
+                            toastOnMain(HostContext.get(mLoader), "正在从 WebDAV 还原原图");
+                            // onClick 是 void：已接管这一行，绝不落到小米云下载
+                            return null;
+                        } catch (Throwable t) {
+                            Logger.w("event=managed_original_click_fallback", t);
+                            return chain.proceed();
+                        }
+                    });
+            mMenuClickHookReady = true;
+            Logger.i("event=hook_registered method=DownloadOriginal.onClick(BaseDataItem)");
+        } catch (Throwable t) {
+            mMenuClickHookReady = false;
+            Logger.e("event=managed_original_click_hook_missing"
+                    + " method=DownloadOriginal.onClick(BaseDataItem)", t);
+        }
+    }
+
+    /**
+     * 点击分支的行判定，与菜单钩子同源：{@link #recordForItem} 认这张注册表，再确认这条记录确实
+     * 能还原（有远端路径、有落盘目标）。认不出来就返回 null，让调用方原样放行。
+     */
+    private ClickRequest clickRestoreForItem(Object item) throws Exception {
+        Config config = mConfig;
+        if (item == null || config == null || !config.isReady()) return null;
+        OriginalStore store = store();
+        if (store == null) return null;
+        OriginalStore.Record record = recordForItem(item, store, config);
+        if (record == null) return null;
+        String destination = record.originalLocalPath;
+        if (record.remotePath == null || record.remotePath.isEmpty()
+                || destination == null || destination.isEmpty()) {
+            Logger.w("event=managed_original_click_unrestorable row=" + record.rowId
+                    + " remote=" + record.remotePath + " dest=" + (destination != null));
+            return null;
+        }
+        boolean targetMatches = OriginalStore.targetKey(config).equals(record.target);
+        return new ClickRequest(item, record, config, destination, targetMatches);
+    }
+
+    /**
+     * 平板点击分支的后台还原：走的就是手机端那条 {@link OriginalStore#restoreOriginal}（下载、
+     * 长度/摘要校验、原子发布、状态落库全在它里面），这里只负责线程切换与结果提示。
+     */
+    private boolean restoreClickOffThread(final ClickRequest request) {
+        try {
+            mWorker.execute(() -> {
+                File restored = null;
+                Throwable failure = null;
+                Logger.i("event=managed_original_click_worker_started row=" + request.record.rowId);
+                try {
+                    if (!request.targetMatches) {
+                        throw new IllegalStateException("WebDAV target is not active for this item");
+                    }
+                    OriginalStore store = store();
+                    if (store == null) {
+                        throw new IllegalStateException("verified original registry is unavailable");
+                    }
+                    restored = store.restoreOriginal(request.config, request.record,
+                            new File(request.destination));
+                    Logger.i("event=managed_original_click_file_ready row="
+                            + request.record.rowId + " bytes=" + restored.length());
+                } catch (Throwable t) {
+                    failure = t;
+                }
+                File restoredFile = restored;
+                Throwable finalFailure = failure;
+                if (!mMain.post(() -> announceClickRestore(request, restoredFile, finalFailure))) {
+                    Logger.w("event=managed_original_click_callback_rejected row="
+                            + request.record.rowId);
+                }
+            });
+            return true;
+        } catch (Throwable t) {
+            Logger.w("event=managed_original_click_worker_unavailable row="
+                    + request.record.rowId, t);
+            return false;
+        }
+    }
+
+    private void announceClickRestore(ClickRequest request, File restored, Throwable failure) {
+        Context context = HostContext.get(mLoader);
+        if (failure == null && restored != null && restored.isFile()) {
+            Logger.i("event=managed_original_click_restored row=" + request.record.rowId
+                    + " bytes=" + restored.length());
+            toastOnMain(context, "原图已还原，可重新打开查看");
+            return;
+        }
+        Logger.w("event=managed_original_click_restore_failed row=" + request.record.rowId
+                + " detail=" + failure);
+        toastOnMain(context, "原图还原失败，请重试");
+    }
+
     /** 反射方法转 {@code name(paramType1,paramType2)} 形式的签名，参数类型只留简单名。 */
     private static String menuSignature(Method method) {
         StringBuilder sb = new StringBuilder(method.getName()).append('(');
@@ -1719,6 +1855,7 @@ final class OriginalRestoreHook {
         }
         mVideoPlaybackHookReady = false;
         mVideoErrorHookReady = false;
+        mMenuClickHookReady = false;
         mActiveVideoPlayback = null;
         mOriginHookReady = false;
         mImageLoaderHookReady = false;
@@ -1751,6 +1888,24 @@ final class OriginalRestoreHook {
             this.record = record;
             this.config = config;
             this.generation = generation;
+        }
+    }
+
+    /** 平板“下载原图”点击分支捕获到的一行：不需要 Gallery 的监听器，只要注册表记录与落盘目标。 */
+    private static final class ClickRequest {
+        final Object item;
+        final OriginalStore.Record record;
+        final Config config;
+        final String destination;
+        final boolean targetMatches;
+
+        ClickRequest(Object item, OriginalStore.Record record, Config config, String destination,
+                boolean targetMatches) {
+            this.item = item;
+            this.record = record;
+            this.config = config;
+            this.destination = destination;
+            this.targetMatches = targetMatches;
         }
     }
 
