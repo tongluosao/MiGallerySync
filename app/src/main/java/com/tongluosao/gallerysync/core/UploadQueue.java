@@ -1547,13 +1547,15 @@ public final class UploadQueue {
                 // 与老行为一致
                 ProbeDecision.Outcome probeOutcome = ProbeDecision.Outcome.ABSENT;
                 long probeWaitedMs = 0L;
+                // 探测的原始观测（远端真实大小）留给下面的覆盖闸门：null = 这一轮没观测到
+                ProbeOutcome probe = null;
                 phaseAt = phase("probe_start", index, task, "remote=" + remotePath
                         + " skip_existing=" + config.isSkipExistingRemote()
                         + " deadline_ms=" + PROBE_DEADLINE_MS);
                 if (config.isSkipExistingRemote()) {
                     // **探测有硬截止**：它只是"省一次上传"的优化，绝不许把 PUT 拖死。
                     // 大目录下问一句"这个陌生文件在不在"能等到几十秒（见 PROBE_DEADLINE_MS）
-                    ProbeOutcome probe = probeRemoteExists(config, remoteDir, file.getName(),
+                    probe = probeRemoteExists(config, remoteDir, file.getName(),
                             uploadedLength, remotePath);
                     probeOutcome = probe.outcome;
                     probeWaitedMs = probe.waitedMs;
@@ -1673,6 +1675,14 @@ public final class UploadQueue {
                         mPendingVersion++;
                         saveThrottledLocked();
                     }
+                    return;
+                }
+                // 覆盖闸门：**唯一**一处"已经问过远端、又还没发出任何字节"的判定点。
+                // 上面的 skip 分支（受保护 / 垃圾副本 / 载荷不合格）都走完了，下面的
+                // putSendResolved 就是真正的写 —— 再往前后挪都会漏判或重复判。
+                // 拒绝时按既有"跳过"收尾（摘出待传队列、不重试、不记账），绝不走 fail()。
+                if (refuseOverwritingRemoteOriginal(config, client, remoteDir, remotePath, taskKey,
+                        file, uploadedLength, uploadedSha256, probe)) {
                     return;
                 }
                 // **顺序不能颠倒：先把字节发出去，再谈复核。** 复核（HEAD/PROPFIND）问的是
@@ -2679,10 +2689,39 @@ public final class UploadQueue {
     private static final class ProbeOutcome {
         final ProbeDecision.Outcome outcome;
         final long waitedMs;
+        /**
+         * 这一次探测**看见了什么**（名字在不在、大小是多少）。null = 没观测到（超时 / 异常 /
+         * 没提交成功）。跳过判定只关心"名字 + 大小都对上"，而覆盖闸门要的是真实大小 ——
+         * 同名但长度不同的对象恰恰是它要拒绝覆盖的那一类，所以观测结果必须带出来。
+         */
+        final RemoteStat stat;
 
         ProbeOutcome(ProbeDecision.Outcome outcome, long waitedMs) {
+            this(outcome, waitedMs, null);
+        }
+
+        ProbeOutcome(ProbeDecision.Outcome outcome, long waitedMs, RemoteStat stat) {
             this.outcome = outcome;
             this.waitedMs = waitedMs;
+            this.stat = stat;
+        }
+    }
+
+    /**
+     * 一次远端对象观测：这个名字在不在、大小是多少。
+     *
+     * <p>与"跳过"用的布尔结论分开：老判定只回答"名字 + 大小都对上吗"，
+     * 大小对不上时它和"没有这个对象"是同一个 false；覆盖闸门却必须区分这两者。
+     */
+    private static final class RemoteStat {
+        /** 远端目录名单里出现了这个名字（或对象级探测拿到了正的大小） */
+        final boolean present;
+        /** &gt;0 已知大小；0 存在但大小未知；-1 不知道 / 不存在 */
+        final long size;
+
+        RemoteStat(boolean present, long size) {
+            this.present = present;
+            this.size = size;
         }
     }
 
@@ -2702,21 +2741,21 @@ public final class UploadQueue {
                                            final String name, final long size,
                                            final String remotePath) {
         final long start = nowMs();
-        Callable<Boolean> probe = () -> {
+        Callable<RemoteStat> probe = () -> {
             long at = nowMs();
             try {
-                boolean exists = remoteExists(probeClientFor(config), remoteDir, name, size);
-                Logger.d("event=upload_probe_task_result remote=" + remotePath + " exists="
-                        + exists + " probe_ms=" + (nowMs() - at));
-                return exists;
+                RemoteStat stat = remoteStat(probeClientFor(config), remoteDir, name, size);
+                Logger.d("event=upload_probe_task_result remote=" + remotePath + " present="
+                        + stat.present + " size=" + stat.size + " probe_ms=" + (nowMs() - at));
+                return stat;
             } catch (Throwable t) {
                 // 结果只用于日志：主链路这一刻早就按"问不出来"继续上传了
                 Logger.d("event=upload_probe_task_result remote=" + remotePath
-                        + " exists=unknown reason=" + t + " probe_ms=" + (nowMs() - at));
+                        + " present=unknown reason=" + t + " probe_ms=" + (nowMs() - at));
                 return null;
             }
         };
-        Future<Boolean> future;
+        Future<RemoteStat> future;
         try {
             future = PROBE_POOL.submit(probe);
         } catch (RejectedExecutionException e) {
@@ -2726,13 +2765,16 @@ public final class UploadQueue {
             return new ProbeOutcome(ProbeDecision.Outcome.ERROR, 0L);
         }
         try {
-            Boolean exists = future.get(PROBE_DEADLINE_MS, TimeUnit.MILLISECONDS);
+            RemoteStat stat = future.get(PROBE_DEADLINE_MS, TimeUnit.MILLISECONDS);
             long waited = nowMs() - start;
-            if (exists == null) {
+            if (stat == null) {
                 return new ProbeOutcome(ProbeDecision.Outcome.ERROR, waited);
             }
+            // 与老判定逐字等价：名字在名单里，且（大小未知 或 大小相同）才算"有"。
+            // 大小对不上时 stat 仍然把**真实大小**带出去，覆盖闸门要用它
+            boolean exists = stat.present && (stat.size < 0L || stat.size == size);
             return new ProbeOutcome(exists ? ProbeDecision.Outcome.PRESENT
-                    : ProbeDecision.Outcome.ABSENT, waited);
+                    : ProbeDecision.Outcome.ABSENT, waited, stat);
         } catch (TimeoutException e) {
             // 打断它只是让它别再占着那条连接；读不出来的结果直接丢掉，判定已经走照传
             future.cancel(true);
@@ -2746,6 +2788,124 @@ public final class UploadQueue {
             Thread.currentThread().interrupt();
             return new ProbeOutcome(ProbeDecision.Outcome.ERROR, nowMs() - start);
         }
+    }
+
+    /**
+     * 覆盖闸门：本地这份文件能不能覆盖远端**同名**的那个对象。返回 true 表示已拒绝 ——
+     * 日志已经记过、任务已经按"跳过"收尾，调用方直接 {@code return} 即可。
+     *
+     * <p>事故背景（2026-11）：本地照片被系统/云相册换成低清高质量图（长度远小于原图），
+     * 相册把它标脏重新入队，而老判据只有"同路径"→ 一次普通 PUT 就把远端完整原图盖掉。
+     *
+     * <p>判定顺序（每一档先想清楚"不知道"怎么办，一律 fail-open 到照传）：
+     * <ol>
+     *   <li>远端观测：探测跑过（skip_existing 开启）就用它的结果；没跑（skip_existing 关闭）才
+     *       花一次对象级 PROPFIND 问大小 —— 这是本闸门唯一可能新增的请求；探测超时/异常时
+     *       没有观测，按"不知道"照传，绝不再补一次请求把 PUT 拖住；</li>
+     *   <li>远端没有这个名字 / 大小问不出来 / 与本地相同 → 直接放行，<b>连注册表都不查</b>；</li>
+     *   <li>只有"远端存在且长度不同"才查注册表：本地这份是不是那条原图（远端路径 + 长度 +
+     *       摘要）。是 → 放行（原图替换原图，或远端被截断后的修复）；否 → 拒绝。</li>
+     * </ol>
+     */
+    private boolean refuseOverwritingRemoteOriginal(Config config, WebDavClient client,
+                                                    String remoteDir, String remotePath,
+                                                    String taskKey, File file, long localLength,
+                                                    String localSha256, ProbeOutcome probe) {
+        // 探测跑过（skip_existing 开启）就用它的观测；它超时/抛异常时没有观测 —— 那种链路上
+        // 绝不能再补一次元数据请求去拖住 PUT，按"不知道"照传。没探测（skip_existing 关闭）时
+        // 才花那一次对象级 PROPFIND 问大小
+        RemoteStat stat = probe == null
+                ? quietRemoteStat(client, remoteDir, file.getName(), remotePath)
+                : probe.stat;
+        if (stat == null) {
+            return false;
+        }
+        if (!stat.present || stat.size <= 0L || stat.size == localLength) {
+            // 远端没有这个名字 / 大小问不出来 / 长度相同：都不属于"用另一个长度的文件盖掉
+            // 原图"，交给既有逻辑（skip_existing 的字节校验，或直接覆盖写）。
+            // 这一支不查注册表，正常上传路径因此没有任何额外开销
+            return false;
+        }
+        boolean registeredOriginal = isRegisteredOriginal(config, remotePath, file, localLength,
+                localSha256);
+        if (OverwriteGuard.decide(true, stat.size, localLength, registeredOriginal)
+                != OverwriteGuard.Decision.REFUSE_NOT_REGISTERED_ORIGINAL) {
+            return false;
+        }
+        Logger.i("event=upload_refused_remote_original_mismatch remote=" + remotePath
+                + " local=" + localLength + " remote_len=" + stat.size
+                + " registered=" + (registeredOriginal ? 1 : 0));
+        // 与 upload_skip_protected_before_put / upload_rejected 同一条收尾路径：从待传队列
+        // 里摘掉，不重试、不记 done、不打断宿主。绝不走 fail() —— 那不是"传失败"，
+        // 而是"这一次不该传"，退避重试只会把同一份低清图再推一遍
+        synchronized (mLock) {
+            mPending.remove(taskKey);
+            mPendingVersion++;
+            saveThrottledLocked();
+        }
+        return true;
+    }
+
+    /**
+     * 只在覆盖闸门需要时，花一次**对象级**请求问远端大小
+     * （{@link WebDavClient#propfindSize}，Depth 0，不列父目录）。
+     *
+     * <p>为什么先看 {@link #mRemoteNames}：探测刚取过整个目录的名单时，这个名字的大小是免费的。
+     * 名单里没有这个名字也算结论 —— 名单是刚取的（{@link #REMOTE_DIR_CACHE_MS} 内）。
+     *
+     * <p>返回 {@link RemoteStat}：present=false 表示"没有这个名字"或"问不出来"（两者结论相同，
+     * 都是照传）；present=true 且 size=0 表示"存在但大小未知"，同样照传。
+     */
+    private RemoteStat quietRemoteStat(WebDavClient client, String remoteDir, String name,
+                                       String remotePath) {
+        synchronized (mLock) {
+            RemoteNames cached = mRemoteNames.get(remoteDir);
+            if (cached != null && System.currentTimeMillis() - cached.at < REMOTE_DIR_CACHE_MS) {
+                return statOf(cached.sizes, name);
+            }
+        }
+        long size;
+        try {
+            size = client.propfindSize(remotePath);
+        } catch (Throwable t) {
+            Logger.d("event=upload_guard_probe_failed remote=" + remotePath + " reason=" + t);
+            return new RemoteStat(false, -1L);
+        }
+        if (size < -1L) {
+            // -2 = 问不出来（不支持 PROPFIND / 网络失败）。结论与"没有"相同（照传），
+            // 但日志里要能分辨，否则事后看不出这一次闸门到底判没判
+            Logger.d("event=upload_guard_probe_unknown remote=" + remotePath);
+            return new RemoteStat(false, -1L);
+        }
+        if (size == -1L) {
+            return new RemoteStat(false, -1L);
+        }
+        return new RemoteStat(true, size);
+    }
+
+    /**
+     * 本地这份文件是不是注册表里登记的那条**远端原图**：远端路径对得上、登记长度等于本地长度，
+     * 且（登记了摘要时）SHA-256 也一致。
+     *
+     * <p>摘要**不在这里算**：prepare 段已经为每次上传算过一份 {@code uploadedSha256}，
+     * 这里只是复用。长度对不上就已经判否，绝不为了判否去读整个文件 —— 否则每张图都要多付
+     * 一次全文件哈希。
+     */
+    private boolean isRegisteredOriginal(Config config, String remotePath, File file,
+                                         long localLength, String localSha256) {
+        if (mOriginalStore == null) {
+            return false;
+        }
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath, file);
+        if (record == null || record.originalLength != localLength) {
+            return false;
+        }
+        if (record.sha256 == null || record.sha256.isEmpty()) {
+            // 接管登记之类的记录没有摘要：长度对上就只能认它是原图（与 isProtectedUpload 的
+            // "缺摘要不等于放行"不同 —— 那是拦本地写，这里是放远端覆盖，方向正好相反）
+            return true;
+        }
+        return localSha256 != null && record.sha256.equalsIgnoreCase(localSha256);
     }
 
     /**
@@ -2764,16 +2924,19 @@ public final class UploadQueue {
      * 那种情况按名字跳过会把**不完整的一份**当成备份完成，比多传一次危险得多。
      * 唯一放宽的是远端报不出大小（-1）：那时按名字判，与老行为一致。
      *
-     * <p><b>任何失败都返回 false（继续上传）</b>。这个判断只是"省一次上传"的优化，
+     * <p><b>任何失败都按"没有"返回（继续上传）</b>。这个判断只是"省一次上传"的优化，
      * 它自己坏掉（不支持 PROPFIND、超时、被拦）绝不该让文件传不上去 —— 判错了方向以后果
      * 最轻：多传一次覆盖写。反过来若在拿不到名单时判"远端有"，那才是丢文件。
+     *
+     * <p>返回的是**观测**而不是布尔值：跳过判定只关心"名字 + 大小都对上"，而覆盖闸门
+     * （{@link OverwriteGuard}）要的是真实大小 —— 同名但长度不同的对象正是它要拒绝的那一类。
      */
-    private boolean remoteExists(WebDavClient client, String remoteDir, String name, long size) {
+    private RemoteStat remoteStat(WebDavClient client, String remoteDir, String name, long size) {
         Map<String, Long> remote;
         synchronized (mLock) {
             RemoteNames cached = mRemoteNames.get(remoteDir);
             if (cached != null && System.currentTimeMillis() - cached.at < REMOTE_DIR_CACHE_MS) {
-                return matches(cached.sizes, name, size);
+                return statOf(cached.sizes, name);
             }
         }
         try {
@@ -2786,7 +2949,8 @@ public final class UploadQueue {
                 boolean exact = WebDavClient.hasExactSize(directSize, size);
                 Logger.d("event=remote_object_fallback size=" + directSize
                         + " expected=" + size + " exact=" + exact);
-                return exact;
+                // directRemoteSize：>0 已知大小；0 存在但大小未知；-1 两个直问法都说没有
+                return new RemoteStat(directSize != -1L, directSize);
             }
             Map<String, Long> sizes = new HashMap<>();
             for (WebDavClient.RemoteEntry entry : entries) {
@@ -2803,18 +2967,18 @@ public final class UploadQueue {
             // 连接层失败（TransportFailure）与协议层失败一视同仁：这一项照传，
             // 真传不上去会由下面的 putSend 报出来，不该在这里改判定
             Logger.d("event=remote_list_failed dir=" + remoteDir + " reason=" + t);
-            return false;
+            return new RemoteStat(false, -1L);
         }
-        return matches(remote, name, size);
+        return statOf(remote, name);
     }
 
-    /** 名单里这个名字的大小与本地一致吗；远端大小未知（-1）时按名字算 */
-    private static boolean matches(Map<String, Long> remote, String name, long size) {
+    /** 名单里这个名字的观测结果；不在名单里就是"没有"，大小 -1 表示未知 */
+    private static RemoteStat statOf(Map<String, Long> remote, String name) {
         Long remoteSize = remote.get(name);
         if (remoteSize == null) {
-            return false;
+            return new RemoteStat(false, -1L);
         }
-        return remoteSize < 0 || remoteSize == size;
+        return new RemoteStat(true, remoteSize);
     }
 
     /**

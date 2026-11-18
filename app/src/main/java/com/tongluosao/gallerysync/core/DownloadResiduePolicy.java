@@ -58,6 +58,37 @@ public final class DownloadResiduePolicy {
      * @param nowMs     当前时刻（{@code System.currentTimeMillis()}）
      * @param mtimeMs   该文件的修改时刻；读不到（0 或负数）一律不删
      */
+    /**
+     * 同一目录两次清扫之间的最小间隔。
+     *
+     * <p>清扫要把目录整个 {@code list()} 一遍，在 FUSE 上（相册目录动辄数千个文件）
+     * 单次要几秒到十几秒——每个对象都扫一次会把下载吞吐拖死。而残留件的判据本身要求
+     * “至少 {@link #MIN_AGE_MS} 没被动过”，所以十分钟扫一次就足够把上一个进程留下的
+     * 残留收干净；本次进程自己写的临时件名字带随机 UUID，绝不会被下一次写入影响。
+     */
+    public static final long SWEEP_INTERVAL_MS = 10L * 60_000L;
+
+    /**
+     * 这个目录该不该现在扫一遍。
+     *
+     * @param lastSweepAtMs 上次扫描时刻；没扫过（0 或负数）一律要扫
+     * @param nowMs         当前时刻
+     */
+    public static boolean shouldSweepDirectory(long lastSweepAtMs, long nowMs) {
+        if (nowMs <= 0L) {
+            return false;
+        }
+        if (lastSweepAtMs <= 0L) {
+            return true;
+        }
+        long elapsed = nowMs - lastSweepAtMs;
+        if (elapsed < 0L) {
+            // 时钟往回调过：间隔判断不可信，按“该扫”处理，避免永远不再清扫
+            return true;
+        }
+        return elapsed >= SWEEP_INTERVAL_MS;
+    }
+
     public static boolean isSweepable(String candidate, String destName, long nowMs, long mtimeMs) {
         if (!isStagingNameFor(candidate, destName)) {
             return false;

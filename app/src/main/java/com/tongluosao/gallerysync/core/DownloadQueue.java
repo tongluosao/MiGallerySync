@@ -38,6 +38,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -166,6 +172,37 @@ public final class DownloadQueue {
      * 风险太大，交给维护模式人工处理。这里只保证日志不刷屏（每轮计划都会看到它们）。
      */
     private final Set<String> mMirrorPreexistingLogged = new HashSet<>();
+
+    /**
+     * 收尾池的队列容量：收尾任务每个都可能压着十几秒，无界队列会把"已提交但还没生效"
+     * 的时间与内存一起拉长。满了由车道线程同步做完（见
+     * {@link FinalizePipeline#shouldRunInline(int, int)}）。
+     */
+    private static final int FINALIZE_QUEUE_CAPACITY = 64;
+    /** 收尾线程名：logcat 里与传输线程一眼分开 */
+    private static final String FINALIZE_THREAD_NAME = "download-finalize-";
+    /**
+     * 传输后收尾（接管相册行 + 通知宿主扫描）的有界池。
+     *
+     * <p>这两步是"别人的锁 + 别人的队列"（相册 cloud 行更新、宿主扫描器），真机上
+     * 占掉单次下载 13–15 s 里的绝大部分。搬到这里之后，车道线程只负责落盘/登记/记账，
+     * 领下一个对象不再陪等。懒创建：第一次提交时按配置并发数决定路数。
+     */
+    private ThreadPoolExecutor mFinalizePool;
+    /** 已提交、尚未跑完的收尾路径：同一 remotePath 最多提交一次（受 mLock 保护） */
+    private final Set<String> mFinalizeQueued = new HashSet<>();
+    /** 收尾池的创建/关闭互斥 */
+    private final Object mFinalizeGate = new Object();
+    /**
+     * 目录级清扫节流表：目录绝对路径 → 上次 list() 的时刻。
+     *
+     * <p>真机实测：每下完一个对象都去 {@code list()} 一次相册目录，在 FUSE 上单次中位
+     * 16.7 s，占掉整条下载流水的大头。残留件判据本身要求"十分钟没被动过"，所以同一目录
+     * 十分钟扫一次就够；这里只记时刻，不缓存目录内容，内存占用可忽略。
+     */
+    private static final java.util.HashMap<String, Long> SWEEP_SLOTS = new java.util.HashMap<>();
+    /** 节流表上限：超过就整体清空（代价只是多扫几次，不会泄漏） */
+    private static final int SWEEP_SLOTS_LIMIT = 512;
 
     private volatile Config mConfig;
     /** Native Gallery auto-download gate. No host wiring means downloads stay disabled. */
@@ -849,6 +886,36 @@ public final class DownloadQueue {
             mLock.notifyAll();
         }
         closeClients();
+        stopFinalizePool();
+    }
+
+    /**
+     * 停收尾池：先让排队中的任务跑完，2 s 还不够就打断（provider 调用不可中断，
+     * 打断只是让线程在下一个可中断点退出，绝不影响已经落盘并登记过的文件）。
+     */
+    private void stopFinalizePool() {
+        ThreadPoolExecutor pool;
+        synchronized (mFinalizeGate) {
+            pool = mFinalizePool;
+            mFinalizePool = null;
+        }
+        if (pool == null) {
+            return;
+        }
+        pool.shutdown();
+        boolean terminated = false;
+        try {
+            terminated = pool.awaitTermination(2L, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!terminated) {
+            pool.shutdownNow();
+        }
+        synchronized (mLock) {
+            mFinalizeQueued.clear();
+        }
+        Logger.i("event=download_finalize_pool_stopped drained=" + terminated);
     }
 
     // ------------------------------------------------------------------ 计划侧
@@ -2122,17 +2189,10 @@ public final class DownloadQueue {
             mDamagedRemotes.forget(pending.target, pending.remotePath, "download_ok");
             // 已经下成了：这一条不需要"在不在"的结论了，别让它留在缓存里占位
             mProbeCache.forget(pending.remotePath, pending.size);
-            boolean rowAdopted = false;
-            if (pending.autoDownload) {
-                // 接管行本来就有一行相册记录：把 localFile 精确指回原路径，绝不让扫描器建第二行。
-                rowAdopted = adoptAutoDownloadedRow(pending, config, dest, publishedDigest);
-            }
-            // 原地发布已经把既有行精确改成“本地文件 = 原路径、缩略图为空”：这时再交给宿主
-            // 扫描器只会让它在同一路径上多建一行，所以原地成功分支刻意跳过通知。
-            if (!inplaceCommitted && !rowAdopted) {
-                // 质量分支的 dest 在 .gallerysync-slim 里时只能挂到既有云行，不能交给宿主扫描器
-                notifyHostAfterPublish(dest, normalDest);
-            }
+            // 接管相册行 + 通知宿主扫描器都很慢（真机 13–15 s，全是 provider/扫描器的等待）：
+            // 交给有界收尾池，车道线程立刻去领下一个对象。原地发布的特殊之处（不交给扫描器）
+            // 作为参数传进去，判据仍在收尾任务里执行，逻辑与同步时完全一致。
+            submitFinalize(pending, config, dest, normalDest, publishedDigest, inplaceCommitted);
             Logger.i("event=download_ok remote=" + pending.remotePath
                     + " local=" + dest.getAbsolutePath() + " size=" + dest.length()
                     + " dest_kind=" + pending.destKind.wire
@@ -2230,6 +2290,155 @@ public final class DownloadQueue {
                     + " path=" + dest.getAbsolutePath());
         }
         return rowUpdated;
+    }
+
+    /**
+     * 把一次"传输后收尾"投进有界池；池不可用或队列已满时就地同步做完。
+     *
+     * <p>调用点在 {@code markDone} 之后、{@code finally} 摘 {@link #mInflight} 之前，
+     * 所以此刻同一 {@code remotePath} 必然仍在在传集合里 —— 见下面的守卫。
+     * 幂等由 {@link #mFinalizeQueued} 保证：同一路径的收尾最多提交一次。
+     *
+     * <p>参数在这里一次性拷进 {@link FinalizeTask} 的 final 字段：车道线程接下来还会跑
+     * {@code finally}（摘在传集合、发终态），收尾任务绝不能再去读那些会被改写的局部变量。
+     */
+    private void submitFinalize(Pending pending, Config config, File dest, File normalDest,
+            String publishedDigest, boolean inplaceCommitted) {
+        File published = dest;
+        File albumOriginal = normalDest == null ? dest : normalDest;
+        long bytes = published == null ? 0L : published.length();
+        synchronized (mLock) {
+            // 提交点仍在 finally 之前：这里为 false 说明调用顺序被改坏了，留一条证据
+            if (!mInflight.contains(pending.remotePath)) {
+                Logger.w("event=download_finalize_guard remote=" + pending.remotePath
+                        + " inflight=false");
+            }
+            if (!mFinalizeQueued.add(pending.remotePath)) {
+                Logger.w("event=download_finalize_skipped remote=" + pending.remotePath
+                        + " reason=duplicate");
+                return;
+            }
+        }
+        FinalizeTask task = new FinalizeTask(pending, config, published, albumOriginal,
+                publishedDigest, inplaceCommitted, bytes);
+        ThreadPoolExecutor pool = finalizePool();
+        int queued = pool == null ? -1 : pool.getQueue().size();
+        if (pool == null
+                || FinalizePipeline.shouldRunInline(queued, FINALIZE_QUEUE_CAPACITY)) {
+            // 队列满/池已关：车道线程自己做，保证不丢、也不让积压无界
+            Logger.i("event=download_finalize_submitted remote=" + pending.remotePath
+                    + " queue=" + Math.max(queued, 0) + " inline=1");
+            task.run();
+            return;
+        }
+        try {
+            pool.execute(task);
+            Logger.i("event=download_finalize_submitted remote=" + pending.remotePath
+                    + " queue=" + queued);
+        } catch (RejectedExecutionException e) {
+            // execute 与 take 之间池可能刚被关：退回同步执行，绝不能丢
+            Logger.w("event=download_finalize_rejected remote=" + pending.remotePath
+                    + " queue=" + queued + " fallback=inline");
+            task.run();
+        }
+    }
+
+    /** 懒创建收尾池：路数由"当前配置并发数"决定，见 {@link FinalizePipeline#workerCount(int)}。 */
+    private ThreadPoolExecutor finalizePool() {
+        synchronized (mFinalizeGate) {
+            if (mFinalizePool != null) {
+                return mFinalizePool;
+            }
+            if (!mRunning) {
+                return null;
+            }
+            Config config = mConfig;
+            int concurrency = config == null
+                    ? Config.DEFAULT_DOWNLOAD_CONCURRENCY : config.getDownloadConcurrency();
+            int workers = FinalizePipeline.workerCount(concurrency);
+            final AtomicInteger seq = new AtomicInteger();
+            ThreadFactory factory = runnable -> {
+                Thread thread = new Thread(runnable,
+                        FINALIZE_THREAD_NAME + seq.incrementAndGet());
+                thread.setDaemon(true);
+                return thread;
+            };
+            ThreadPoolExecutor pool = new ThreadPoolExecutor(workers, workers, 30L,
+                    TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(FINALIZE_QUEUE_CAPACITY),
+                    factory, new ThreadPoolExecutor.AbortPolicy());
+            // 空闲线程 30 s 后退出：下载是突发的，没必要为收尾常驻 4 条线程
+            pool.allowCoreThreadTimeOut(true);
+            mFinalizePool = pool;
+            Logger.i("event=download_finalize_pool_started workers=" + workers
+                    + " queue=" + FINALIZE_QUEUE_CAPACITY + " concurrency=" + concurrency);
+            return pool;
+        }
+    }
+
+    /**
+     * 一次收尾：接管相册行（自动下载）→ 必要时通知宿主扫描器。
+     *
+     * <p>异常绝不逃逸：文件此时已经落盘、{@code markDone} 也已记过，收尾失败最多是
+     * "这一行暂时没更新"，下一轮 {@code PROMOTE_EXISTING} 会补；把异常抛给池线程只会
+     * 白白换掉一条线程，还会让 {@link #mFinalizeQueued} 的清理停在半路。
+     */
+    private final class FinalizeTask implements Runnable {
+        private final Pending pending;
+        private final Config config;
+        private final File dest;
+        private final File normalDest;
+        private final String digest;
+        private final boolean inplaceCommitted;
+        private final long bytes;
+
+        FinalizeTask(Pending pending, Config config, File dest, File normalDest, String digest,
+                boolean inplaceCommitted, long bytes) {
+            this.pending = pending;
+            this.config = config;
+            this.dest = dest;
+            this.normalDest = normalDest;
+            this.digest = digest;
+            this.inplaceCommitted = inplaceCommitted;
+            this.bytes = bytes;
+        }
+
+        @Override
+        public void run() {
+            long started = SystemClock.elapsedRealtime();
+            try {
+                boolean rowAdopted = false;
+                if (pending.autoDownload) {
+                    // 接管行本来就有一行相册记录：把 localFile 精确指回原路径，绝不建第二行
+                    rowAdopted = adoptAutoDownloadedRow(pending, config, dest, digest);
+                }
+                // 原地发布已经把既有行精确改成"本地文件 = 原路径、缩略图为空"：再交给宿主
+                // 扫描器只会让它在同一路径上多建一行，所以原地成功分支刻意跳过通知。
+                if (!inplaceCommitted && !rowAdopted) {
+                    // 质量分支的 dest 在 .gallerysync-slim 里时只能挂到既有云行，不能交给扫描器
+                    notifyHostAfterPublish(dest, normalDest);
+                }
+                long ms = SystemClock.elapsedRealtime() - started;
+                Logger.i("event=download_finalized remote=" + pending.remotePath
+                        + " ms=" + ms + " row_adopted=" + rowAdopted);
+                long budget = FinalizePipeline.timeoutMs(bytes);
+                if (ms > budget) {
+                    // 只打点、不强杀：provider 的行更新不响应中断，硬杀会留下半个状态
+                    Logger.w("event=download_finalize_slow remote=" + pending.remotePath
+                            + " ms=" + ms + " timeout=" + budget);
+                }
+            } catch (Throwable t) {
+                try {
+                    Logger.w("event=download_finalize_failed remote=" + pending.remotePath
+                            + " reason=" + t, t);
+                } catch (Throwable ignored) {
+                    // 连日志都失败也不能让异常逃到池线程
+                }
+            } finally {
+                synchronized (mLock) {
+                    mFinalizeQueued.remove(pending.remotePath);
+                }
+            }
+        }
     }
 
     /**
@@ -3869,6 +4078,12 @@ public final class DownloadQueue {
         if (parent == null || !parent.isDirectory()) {
             return;
         }
+        long now = System.currentTimeMillis();
+        // 目录级节流：list() 在 FUSE 上是重活（相册目录数千文件，单次数秒），而残留件
+        // 判据本身要求“十分钟没被动过”，所以同一目录十分钟扫一次就够。
+        if (!claimSweepSlot(parent, now)) {
+            return;
+        }
         String[] names;
         try {
             names = parent.list();
@@ -3878,7 +4093,6 @@ public final class DownloadQueue {
         if (names == null || names.length == 0) {
             return;
         }
-        long now = System.currentTimeMillis();
         int removed = 0;
         for (String name : names) {
             File candidate = new File(parent, name);
@@ -3893,6 +4107,27 @@ public final class DownloadQueue {
         if (removed > 0) {
             Logger.i("event=download_residue_cleaned dir=" + parent.getAbsolutePath()
                     + " dest=" + destination.getName() + " removed=" + removed);
+        }
+    }
+
+    /**
+     * 抢占某个目录本轮的清扫权：同一目录 {@link DownloadResiduePolicy#SWEEP_INTERVAL_MS}
+     * 内只允许一个对象去 {@code list()}。
+     *
+     * <p>先占坑再扫：即使这次 list() 抛异常或很慢，也不会被排队的下一个对象立刻重试。
+     */
+    private static boolean claimSweepSlot(File parent, long now) {
+        String key = parent.getAbsolutePath();
+        synchronized (SWEEP_SLOTS) {
+            Long last = SWEEP_SLOTS.get(key);
+            if (last != null && !DownloadResiduePolicy.shouldSweepDirectory(last.longValue(), now)) {
+                return false;
+            }
+            if (SWEEP_SLOTS.size() > SWEEP_SLOTS_LIMIT) {
+                SWEEP_SLOTS.clear();
+            }
+            SWEEP_SLOTS.put(key, Long.valueOf(now));
+            return true;
         }
     }
 

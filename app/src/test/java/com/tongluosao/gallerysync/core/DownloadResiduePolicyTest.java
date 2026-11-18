@@ -70,4 +70,22 @@ public class DownloadResiduePolicyTest {
         assertFalse(DownloadResiduePolicy.isSweepable(".other.mgs-abc.tmp", DEST, now,
                 now - 86_400_000L));
     }
+
+    @Test
+    public void directoryIsSweptOnlyAfterTheInterval() {
+        long now = 1_700_000_000_000L;
+        assertTrue("没扫过的目录一律要扫", DownloadResiduePolicy.shouldSweepDirectory(0L, now));
+        assertFalse("刚扫过：不该再 list()",
+                DownloadResiduePolicy.shouldSweepDirectory(now - 1_000L, now));
+        assertFalse("间隔没到：不该再 list()",
+                DownloadResiduePolicy.shouldSweepDirectory(
+                        now - DownloadResiduePolicy.SWEEP_INTERVAL_MS + 1L, now));
+        assertTrue("间隔到了：该扫",
+                DownloadResiduePolicy.shouldSweepDirectory(
+                        now - DownloadResiduePolicy.SWEEP_INTERVAL_MS, now));
+        assertTrue("时钟往回调过：按该扫处理，避免永远不清扫",
+                DownloadResiduePolicy.shouldSweepDirectory(now + 60_000L, now));
+        assertFalse("拿不到当前时刻：跳过",
+                DownloadResiduePolicy.shouldSweepDirectory(now, 0L));
+    }
 }
