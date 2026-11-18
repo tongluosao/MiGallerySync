@@ -41,6 +41,22 @@ public final class DownloadDestinationPolicy {
      */
     public static File resolve(File albumPath, File mirrorPath, boolean sameNameSameLength,
             String registeredOriginalPath) {
+        return resolve(albumPath, mirrorPath, sameNameSameLength, registeredOriginalPath, false);
+    }
+
+    /**
+     * 决定下载落点，并把"相册里那份同名文件是本记录自己登记过的副本"当作回流条件。
+     *
+     * <p>为什么需要第五个参数：原地瘦身会把原图换成<b>同名同路径</b>的预览，长度必然短于
+     * 远端对象。此时前三条判据全部落空（没登记成原路径 —— 因为登记的是"原图在别处/已瘦身"，
+     * 长度也不同），于是老逻辑改写到镜像目录，同一张照片出现第二份文件、相册多出第二行。
+     * 但那份字节<b>是我们自己写的副本</b>，正确动作是"把原图写回它、顶掉预览"，而不是另存。
+     *
+     * <p>参数只在调用方已经按注册表确认过（{@code isRegisteredDerivedPath}）时才置 true，
+     * 用户自己的同名文件永远不会走到这条分支。
+     */
+    public static File resolve(File albumPath, File mirrorPath, boolean sameNameSameLength,
+            String registeredOriginalPath, boolean albumIsRegisteredDerived) {
         if (albumPath == null) {
             return mirrorPath;
         }
@@ -50,6 +66,10 @@ public final class DownloadDestinationPolicy {
             return registered;
         }
         if (sameNameSameLength) {
+            return albumPath;
+        }
+        if (albumIsRegisteredDerived) {
+            // 相册里那份同名文件是本记录登记过的派生副本：写回它（原地替换），不另存镜像
             return albumPath;
         }
         return albumPath.exists() ? mirrorPath : albumPath;

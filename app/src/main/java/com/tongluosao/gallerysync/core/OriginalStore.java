@@ -480,7 +480,9 @@ public final class OriginalStore {
         if (localOriginal.length() != originalLength || !digest.equals(sha256(localOriginal))) {
             throw new IOException("download original changed before registration");
         }
-        requireUsablePayload(localOriginal, "downloaded_original");
+        // 闸门按最终扩展名验签（这里两者同一个文件），拒绝空/全 0/截断/签名不符，
+        // 并抛带原因标签的 IOException：调用方能把它归进"可重试/不可重试"。
+        DownloadedPayloadGate.requirePublishable(localOriginal, localOriginal, originalLength);
         requireNonZeroDigest(digest, originalLength, "downloaded_original");
         persist(new Record(targetKey(config), remotePath, originalLength, digest,
                 canonical(localOriginal), null, null, null, localOriginal.lastModified(),
@@ -495,10 +497,17 @@ public final class OriginalStore {
                 || !originalSha256.equals(sha256(stagedOriginal))) {
             throw new IOException("staged download changed before registration");
         }
-        requireUsablePayload(stagedOriginal, "downloaded_original");
+        // 登记闸门按**最终路径**的扩展名验签：staging 文件叫
+        // ".<name>.jpg.mgs-<uuid>.tmp"，按它自己的扩展名（tmp）判等于什么都没查，
+        // 而按内容判又能抓住"中间层返回全 0 / 被截断"这两类真机故障。字节仍从 staged 读。
+        DownloadedPayloadGate.requirePublishable(stagedOriginal, finalPath, originalLength);
         requireNonZeroDigest(originalSha256, originalLength, "downloaded_original");
+        // mtime 沿用 staged 上的值：调用方在登记前已经把远端时间写进 staged，
+        // 这里再传 0 会让重启后丢掉服务端时间，空间优化判定退化成"按当前时间"。
+        long stagedMtime = stagedOriginal.lastModified();
         persist(new Record(targetKey(config), remotePath, originalLength, originalSha256,
-                canonical(finalPath), null, null, null, 0L, Collections.emptySet()));
+                canonical(finalPath), null, null, null,
+                stagedMtime <= 0L ? 0L : stagedMtime, Collections.emptySet()));
     }
 
     /** Register a downloaded compressed preview before its final path is made visible to scanners. */

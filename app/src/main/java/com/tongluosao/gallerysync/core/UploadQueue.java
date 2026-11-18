@@ -1,7 +1,6 @@
 package com.tongluosao.gallerysync.core;
 
 import android.content.Context;
-import android.os.SystemClock;
 
 import com.tongluosao.gallerysync.hook.CloudItemReader;
 import com.tongluosao.gallerysync.hook.HostSyncState;
@@ -378,6 +377,15 @@ public final class UploadQueue {
      * 调小时多出来的那几路自己退出循环。
      */
     private final Thread[] mWorkers = new Thread[Config.MAX_UPLOAD_CONCURRENCY];
+    /**
+     * 保护 {@link #mWorkers} 的"这一个 index 是否已有活线程"。
+     *
+     * <p>为什么需要：路数 3→1→3 时，被调小挤出去的那一路可能还在 {@code upload()} 里
+     * （不能中途砍请求），而 {@link #applyConcurrency} 又会为同一个 index 补开线程。
+     * 没有这把锁时会出现两个同 index 的 worker：共用 {@code mClients[index]} 的同一条
+     * socket（互相读走对方的响应），先退出的那个还会把新线程的连接关掉。
+     */
+    private final Object mWorkerLock = new Object();
     /** worker 循环在锁外读它，必须 volatile；热重载时由 shutdown() 置假 */
     private volatile boolean mRunning = true;
 
@@ -1104,19 +1112,27 @@ public final class UploadQueue {
                 }
                 if (mDone.containsKey(key)) {
                     skipped++;
-                    // 账本命中：排一次远端确认，确认结果由 ledgerCheckLoop 定 skip/requeue。
-                    // 额度用完、或目标还没配好时退回老行为（按账本跳过）并留一条日志
-                    String remotePath = (mLedgerCheckBudget > 0 && config != null
-                            && config.isReady())
+                    // 账本命中：先排一次远端确认，确认结果由 ledgerCheckLoop 定 skip/requeue。
+                    // 是否排队由 LedgerCheckPolicy 统一判定：本进程已确认过（或正在确认）
+                    // 的 key 不再重复问，避免每批枚举都把同一批 done 重新 PROPFIND 一遍、
+                    // 白烧 256 次额度。
+                    boolean configReady = config != null && config.isReady();
+                    String remotePath = configReady
                             ? remotePathFor(config, task.path, task.video, task.date) : null;
-                    if (remotePath != null && !mLedgerChecking.contains(key)) {
+                    LedgerCheckPolicy.Action action = LedgerCheckPolicy.decide(
+                            mLedgerChecking.contains(key), mLedgerCheckBudget,
+                            configReady, remotePath != null);
+                    if (action == LedgerCheckPolicy.Action.VERIFY) {
                         mLedgerCheckBudget--;
                         mLedgerChecking.add(key);
                         mLedgerChecks.addLast(new LedgerCheck(key, task, config, remotePath));
                         ledgerCheck++;
                     } else {
+                        // 老行为的兜底：按账本跳过，但这只是一次"没验"，不是"验过了"。
+                        // reason 分开记，排查时能一眼看出是额度用完还是目标还没配好。
                         Logger.d("event=enqueue_skip_ledger path=" + item.path
-                                + " size=" + size + " reason=unverified_budget_or_config");
+                                + " size=" + size
+                                + " reason=" + LedgerCheckPolicy.reason(action));
                     }
                     continue;
                 }
@@ -1187,11 +1203,35 @@ public final class UploadQueue {
      * 所以 {@link #applyConcurrency} 只在**调大**时补开，调小时靠旧线程自己退出。
      */
     private void startWorker(int index) {
-        Thread worker = new Thread(() -> drain(index), "MiGallerySync-upload-" + index);
-        // daemon：上传线程绝不能拖住相册进程不让它退出
-        worker.setDaemon(true);
-        mWorkers[index] = worker;
-        worker.start();
+        synchronized (mWorkerLock) {
+            Thread existing = mWorkers[index];
+            if (existing != null && existing.isAlive()) {
+                // 旧的那一路还在传（它退出时会调 replenishWorkers 补位）。这里绝不能再开
+                // 第二个同 index 的线程：两者共用同一条连接，响应会被对方读走。
+                Logger.d("event=upload_worker_deferred index=" + index + " reason=alive");
+                return;
+            }
+            Thread worker = new Thread(() -> drain(index), "MiGallerySync-upload-" + index);
+            // daemon：上传线程绝不能拖住相册进程不让它退出
+            worker.setDaemon(true);
+            mWorkers[index] = worker;
+            worker.start();
+        }
+    }
+
+    /**
+     * 补齐 {@code [0, mConcurrency)} 里空着的路。worker 线程退出时调用 ——
+     * "调小再调大"期间 {@link #applyConcurrency} 可能因为旧线程还活着而跳过这一路，
+     * 等旧线程真正退出时如果不补，路数就永久少一条（任务还在，只是并行度掉了）。
+     */
+    private void replenishWorkers() {
+        if (!mRunning) {
+            return;
+        }
+        int live = mConcurrency;
+        for (int i = 0; i < live; i++) {
+            startWorker(i);
+        }
     }
 
     /** 开复核线程。数量固定（{@link #VERIFY_THREADS}），不随上传路数变 */
@@ -1246,9 +1286,11 @@ public final class UploadQueue {
                     }
                     // **同一个远端路径一次只能有一个 PUT 在飞**（服务器侧硬约束，见
                     // inflightRemotePathLocked 的说明）。挡住的项不算进 waitMillis ——
-                    // 它不是"在等退避"，而是"在等那条同路径的请求结束"，那一刻会被唤醒重挑
+                    // 它不是"在等退避"，而是"在等那条同路径的请求结束"，那一刻会被唤醒重挑。
+                    // claim 本身也挡重复登记：即便 contains 与 claim 之间被别的路径释放打断，
+                    // 结果也只会是"这一轮跳过、下一轮再领"，绝不会两个任务共用一条路径。
                     String claimedPath = remotePathOfLocked(config, candidate);
-                    if (mInflightRemotePaths.contains(claimedPath)) {
+                    if (!mInflightRemotePaths.claim(claimedPath)) {
                         continue;
                     }
                     task = candidate;
@@ -1256,7 +1298,6 @@ public final class UploadQueue {
                     // 登记写在任务自己身上：释放时按它删，不重新推一遍（推的话配置中途一改
                     // 就会删错一个键，那条路径就再也没人能传了）
                     candidate.inflightPath = claimedPath;
-                    mInflightRemotePaths.add(claimedPath);
                     mIdleNotified = false;
                     break;
                 }
@@ -1288,9 +1329,16 @@ public final class UploadQueue {
 
             upload(task, config, index);
         }
-        // 路数被调小、或队列整体停机时走到这里。这一路的连接要还回去，
-        // 否则它会一直对着目标挂着，直到队列销毁
-        releaseClientAt(index);
+        // 路数被调小、或队列整体停机时走到这里。连接要还回去，并把这路在 mWorkers 里
+        // 的位置腾出来；然后补位 —— 调小再调大时 applyConcurrency 可能看到本线程还活着
+        // 而跳过这一路，等它退出时已经没人再补，并行度就永久少一条。
+        synchronized (mWorkerLock) {
+            if (mWorkers[index] == Thread.currentThread()) {
+                mWorkers[index] = null;
+                releaseClientAt(index);
+            }
+        }
+        replenishWorkers();
     }
 
     /**
@@ -1526,9 +1574,10 @@ public final class UploadQueue {
                         // mInflightRemotePaths 了（worker 循环里，早于 upload()），
                         // 而释放只在 upload() 的 finally 里 —— 超时分支既没提前领、也没提前放，
                         // 所以照传仍然落在"同路径同时只有一条 PUT"的保护内
-                        Logger.w("event=upload_probe_deadline_proceed key=" + taskKey
-                                + " remote=" + remotePath + " waited_ms=" + probeWaitedMs
-                                + " probe=" + ProbeDecision.describe(probeOutcome));
+                        Logger.w("event=upload_probe_deadline key=" + taskKey
+                                + " remote=" + remotePath + " ms=" + probeWaitedMs
+                                + " probe=" + ProbeDecision.describe(probeOutcome)
+                                + " reason=deadline_proceed");
                     }
                 }
                 phaseAt = phaseDone("probe_done", index, task, phaseAt,
@@ -1656,7 +1705,7 @@ public final class UploadQueue {
                     phaseAt = phase("verify_start", index, task, "remote=" + remotePath
                             + " mode=sync");
                     client.requireStoredAs(remotePath, uploadedLength);
-                    requireMatchingRemoteBytes(client, remotePath, file, uploadedLength,
+                    requireMatchingRemoteBytes(client, taskKey, remotePath, file, uploadedLength,
                             uploadedSha256);
                     phaseAt = phaseDone("verify_done", index, task, phaseAt,
                             "remote=" + remotePath + " mode=sync ok=true");
@@ -1719,7 +1768,12 @@ public final class UploadQueue {
                 // 同路径串行的占用一并释放，并喊醒在等它的同伴（那些项没被领走、
                 // 也没进 waitMillis，不喊的话要等到下一次唤醒窗口才动）
                 if (task.inflightPath != null) {
-                    mInflightRemotePaths.remove(task.inflightPath);
+                    if (!mInflightRemotePaths.release(task.inflightPath)) {
+                        // 走到这里说明登记被谁提前清掉了（停机 clear，或上游 bug）。
+                        // 只记一条：绝不能因此跳过释放流程的其他部分。
+                        Logger.d("event=upload_inflight_release_missing key=" + taskKey
+                                + " remote=" + task.inflightPath + " reason=not_registered");
+                    }
                     task.inflightPath = null;
                 }
                 mLock.notifyAll();
@@ -1854,11 +1908,17 @@ public final class UploadQueue {
                 long phaseAt = phase("verify_start", index, job.task,
                         "remote=" + job.remotePath + " mode=async");
                 client.requireStoredAs(job.remotePath, job.size);
-                if (SystemClock.elapsedRealtime() - phaseAt > VERIFY_DEADLINE_MS) {
+                // 计时必须与 phaseAt 同源：phaseAt 是 nowMs()，也就是 System.nanoTime()（单调钟，
+                // 不含深睡）。这里原来用 SystemClock.elapsedRealtime()（含深睡）去减，两者差值
+                // 就是累计深睡时长 —— 设备只要深睡过 30 秒，这个判断就永远为真，异步复核会
+                // 绕开字节回读、直接记 bytesVerified=false 成功。见 upload_verify_deadline 日志。
+                long verifyElapsed = nowMs() - phaseAt;
+                if (verifyElapsed > VERIFY_DEADLINE_MS) {
                     // 服务器慢（冷对象 PROPFIND 可达数十秒）时不能无限占住复核线程：长度已确认就把
                     // 该项记成功、但不写旁车（摘要必须由字节回读证明，超时不算证明）。
-                    Logger.w("event=verify_deadline_proceed remote=" + job.remotePath
-                            + " elapsed=" + (SystemClock.elapsedRealtime() - phaseAt));
+                    Logger.w("event=upload_verify_deadline key=" + job.key
+                            + " remote=" + job.remotePath
+                            + " ms=" + verifyElapsed + " reason=deadline");
                     ok = finalizeOk(job.task, job.config, job.remotePath, "verify-timeout-" + index,
                             job.uploadedSha256, job.size, job.uploadedMtime, false, false);
                     Logger.i("event=verify_async_done ok=" + ok + " path=" + job.task.path
@@ -1867,8 +1927,8 @@ public final class UploadQueue {
                 }
                 // 长度只是"候选"：字节回读核对过才算合格，不合格按普通失败重传 ——
                 // 它同时也是写远端旁车的前提（旁车摘要来自本地，不能自己证明自己）
-                requireMatchingRemoteBytes(client, job.remotePath, new File(job.task.path),
-                        job.size, job.uploadedSha256);
+                requireMatchingRemoteBytes(client, job.key, job.remotePath,
+                        new File(job.task.path), job.size, job.uploadedSha256);
                 phaseAt = phaseDone("verify_done", index, job.task, phaseAt,
                         "remote=" + job.remotePath + " mode=async ok=true");
                 ok = finalizeOk(job.task, job.config, job.remotePath, "verify-" + index,
@@ -1939,17 +1999,19 @@ public final class UploadQueue {
                     continue;
                 }
             }
+            long startedAt = nowMs();
             try {
                 checkLedgerEntry(check);
             } catch (Throwable t) {
+                long ms = nowMs() - startedAt;
                 // 自检自己绝不能把线程弄死：它死了以后账本脏了就再没人发现
-                Logger.w("event=enqueue_verify_failed remote=" + check.remotePath
-                        + " key=" + check.key + " reason=" + t);
+                Logger.w("event=upload_ledger_verify_failed key=" + check.key
+                        + " remote=" + check.remotePath + " ms=" + ms + " reason=" + t);
                 synchronized (mLock) {
                     mLedgerChecking.remove(check.key);
                 }
                 requeueLedgerEntry(check,
-                        EnqueueLedgerDecision.RemoteState.UNKNOWN, 0L);
+                        EnqueueLedgerDecision.RemoteState.UNKNOWN, 0L, ms);
             }
         }
         releaseLedgerClient();
@@ -1966,29 +2028,35 @@ public final class UploadQueue {
     private void checkLedgerEntry(LedgerCheck check) {
         long remoteSize;
         EnqueueLedgerDecision.RemoteState state;
+        long startedAt = nowMs();
         try {
             WebDavClient client = ledgerClientFor(check.config);
             remoteSize = client.propfindSize(check.remotePath);
             state = EnqueueLedgerDecision.fromPropfind(remoteSize, check.task.size);
         } catch (Throwable t) {
+            long ms = nowMs() - startedAt;
             // 401/403（鉴权失败）与网络异常都走这里：问不出来不等于"远端没有"，
             // 但对账本自检来说，唯一安全的兜底是重传
-            Logger.w("event=enqueue_verify_failed remote=" + check.remotePath
-                    + " key=" + check.key + " reason=" + t);
-            requeueLedgerEntry(check, EnqueueLedgerDecision.RemoteState.UNKNOWN, 0L);
+            Logger.w("event=upload_ledger_verify_failed key=" + check.key
+                    + " remote=" + check.remotePath + " ms=" + ms + " reason=" + t);
+            requeueLedgerEntry(check, EnqueueLedgerDecision.RemoteState.UNKNOWN, 0L, ms);
             return;
         }
+        long ms = nowMs() - startedAt;
         if (EnqueueLedgerDecision.decide(state) == EnqueueLedgerDecision.Action.SKIP) {
-            synchronized (mLock) {
-                mLedgerChecking.remove(check.key);
-            }
-            // 账本这次是真的：key 留在 done 里，下一轮同样跳过（不再重复确认，省额度）
-            Logger.i("event=enqueue_skip_verified remote=" + check.remotePath
-                    + " key=" + check.key + " remote_size=" + remoteSize
-                    + " state=" + EnqueueLedgerDecision.describe(state));
+            // 确认通过：key 留在 done 里，也**留在 mLedgerChecking** 里。
+            // 留着不是"还在排队"，而是"本进程已经问过远端、结论是真有"—— 同一进程里
+            // 每批枚举都会把 done 命中的项交上来，不留这一条就会对同一批 key 反复
+            // PROPFIND，256 次额度很快烧光，后面的 key 只能退回"不验直接跳过"。
+            // 进程重启后集合清空，会重新确认一次（远端真被删掉时仍能发现）。
+            Logger.i("event=upload_ledger_skip_verified key=" + check.key
+                    + " remote=" + check.remotePath + " ms=" + ms
+                    + " remote_size=" + remoteSize
+                    + " state=" + EnqueueLedgerDecision.describe(state)
+                    + " reason=present_same_size");
             return;
         }
-        requeueLedgerEntry(check, state, remoteSize);
+        requeueLedgerEntry(check, state, remoteSize, ms);
     }
 
     /**
@@ -2002,7 +2070,7 @@ public final class UploadQueue {
      * {@link #mInflightRemotePaths} 保证同一路径同时只有一条 PUT 在飞。
      */
     private void requeueLedgerEntry(LedgerCheck check, EnqueueLedgerDecision.RemoteState state,
-                                    long remoteSize) {
+                                    long remoteSize, long ms) {
         Task task = check.task;
         File local = new File(task.path);
         if (local.isFile() && local.length() > 0
@@ -2031,10 +2099,12 @@ public final class UploadQueue {
                 queued = true;
             }
         }
-        Logger.w("event=enqueue_requeue_missing remote=" + check.remotePath
-                + " path=" + task.path + " key=" + key + " size=" + task.size
+        Logger.w("event=upload_ledger_requeue key=" + key + " old_key=" + check.key
+                + " remote=" + check.remotePath + " ms=" + ms
+                + " path=" + task.path + " size=" + task.size
                 + " remote_size=" + remoteSize
                 + " state=" + EnqueueLedgerDecision.describe(state)
+                + " reason=" + LedgerCheckPolicy.reason(state)
                 + " queued=" + queued);
     }
 
@@ -2115,17 +2185,22 @@ public final class UploadQueue {
      * 改坏的载荷（长度不变），或者截断后补零。而空间优化之后本地原图就删了，远端那份是
      * 唯一副本 —— 所以长度只是"候选合格"，内容才决定能不能证明。
      *
-     * <p>成本按 {@link RemoteByteCheck} 的策略：照片整份回读（{@code ≤64 MiB}），
-     * 视频抽头/1/4/1/2/3/4/尾共 5 段。
+     * <p>成本按 {@link RemoteByteCheck} 的策略：{@code ≤256 KiB} 整份回读算 SHA-256，
+     * 更大的文件只读头尾各 {@code 100 KiB} 抽样（截断/补零/只写了开头这些最现实的损坏
+     * 都能抓住，代价固定 200 KiB）。<b>不是</b>整份回读，也不是 5 段抽样。
      */
-    private void requireMatchingRemoteBytes(WebDavClient client, String remotePath, File file,
-            long size, String expectedSha256) throws IOException {
+    private void requireMatchingRemoteBytes(WebDavClient client, String taskKey, String remotePath,
+            File file, long size, String expectedSha256) throws IOException {
+        long startedAt = nowMs();
         if (!RemoteByteCheck.verify(client, remotePath, file, size, expectedSha256)) {
-            Logger.w("event=upload_bytes_mismatch remote=" + remotePath + " size=" + size);
+            Logger.w("event=upload_bytes_mismatch key=" + taskKey + " remote=" + remotePath
+                    + " size=" + size + " ms=" + (nowMs() - startedAt)
+                    + " reason=bytes_mismatch");
             throw new IOException("remote bytes differ from the uploaded file"
                     + " remote=" + remotePath);
         }
-        Logger.d("event=upload_bytes_verified remote=" + remotePath + " size=" + size);
+        Logger.d("event=upload_bytes_verified key=" + taskKey + " remote=" + remotePath
+                + " size=" + size + " ms=" + (nowMs() - startedAt) + " reason=sampled_match");
     }
 
     /**
@@ -2780,8 +2855,11 @@ public final class UploadQueue {
         }
         Iterator<String> it = mDone.keySet().iterator();
         while (it.hasNext() && mDone.size() > MAX_DONE_RECORDS) {
-            it.next();
+            String dropped = it.next();
             it.remove();
+            // 账本行被挤掉后，"本进程已确认"也跟着失效：它认的是 done 里的那条记录。
+            // 不摘掉的话这个集合会随着长跑进程一直涨（每次裁剪都留下已确认的 key）。
+            mLedgerChecking.remove(dropped);
         }
     }
 
@@ -3144,7 +3222,7 @@ public final class UploadQueue {
      * <p>都在 {@code mLock} 内操作：领取时登记、任何返回路径在 finally 里释放。
      * 漏放会导致那条路径永远没人传（档在"已占用"上）。
      */
-    private final Set<String> mInflightRemotePaths = new HashSet<>();
+    private final InflightRegistry mInflightRemotePaths = new InflightRegistry();
 
     private static final class Task {
         final String path;

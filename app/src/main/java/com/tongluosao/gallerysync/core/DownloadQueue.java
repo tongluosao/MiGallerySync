@@ -28,6 +28,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -120,6 +121,15 @@ public final class DownloadQueue {
     /** 失败次数，用来把反复失败的项排除掉 */
     private final LinkedHashMap<String, Integer> mFailures = new LinkedHashMap<>();
     private final LinkedHashMap<String, Long> mFailureTimes = new LinkedHashMap<>();
+    /**
+     * 每个远端路径最近一次失败的**种类**，与 {@link #mFailures} 同步维护。
+     *
+     * <p>决定冷却长短：可重试从 60s 起步，终态从 30min 起步，两者都只随次数增长、
+     * <b>不再清零</b>（见 {@link DownloadFailurePolicy}）。旧实现冷却一过就把次数删掉，
+     * 于是"每次返回坏字节"这类永不痊愈的失败会每分钟重下一整份。
+     */
+    private final LinkedHashMap<String, DownloadFailurePolicy.Kind> mFailureKinds =
+            new LinkedHashMap<>();
     /** 正在下载的远端路径，受 mLock 保护 */
     private final Set<String> mInflight = new HashSet<>();
 
@@ -167,6 +177,29 @@ public final class DownloadQueue {
      * 用它替掉自动下载里逐条的 {@code propfindSize}，见 {@link DownloadProbeCache}。
      */
     private final DownloadProbeCache mProbeCache = new DownloadProbeCache();
+
+    /** 停滞看门狗的巡检间隔：每 5s 看一次"最后收到字节到现在多久了" */
+    private static final long WATCHDOG_INTERVAL_MS = 5_000L;
+    /**
+     * 正在传输的远端路径 → 最后一次收到字节的时刻（{@code elapsedRealtime}）。
+     *
+     * <p>为什么要单独记账：连接卡死时读循环一个字节都不会来，进度回调永远不会触发，
+     * worker 只能等 socket 自己超时（{@code READ_TIMEOUT_MAX} 是分钟级）。有了这张表，
+     * 看门狗可以在 {@link DownloadProgressPolicy#STALL_MS} 之后主动关掉那条连接。
+     */
+    private final Map<String, Long> mLastByteAt = new HashMap<>();
+    /** 正在传输的远端路径 → 承载它的连接，停滞时由看门狗关闭 */
+    private final Map<String, WebDavClient> mActiveClients = new HashMap<>();
+    /**
+     * 被看门狗判定停滞、主动关掉连接的远端路径。
+     *
+     * <p>连接一关，读循环抛出来的只是 {@code SocketException: Socket closed}，从异常本身分不出
+     * "服务器卡住"和"网线掉了"。这条标记让失败分类能落到 {@code stalled}，从而按
+     * {@link DownloadFailurePolicy#attemptCost} 记满额、下一次尝试直接进冷却，而不是立刻重连、
+     * 再白等 60 秒。
+     */
+    private final java.util.Set<String> mStalledPaths = new java.util.LinkedHashSet<>();
+    private Thread mWatchdog;
 
     /** 进度发布器（与上传共用一个），由 Hook 侧接线 */
     private volatile UploadProgressPublisher mPublisher;
@@ -300,6 +333,9 @@ public final class DownloadQueue {
         mPlanner = new Thread(this::plannerLoop, "MiGallerySync-download-plan");
         mPlanner.setDaemon(true);
         mPlanner.start();
+        mWatchdog = new Thread(this::watchdogLoop, "MiGallerySync-download-watchdog");
+        mWatchdog.setDaemon(true);
+        mWatchdog.start();
         for (int i = 0; i < THREADS; i++) {
             Thread thread = new Thread(this::workerLoop, "MiGallerySync-download-" + i);
             thread.setDaemon(true);
@@ -544,15 +580,12 @@ public final class DownloadQueue {
             }
         }
         Integer failures = mFailures.get(remotePath);
-        if (failures == null || failures < MAX_FAIL_PER_PATH) return false;
+        if (failures == null || failures <= 0) return false;
+        DownloadFailurePolicy.Kind kind = mFailureKinds.get(remotePath);
         Long failedAt = mFailureTimes.get(remotePath);
-        if (failedAt != null && SystemClock.elapsedRealtime() - failedAt < FAILURE_COOLDOWN_MS) {
-            return true;
-        }
-        // A later native event can retry; no independent scan timer is introduced.
-        mFailures.remove(remotePath);
-        mFailureTimes.remove(remotePath);
-        return false;
+        return DownloadFailurePolicy.blocked(kind, failures,
+                failedAt == null ? 0L : failedAt, SystemClock.elapsedRealtime(),
+                MAX_FAIL_PER_PATH);
     }
 
     private void removePendingLocked(String remotePath) {
@@ -757,12 +790,12 @@ public final class DownloadQueue {
                     // 目录名单只活在"这一轮"里：跨轮复用等于拿几分钟前（甚至几小时前）
                     // 的目录快照判断远端有没有，删掉的照片会被反复判成还在
                     mProbeCache.clearListings();
-                    planAutoDownloads(config, generation, auto);
+                    planAutoDownloads(config, generation, auto, "registry");
                     if (!auto.isEmpty()) {
                         enqueue(auto, generation);
                     }
                 } catch (Throwable t) {
-                    Logger.w("event=auto_download_plan_failed detail=" + t);
+                    Logger.w("event=auto_download_plan_failed phase=registry detail=" + t);
                 }
                 for (int round = 0; round < MAX_BATCH_ROUNDS && mRunning; round++) {
                     if (!isWorkCurrent(config, generation)) {
@@ -790,6 +823,21 @@ public final class DownloadQueue {
                     if (round == MAX_BATCH_ROUNDS - 1) {
                         Logger.i("event=download_batch_limit rounds=" + MAX_BATCH_ROUNDS);
                     }
+                }
+                // 第二遍注册表计划：这时目录名单已经被上面的枚举填满，注册表行的
+                // "远端在不在"可以直接命中探测缓存。第一遍跑在枚举之前（那时一个名单都
+                // 没有，hit 恒为 0，真机日志里就是 probe_cache hit=0 miss=30），
+                // 所以两遍都要跑：第一遍抢延迟，第二遍拿命中率。
+                try {
+                    if (isWorkCurrent(config, generation)) {
+                        List<Pending> afterWalk = new ArrayList<>();
+                        planAutoDownloads(config, generation, afterWalk, "after_walk");
+                        if (!afterWalk.isEmpty()) {
+                            enqueue(afterWalk, generation);
+                        }
+                    }
+                } catch (Throwable t) {
+                    Logger.w("event=auto_download_plan_failed phase=after_walk detail=" + t);
                 }
                 // 这一轮自动下载的探测缓存收尾：hit = 因为"本轮已经知道答案"而省掉的握手次数，
                 // miss = 仍然得自己去探的次数，listings = 本轮枚举过并留下的目录名单条数。
@@ -935,8 +983,13 @@ public final class DownloadQueue {
             }
             boolean restoreMissingOriginal = !highQuality
                     && isRegisteredPreviewNeedingOriginalRestore(remotePath, config, normalLocal);
+            // 高清/原图请求遇到"本地只有我们自己写的预览"时，仍然要排 —— 否则
+            // publishPreviewInPlace 与 publishDownloadedOriginal 里那两条"顶掉旧预览"的
+            // 分支永远走不到（计划期就被 localExists 挡掉了）。
+            boolean localIsRegisteredDerivedCopy = highQuality && normalLocal.isFile()
+                    && isRegisteredDerivedCopyFor(remotePath, config, normalLocal);
             if (!shouldPlanDownload(scheduled, done, restoreMissingOriginal, normalLocal.exists(),
-                    hostRows.knows(normalLocal))) {
+                    hostRows.knows(normalLocal), localIsRegisteredDerivedCopy)) {
                 continue;
             }
             out.add(new Pending(remotePath, relative, entry.size, target,
@@ -956,8 +1009,9 @@ public final class DownloadQueue {
      * 记账与写日志。判据按条数汇总，不逐行刷屏：1.2 万条里绝大多数是"已经不是 REMOTE_ONLY"。
      *
      * @param out 与本轮远端枚举共用的待下载列表，总数同样不得越过 {@link #MAX_DOWNLOADS_PER_ROUND}
+     * @param phase 这一遍跑在枚举之前（{@code registry}）还是之后（{@code after_walk}），只进日志
      */
-    private void planAutoDownloads(Config config, int generation, List<Pending> out) {
+    private void planAutoDownloads(Config config, int generation, List<Pending> out, String phase) {
         if (!config.isAutoDownload()) {
             Logger.i("event=auto_download_skip reason=disabled");
             return;
@@ -988,18 +1042,31 @@ public final class DownloadQueue {
         Map<AutoDownloadPolicy.Decision, Integer> skipped = new LinkedHashMap<>();
         int planned = 0;
         int unmapped = 0;
+        int suppressed = 0;
         for (OriginalStore.Record record : records) {
             if (!isPolicyCurrent(generation) || planned >= MAX_DOWNLOADS_PER_ROUND) {
                 // 本轮额度用完就停：剩下的下个相册事件再说，不能一次把 1.2 万条都过一遍
                 break;
             }
-            File destination = AutoDownloadPolicy.targetPath(layout, config.getRemoteRoot(),
+            if (!mayDownload(mRemoteSuppress, config, record.remotePath)) {
+                // 用户主动删掉的副本：远端还在，但它已经不是"缺失的照片"。计划期就拦住 ——
+                // 否则每轮都会排进队列、worker 里再跳过一次，白占 200 条配额还刷日志。
+                suppressed++;
+                continue;
+            }
+            File albumDestination = AutoDownloadPolicy.targetPath(layout, config.getRemoteRoot(),
                     record.remotePath, primaryRoot);
+            File destination = albumDestination == null ? null
+                    : registryAwareDestination(config, layout, record, albumDestination);
             if (destination == null) {
                 unmapped++;
                 continue;
             }
-            boolean exists = destination.isFile();
+            // 相册路径上那份同名文件如果是本记录登记过的副本（原地瘦身的预览），
+            // 就不能算"本地已经有原图"：正确动作是把原图写回去顶掉它。
+            boolean derived = albumDestination != null && albumDestination.isFile()
+                    && mOriginalStore.isRegisteredDerivedPath(record, albumDestination);
+            boolean exists = destination.isFile() && !derived;
             long existingLength = exists ? destination.length() : -1L;
             boolean scheduled;
             boolean done;
@@ -1038,15 +1105,22 @@ public final class DownloadQueue {
             }
         }
         if (unmapped > 0) {
-            Logger.w("event=auto_download_skip reason=unmapped_remote count=" + unmapped);
+            Logger.w("event=auto_download_skip reason=unmapped_remote count=" + unmapped
+                    + " phase=" + phase);
+        }
+        if (suppressed > 0) {
+            // 用户删掉的副本：远端还在，但账本已经写过"别再下回来"。这里只报条数。
+            Logger.i("event=auto_download_skip reason=suppressed count=" + suppressed
+                    + " phase=" + phase);
         }
         if (planned > 0) {
             Logger.i("event=auto_download_planned count=" + planned
-                    + " queued=" + out.size() + " catalog=" + records.size());
+                    + " phase=" + phase + " queued=" + out.size()
+                    + " catalog=" + records.size());
             // 这批任务会被几路自动下载并行执行、以及本轮总共排了多少：
             // 单看"下了几张"分不清是路数没生效还是服务端慢，这两个数字能分开
             Logger.i("event=auto_download_batch planned=" + planned
-                    + " parallel=" + mAutoConcurrency
+                    + " parallel=" + mAutoConcurrency + " phase=" + phase
                     + " queued=" + out.size() + " catalog=" + records.size());
         }
         for (Map.Entry<AutoDownloadPolicy.Decision, Integer> entry : skipped.entrySet()) {
@@ -1163,16 +1237,31 @@ public final class DownloadQueue {
      */
     static boolean shouldPlanDownload(boolean scheduled, boolean done,
             boolean restoreMissingOriginal, boolean localExists, boolean hostKnowsLocalPath) {
+        return shouldPlanDownload(scheduled, done, restoreMissingOriginal, localExists,
+                hostKnowsLocalPath, false);
+    }
+
+    /**
+     * 同上，并额外承认"本地这份字节是本记录自己登记过的副本"。
+     *
+     * <p>为什么需要这一条：原地瘦身把原图换成同名预览之后，{@code localExists=true} 会把
+     * 整条链路挡在计划之外 —— 用户点"下载原图"也永远不会触发替换。可那份文件是我们自己
+     * 写的预览，正确动作恰恰是"下回整份原图、顶掉预览"。判据由调用方按注册表给出
+     * （{@code isRegisteredDerivedPath}，纯路径比较，不做哈希），用户文件永远不满足。
+     */
+    static boolean shouldPlanDownload(boolean scheduled, boolean done,
+            boolean restoreMissingOriginal, boolean localExists, boolean hostKnowsLocalPath,
+            boolean localIsRegisteredDerivedCopy) {
         if (scheduled) {
             return false;
         }
-        if (done && !restoreMissingOriginal) {
+        if (done && !restoreMissingOriginal && !localIsRegisteredDerivedCopy) {
             return false;
         }
-        if (localExists && !restoreMissingOriginal) {
+        if (localExists && !restoreMissingOriginal && !localIsRegisteredDerivedCopy) {
             return false;
         }
-        return restoreMissingOriginal || hostKnowsLocalPath;
+        return restoreMissingOriginal || localIsRegisteredDerivedCopy || hostKnowsLocalPath;
     }
 
     /**
@@ -1517,6 +1606,8 @@ public final class DownloadQueue {
         File compressed = null;
         String publishedDigest = null;
         long registeredOriginalMtime = 0L;
+        /** 进度日志的节流状态：[0]=上次记录的字节数，[1]=上次记录的时刻 */
+        final long[] lastReport = new long[] {0L, SystemClock.elapsedRealtime()};
         try {
             ensureWorkCurrent(config, generation);
             if (pending.autoDownload && !NetGuard.canUpload(mContext, true)) {
@@ -1554,13 +1645,25 @@ public final class DownloadQueue {
             // 预览、状态也不会变成 ORIGINAL，下一轮又排一遍。
             boolean qualityRequested = !pending.autoDownload && isHighQualityRequested()
                     && isCompressibleExtension(normalDest.getName()) && pending.size > 0L;
-            if (normalDest.exists()) {
-                // 本地已经有同名文件：一律不覆盖。用户可能自己改过它，也可能同名但是别的东西
+            // 本地已经有同名文件：默认一律不覆盖 —— 用户可能自己改过它，也可能同名但是
+            // 别的东西。唯一例外是"这份字节正是本条记录登记过的副本"（原地瘦身写下的
+            // 预览）：那时整份原图正是要把它顶掉，而下面 publishPreviewInPlace /
+            // publishDownloadedOriginal 里的替换分支本来就是为这种情况写的（此前被这里
+            // 一刀切挡掉，等于死代码）。守卫仍是 isRegisteredDerivedCopy：用户文件进不来。
+            boolean replacingRegisteredDerived = normalDest.isFile()
+                    && isRegisteredDerivedCopyFor(pending.remotePath, config, normalDest);
+            if (normalDest.exists() && !replacingRegisteredDerived) {
                 Logger.i("event=download_skip_local_exists remote=" + pending.remotePath
+                        + " row=" + rowLabel(pending) + " bytes=" + normalDest.length()
                         + " local=" + normalDest);
                 markDone(pending.remotePath, pending.target);
                 ok = true;
                 return;
+            }
+            if (replacingRegisteredDerived) {
+                Logger.i("event=download_replace_registered_preview row=" + rowLabel(pending)
+                        + " bytes=" + normalDest.length() + " path=" + normalDest
+                        + " remote=" + pending.remotePath);
             }
             if (!mayDownload(mRemoteSuppress, config, pending.remotePath)) {
                 // 计划之后账本又多了这条（删除线程与下载线程并行）：到 GET 之前再拦一次
@@ -1575,9 +1678,14 @@ public final class DownloadQueue {
                 DownloadProbeCache.Presence presence =
                         mProbeCache.probe(pending.remotePath, pending.size);
                 if (presence == DownloadProbeCache.Presence.MISSING) {
-                    Logger.i("event=auto_download_skip reason=probe_missing remote="
-                            + pending.remotePath);
-                    throw new IOException("remote object is absent (listed/probed this round)");
+                    // 远端这一轮确实没有这个名字（目录名单/探测给出的结论）。这不是失败：
+                    // 不记失败次数、不标 done —— 远端对象要是又出现了，下一轮照样会排。
+                    // 旧实现把它抛成 IOException 走失败记账，白白烧掉重试额度。
+                    Logger.i("event=download_absent row=" + rowLabel(pending)
+                            + " path=" + pending.remotePath + " bytes=" + pending.size
+                            + " reason=probe_missing");
+                    ok = true;
+                    return;
                 }
                 if (presence == DownloadProbeCache.Presence.PRESENT) {
                     long listed = mProbeCache.listedSize(pending.remotePath);
@@ -1586,14 +1694,21 @@ public final class DownloadQueue {
                         Logger.w("event=auto_download_skip reason=probe_size_mismatch remote="
                                 + pending.remotePath + " listed=" + listed
                                 + " expected=" + pending.size);
-                        throw new IOException("remote size changed listed=" + listed
-                                + " expected=" + pending.size);
+                        throw new DownloadFailurePolicy.PayloadException(
+                                DownloadFailurePolicy.Cause.LENGTH_MISMATCH,
+                                "remote size changed listed=" + listed
+                                        + " expected=" + pending.size);
                     }
                 }
             }
             WebDavClient client = clientFor(config, index);
+            markTransferStarted(pending.remotePath, client);
             client.setProgressListener((done, total) -> {
-                // 每 64KB 一次，这里只把数字塞给进度发布器（它自己按 2Hz 节流后发帧）
+                // 每 64KB 一次。发布器自己按 2Hz 发帧，这里只负责两件事：
+                // 1) 把数字塞给进度页；2) 按 256KB / 500ms 记一行可对账的字节进度，
+                //    并刷新停滞看门狗的心跳。日志节流做成纯函数，边界可单测。
+                long now = SystemClock.elapsedRealtime();
+                markTransferByte(pending.remotePath, now);
                 if (!isWorkCurrent(config, generation)) {
                     client.close();
                     return;
@@ -1601,11 +1716,22 @@ public final class DownloadQueue {
                 UploadProgressPublisher target = mPublisher;
                 if (target != null) {
                     if (pending.autoDownload) {
-                        // 自动下载走带日志节流的入口；帧仍然由发布器的心跳统一发
                         target.taskProgress(key, rowLabel(pending), done, size);
                     } else {
                         target.taskBytes(key, done);
                     }
+                }
+                if (DownloadProgressPolicy.due(lastReport[0], lastReport[1], done, size, now)) {
+                    long elapsed = lastReport[1] <= 0L ? 0L : now - lastReport[1];
+                    long rate = DownloadProgressPolicy.bytesPerSecond(done, lastReport[0], elapsed);
+                    Logger.i("event=download_progress row=" + rowLabel(pending)
+                            + " bytes=" + done + "/" + size
+                            + " percent=" + DownloadProgressPolicy.percent(done, size)
+                            + " rate=" + rate
+                            + " elapsed=" + elapsed
+                            + " path=" + pending.remotePath);
+                    lastReport[0] = done;
+                    lastReport[1] = now;
                 }
             });
             if (qualityRequested) {
@@ -1624,6 +1750,7 @@ public final class DownloadQueue {
                 registeredOriginalMtime = restoreRegisteredOriginalMtime(pending, config,
                         normalDest, raw);
                 String digest = sha256(raw);
+                verifyDownloadedContent(config, pending, raw, digest);
                 File previewDest = previewPathFor(normalDest, config.isPreserveHeicFormat());
                 OriginalStore.Record previewRecord = mOriginalStore.findByRemotePath(config,
                         pending.remotePath, normalDest);
@@ -1656,6 +1783,7 @@ public final class DownloadQueue {
                             && mOriginalStore.isRegisteredDerivedCopy(previewRecord, previewDest);
                     boolean previewCollision = !samePath(previewDest, normalDest)
                             && previewPathOccupiedByAnotherFile(previewRecord, previewDest);
+                    sweepStaleStaging(previewDest);
                     File parent = previewDest.getAbsoluteFile().getParentFile();
                     if (parent == null
                             || (!parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory())) {
@@ -1722,6 +1850,9 @@ public final class DownloadQueue {
                 registeredOriginalMtime = restoreRegisteredOriginalMtime(pending, config,
                         normalDest, raw);
                 String digest = sha256(raw);
+                // 长度对、摘要不对 = 中间层改了内容（真机那批"下完 355235 字节但登记被拒"
+                // 里最可疑的就是全 0 内容）。注册表里已知的 sha256 是唯一的可信对照。
+                verifyDownloadedContent(config, pending, raw, digest);
                 publishedDigest = digest;
                 // 原路径上可能还留着第 3 波瘦身写下的原地预览：整份原图正是要把它顶掉。
                 // 只认“这条记录自己登记过的副本”，用户文件与计划之后出现的文件仍按失败处理。
@@ -1737,6 +1868,8 @@ public final class DownloadQueue {
                     replacingInplacePreview = true;
                     existingRowId = existing == null ? "" : existing.rowId;
                 }
+                // 先清掉上一次进程被杀时留下的同目录临时件（点开头、扫描器看不见）
+                sweepStaleStaging(normalDest);
                 staged = stageBesideDestination(raw, normalDest);
                 setModificationTime(staged, registeredOriginalMtime);
                 ensureWorkCurrent(config, generation);
@@ -1782,7 +1915,7 @@ public final class DownloadQueue {
             cleanupUnpublished(raw, staged, compressed);
             if (isWorkCurrent(config, generation)) {
                 failureReason = String.valueOf(e.getMessage());
-                fail(pending, failureReason);
+                fail(pending, causeOfTransferFailure(pending, e), failureReason);
             } else {
                 Logger.d("event=download_cancelled remote=" + pending.remotePath);
             }
@@ -1791,7 +1924,7 @@ public final class DownloadQueue {
             noteProbeFailure(pending, e);
             if (isWorkCurrent(config, generation)) {
                 failureReason = String.valueOf(e.getMessage());
-                fail(pending, failureReason);
+                fail(pending, causeOfTransferFailure(pending, e), failureReason);
             } else {
                 Logger.d("event=download_cancelled remote=" + pending.remotePath);
             }
@@ -1799,12 +1932,17 @@ public final class DownloadQueue {
             cleanupUnpublished(raw, staged, compressed);
             if (isWorkCurrent(config, generation)) {
                 failureReason = String.valueOf(t);
-                fail(pending, failureReason);
-                Logger.w("event=download_error remote=" + pending.remotePath, t);
+                // 未预期异常（历史上就是这里吞掉了登记闸门抛的 IllegalStateException）：
+                // 归 UNKNOWN/可重试，但把原始堆栈留下，归类不靠猜。
+                fail(pending, DownloadFailurePolicy.Cause.UNKNOWN, failureReason);
+                Logger.w("event=download_error remote=" + pending.remotePath
+                        + " reason=" + t, t);
             } else {
                 Logger.d("event=download_cancelled remote=" + pending.remotePath);
             }
         } finally {
+            // 这条传输结束了：从停滞看门狗的表里摘掉，别让已经收尾的项被误判成停滞
+            markTransferEnded(pending.remotePath);
             if (publisher != null) {
                 if (pending.autoDownload) {
                     // 终态收敛：项从在传集合里摘掉（进度页不再显示"进行中"），并记一行终态日志
@@ -1819,6 +1957,7 @@ public final class DownloadQueue {
                     removePendingLocked(pending.remotePath);
                     mFailures.remove(pending.remotePath);
                     mFailureTimes.remove(pending.remotePath);
+                    mFailureKinds.remove(pending.remotePath);
                     mPendingVersion++;
                 }
                 mLock.notifyAll();
@@ -1933,14 +2072,18 @@ public final class DownloadQueue {
     private static void publishStagedFile(File staged, File dest, boolean replaceRegisteredPreview)
             throws IOException {
         // 载荷闸门：任何东西在改名进入相册之前，都必须真的是有效介质。压缩预览与原图两条
-        // 发布路径都从这里出去，所以闸门放在这一层；不合规就抛 IOException，
+        // 发布路径都从这里出去，所以闸门放在这一层。判据按**目标**的扩展名（staged 的名字
+        // 是 .tmp，按它判等于没判），不合规就抛带原因标签的 IOException，
         // 由 download() 的 catch 分支清理临时文件并按一次失败记账（不发布半成品）。
-        if (!MediaPayload.isUsableMedia(staged)) {
-            Logger.w("event=download_rejected reason=invalid_payload path="
-                    + (staged == null ? "null" : staged.getAbsolutePath())
+        DownloadedPayloadGate.Verdict verdict = DownloadedPayloadGate.inspect(staged, dest, 0L);
+        if (!verdict.ok()) {
+            Logger.w("event=download_gate_rejected reason=" + verdict.wire()
+                    + " path=" + (staged == null ? "null" : staged.getAbsolutePath())
                     + " dest=" + (dest == null ? "null" : dest.getAbsolutePath())
-                    + " size=" + (staged == null ? -1L : staged.length()));
-            throw new IOException("download produced an invalid payload");
+                    + " bytes=" + (staged == null ? -1L : staged.length()));
+            throw new DownloadFailurePolicy.PayloadException(
+                    DownloadedPayloadGate.causeOf(verdict),
+                    "download produced an invalid payload reason=" + verdict.wire());
         }
         if (!replaceRegisteredPreview && dest.exists()) {
             throw new IOException("download destination appeared before publish: " + dest);
@@ -2116,6 +2259,7 @@ public final class DownloadQueue {
             }
             replaceExisting = true;
         }
+        sweepStaleStaging(normalDest);
         File staged = stageBesideDestination(raw, normalDest);
         try {
             setModificationTime(staged, originalMtime);
@@ -2449,16 +2593,47 @@ public final class DownloadQueue {
         File album = new File(PRIMARY_STORAGE_ROOT, relativePath);
         boolean sameNameSameLength = album.isFile() && remoteSize >= 0L
                 && album.length() == remoteSize;
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath, album);
+        // 相册里那份同名文件是本记录登记过的副本（原地瘦身预览）：写回它，不另存镜像
+        boolean albumIsRegisteredDerived = album.isFile()
+                && mOriginalStore.isRegisteredDerivedPath(record, album);
         return DownloadDestinationPolicy.resolve(album, mirror, sameNameSameLength,
-                registeredOriginalPathFor(config, remotePath, album));
+                record == null ? null : record.originalLocalPath, albumIsRegisteredDerived);
     }
 
-    /** 注册表里这一 remote 的既有原路径；查不到（或压根没登记）返回 null，调用方按“未登记”处理。 */
-    private String registeredOriginalPathFor(Config config, String remotePath,
-            File albumCandidate) {
-        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath,
-                albumCandidate);
-        return record == null ? null : record.originalLocalPath;
+    /**
+     * 注册表驱动的自动下载落点：与 {@link #downloadDestinationFor} 同一套判据。
+     *
+     * <p>为什么不能直接用 {@link AutoDownloadPolicy#targetPath}：那个纯函数只按远端相对路径
+     * 算相册路径，<b>看不到注册表</b>。被用户改名/移动过的接管行因此会被算到第二个路径，
+     * 下完就多一份文件、相册多一行。这里补上"账本优先"，与远端枚举那条链路口径一致。
+     */
+    private File registryAwareDestination(Config config, String layout,
+            OriginalStore.Record record, File albumDestination) {
+        String relative = AutoDownloadPolicy.relativePath(config.getRemoteRoot(), record.remotePath);
+        File mirror = relative == null ? null : new File(MIRROR_ROOT, relative);
+        if (mirror == null) {
+            return albumDestination;
+        }
+        boolean sameNameSameLength = albumDestination.isFile()
+                && record.originalLength >= 0L
+                && albumDestination.length() == record.originalLength;
+        return DownloadDestinationPolicy.resolve(albumDestination, mirror, sameNameSameLength,
+                record.originalLocalPath, false);
+    }
+
+    /**
+     * 这条远端路径在本地登记过的副本是不是就是 {@code file}。
+     *
+     * <p>只认"这条记录自己登记过的副本"：用户自己的同名文件永远不满足，所以它只可能被
+     * 用来放行"顶掉我们写下的预览"，不会变成"覆盖用户文件"。
+     */
+    private boolean isRegisteredDerivedCopyFor(String remotePath, Config config, File file) {
+        if (file == null || !file.isFile() || file.length() <= 0L) {
+            return false;
+        }
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath, file);
+        return record != null && mOriginalStore.isRegisteredDerivedCopy(record, file);
     }
 
     /**
@@ -3041,21 +3216,263 @@ public final class DownloadQueue {
         }
     }
 
-    private void fail(Pending pending, String reason) {
+    /**
+     * 记一次失败：次数只增不减，冷却长短按种类与次数算。
+     *
+     * <p>旧实现（本次修掉的根因）：冷却一过就把次数删掉，于是一个"每次都返回坏字节"的
+     * 远端对象会被每分钟重下一整份。现在次数保留，冷却指数增长（可重试 60s 起、
+     * 终态 30min 起、上限 24h），只有<b>成功</b>才清账。
+     */
+    private void fail(Pending pending, DownloadFailurePolicy.Cause cause, String reason) {
+        DownloadFailurePolicy.Kind kind = DownloadFailurePolicy.kindOf(cause);
         int count;
+        long now = SystemClock.elapsedRealtime();
         synchronized (mLock) {
             Integer previous = mFailures.get(pending.remotePath);
-            count = (previous == null ? 0 : previous) + 1;
+            count = (previous == null ? 0 : previous)
+                    + DownloadFailurePolicy.attemptCost(cause, MAX_FAIL_PER_PATH);
             mFailures.put(pending.remotePath, count);
-            mFailureTimes.put(pending.remotePath, SystemClock.elapsedRealtime());
+            mFailureKinds.put(pending.remotePath, kind);
+            mFailureTimes.put(pending.remotePath, now);
+            trimFailuresLocked();
         }
-        Logger.w("event=download_retry remote=" + pending.remotePath + " attempts=" + count
+        long cooldown = DownloadFailurePolicy.cooldownMs(kind, count, MAX_FAIL_PER_PATH);
+        boolean blocked = DownloadFailurePolicy.blocked(kind, count, now, now, MAX_FAIL_PER_PATH);
+        Logger.w("event=download_fail row=" + rowLabel(pending)
+                + " path=" + pending.remotePath
+                + " bytes=" + pending.size
+                + " kind=" + kind.name().toLowerCase(Locale.US)
+                + " cause=" + (cause == null ? "unknown" : cause.wire())
+                + " attempts=" + count
+                + " cooldown=" + cooldown
+                + " blocked=" + blocked
                 + " reason=" + reason);
         if (pending.autoDownload) {
-            // 失败只记账，不动注册表：状态仍是 REMOTE_ONLY，等下一轮（或冷却之后）重试；
-            // 达到 MAX_FAIL_PER_PATH 后计划侧会跳过这条，不再无限烧流量。
+            // 失败只记账，不动注册表：状态仍是 REMOTE_ONLY，等下一轮（或冷却之后）重试。
             Logger.w("event=auto_download_failed row=" + (pending.rowId == null ? "unknown"
-                    : pending.rowId) + " reason=" + reason + " attempts=" + count);
+                    : pending.rowId) + " kind=" + kind.name().toLowerCase(Locale.US)
+                    + " attempts=" + count + " reason=" + reason);
+        }
+    }
+
+    /**
+     * 异常 → 失败原因。
+     *
+     * <p>分类只影响冷却长短与日志，不影响正确性：认不出来的一律归
+     * {@link DownloadFailurePolicy.Cause#UNKNOWN}（按可重试处理），绝不把未知故障记成
+     * 终态而永久挡住一张照片。
+     */
+    private static DownloadFailurePolicy.Cause causeOf(Throwable t) {
+        if (t == null) {
+            return DownloadFailurePolicy.Cause.UNKNOWN;
+        }
+        if (t instanceof DownloadFailurePolicy.PayloadException) {
+            return ((DownloadFailurePolicy.PayloadException) t).cause();
+        }
+        if (t instanceof WebDavClient.HttpStatusException) {
+            return DownloadFailurePolicy.causeOfStatus(
+                    ((WebDavClient.HttpStatusException) t).code);
+        }
+        if (t instanceof WebDavClient.TransportFailure) {
+            return DownloadFailurePolicy.Cause.TRANSPORT;
+        }
+        if (t instanceof java.net.SocketTimeoutException) {
+            return DownloadFailurePolicy.Cause.TRANSPORT;
+        }
+        return DownloadFailurePolicy.causeOfMessage(t.getMessage());
+    }
+
+    /**
+     * 传输类异常的失败原因：先看"是不是被看门狗按停滞关掉的"。
+     *
+     * <p>关掉连接之后抛出来的只有 {@code SocketException: Socket closed}，从文本上分不出
+     * 是服务器卡住还是别的原因；标记表能给出确定答案（且取走即清，不污染下一次尝试）。
+     */
+    private DownloadFailurePolicy.Cause causeOfTransferFailure(Pending pending, Throwable t) {
+        if (pending != null) {
+            synchronized (mLock) {
+                if (mStalledPaths.remove(pending.remotePath)) {
+                    return DownloadFailurePolicy.Cause.STALLED;
+                }
+            }
+        }
+        return causeOf(t);
+    }
+
+    /** 失败账本不能无界增长：超上限先丢最早的（与 {@link #trimDoneLocked} 同一口径）。 */
+    private void trimFailuresLocked() {
+        if (mFailures.size() <= MAX_DONE_RECORDS) {
+            return;
+        }
+        Iterator<String> it = mFailures.keySet().iterator();
+        while (it.hasNext() && mFailures.size() > MAX_DONE_RECORDS) {
+            String key = it.next();
+            it.remove();
+            mFailureTimes.remove(key);
+            mFailureKinds.remove(key);
+        }
+    }
+
+    // ------------------------------------------------------- 字节进度与停滞看门狗
+
+    /** 这条项开始传输：登记它的连接，供停滞看门狗在必要时关闭。 */
+    private void markTransferStarted(String remotePath, WebDavClient client) {
+        synchronized (mLock) {
+            mLastByteAt.put(remotePath, SystemClock.elapsedRealtime());
+            mActiveClients.put(remotePath, client);
+        }
+    }
+
+    /** 收到字节：刷新心跳。回调在传输线程上跑，只碰受锁保护的 Map。 */
+    private void markTransferByte(String remotePath, long now) {
+        synchronized (mLock) {
+            mLastByteAt.put(remotePath, now);
+        }
+    }
+
+    /** 这条项收尾（成功/失败/取消都走这里）：摘掉心跳与连接登记。 */
+    private void markTransferEnded(String remotePath) {
+        synchronized (mLock) {
+            mLastByteAt.remove(remotePath);
+            mActiveClients.remove(remotePath);
+            // 正常收尾就说明没有被看门狗判定过停滞；残留标记只会让下一次尝试误分类
+            mStalledPaths.remove(remotePath);
+        }
+    }
+
+    /**
+     * 停滞看门狗：每 {@link #WATCHDOG_INTERVAL_MS} 扫一次"最后收到字节到现在多久"。
+     *
+     * <p>为什么不能只靠 socket 超时：WebDavClient 的直连 302 缓存路径在服务端不吐字节时
+     * 会一直挂到 {@code READ_TIMEOUT_MAX}（分钟级），而且缓存 3 分钟内每次重试都卡同一条。
+     * 队列能做的只有一件事 —— 到点主动关掉那条连接，让读循环抛异常走失败记账。
+     */
+    private void watchdogLoop() {
+        while (mRunning) {
+            synchronized (mLock) {
+                if (mRunning) {
+                    try {
+                        mLock.wait(WATCHDOG_INTERVAL_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+            long now = SystemClock.elapsedRealtime();
+            List<String> stalled = new ArrayList<>();
+            Map<String, WebDavClient> clientsByPath = new HashMap<>();
+            synchronized (mLock) {
+                for (Map.Entry<String, Long> entry : mLastByteAt.entrySet()) {
+                    Long last = entry.getValue();
+                    if (last == null
+                            || !DownloadProgressPolicy.stalled(last, now,
+                                    DownloadProgressPolicy.STALL_MS)) {
+                        continue;
+                    }
+                    stalled.add(entry.getKey());
+                    WebDavClient client = mActiveClients.get(entry.getKey());
+                    if (client != null) {
+                        clientsByPath.put(entry.getKey(), client);
+                    }
+                }
+            }
+            for (String remotePath : stalled) {
+                long last;
+                synchronized (mLock) {
+                    Long at = mLastByteAt.get(remotePath);
+                    last = at == null ? now : at;
+                    // 先摘掉心跳，避免同一项被连续关两次
+                    mLastByteAt.remove(remotePath);
+                    mActiveClients.remove(remotePath);
+                    // 留下"这次是停滞"的标记，供 download() 的失败分类使用
+                    mStalledPaths.add(remotePath);
+                }
+                Logger.w("event=download_stalled row=unknown path=" + remotePath
+                        + " elapsed=" + Math.max(0L, now - last)
+                        + " reason=no_bytes_for_" + DownloadProgressPolicy.STALL_MS + "ms");
+                WebDavClient client = clientsByPath.get(remotePath);
+                if (client != null) {
+                    // close() 让正在阻塞的读立即返回，get() 随即抛 IOException，
+                    // 由 download() 的 catch 归成可重试失败（次数只增、冷却递增）。
+                    client.close();
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- 残留临时件
+
+    /**
+     * 清掉同一目录里"上一辈子"留下的下载临时件。
+     *
+     * <p>进程被杀时没人走 {@code cleanupUnpublished}，而 {@code .<name>.mgs-*.tmp} 以点
+     * 开头、媒体扫描器看不见，于是只会安静地越积越多。判据是纯函数
+     * （{@link DownloadResiduePolicy}）：名字形状对 + 足够旧，绝不碰本路或别的路刚写的文件。
+     */
+    private static void sweepStaleStaging(File destination) {
+        if (destination == null) {
+            return;
+        }
+        File parent = destination.getAbsoluteFile().getParentFile();
+        if (parent == null || !parent.isDirectory()) {
+            return;
+        }
+        String[] names;
+        try {
+            names = parent.list();
+        } catch (Throwable t) {
+            names = null;
+        }
+        if (names == null || names.length == 0) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        int removed = 0;
+        for (String name : names) {
+            File candidate = new File(parent, name);
+            if (!DownloadResiduePolicy.isSweepable(name, destination.getName(), now,
+                    candidate.lastModified())) {
+                continue;
+            }
+            if (candidate.delete()) {
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            Logger.i("event=download_residue_cleaned dir=" + parent.getAbsolutePath()
+                    + " dest=" + destination.getName() + " removed=" + removed);
+        }
+    }
+
+    /**
+     * 摘要校验：注册表里这一行记着 sha256 时，下下来的字节必须对得上。
+     *
+     * <p>真机故障里"长度对、内容全 0"这种情况只有这一步能抓稳（签名闸对未知后缀失效，
+     * 而全 0 的 JPEG 名文件也能蒙过只看头部的判据）。注册表里的摘要本身是全 0 摘要时
+     * 跳过 —— 那是账本自己坏了，不能反过来判一份正常下载失败。
+     */
+    private void verifyDownloadedContent(Config config, Pending pending, File file, String digest)
+            throws IOException {
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, pending.remotePath,
+                file);
+        if (record == null || record.sha256 == null || record.sha256.length() != 64
+                || digest == null) {
+            return;
+        }
+        if (MediaPayload.isZeroDigest(record.sha256, record.originalLength)) {
+            Logger.w("event=download_digest_unusable row=" + rowLabel(pending)
+                    + " path=" + pending.remotePath + " reason=registry_zero_digest");
+            return;
+        }
+        if (!record.sha256.equalsIgnoreCase(digest)) {
+            Logger.w("event=download_digest_mismatch row=" + rowLabel(pending)
+                    + " path=" + pending.remotePath + " bytes=" + file.length()
+                    + " expected=" + record.sha256 + " actual=" + digest);
+            throw new DownloadFailurePolicy.PayloadException(
+                    DownloadFailurePolicy.Cause.CONTENT_MISMATCH,
+                    "downloaded bytes do not match the registered digest expected="
+                            + record.sha256 + " actual=" + digest + " bytes=" + file.length());
         }
     }
 

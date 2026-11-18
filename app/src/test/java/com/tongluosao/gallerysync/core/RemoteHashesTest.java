@@ -32,6 +32,7 @@ public class RemoteHashesTest {
         int reads;
         int writes;
         boolean failReads;
+        boolean failWrites;
 
         @Override
         public byte[] read(String remotePath) throws java.io.IOException {
@@ -44,8 +45,11 @@ public class RemoteHashesTest {
         }
 
         @Override
-        public void write(String remotePath, byte[] body) {
+        public void write(String remotePath, byte[] body) throws java.io.IOException {
             writes++;
+            if (failWrites) {
+                throw new java.io.IOException("simulated write failure");
+            }
             files.put(remotePath, body.clone());
         }
 
@@ -232,5 +236,94 @@ public class RemoteHashesTest {
         io.files.put(ROOT + "/.mgs-hashes/a.jpg.sha256", "not a sidecar".getBytes(
                 StandardCharsets.US_ASCII));
         assertNull(new RemoteHashes(ROOT, io).readOrNull("/MiGallerySync/a.jpg"));
+    }
+
+    /** 读的时候 IO 直接抛：readOrNull 必须吞掉并返回 null（调用方退回整份回读）。 */
+    @Test
+    public void readIoFailureReturnsNull() {
+        FakeIo io = new FakeIo();
+        io.failReads = true;
+        assertNull(new RemoteHashes(ROOT, io).readOrNull("/MiGallerySync/a.jpg"));
+        assertEquals(1, io.reads);
+    }
+
+    // ------------------------------------------------------------ v2（头尾证据）
+
+    private static final String HEAD_SHA = "a".repeat(64);
+    private static final String TAIL_SHA = "b".repeat(64);
+
+    /** v2 往返：头尾两段摘要与长度都要原样读回来，hasChunks 才算"有证据"。 */
+    @Test
+    public void chunkedFormatParseRoundTrip() {
+        String text = RemoteHashes.formatChunked(SHA, 300_000L, HEAD_SHA, 100_000L,
+                TAIL_SHA, 100_000L);
+        assertNotNull(text);
+        RemoteHashes.Entry entry = RemoteHashes.parse(text.getBytes(StandardCharsets.US_ASCII));
+        assertNotNull(entry);
+        assertEquals(SHA, entry.sha256);
+        assertEquals(300_000L, entry.length);
+        assertEquals(HEAD_SHA, entry.headSha256);
+        assertEquals(100_000L, entry.headLength);
+        assertEquals(TAIL_SHA, entry.tailSha256);
+        assertEquals(100_000L, entry.tailLength);
+        assertTrue(entry.hasChunks());
+    }
+
+    /** 头尾两段重叠 / 总和超过总长：写与读都必须拒绝，否则证据自相矛盾。 */
+    @Test
+    public void chunkedOverlapIsRejected() {
+        assertNull(RemoteHashes.formatChunked(SHA, 100L, HEAD_SHA, 60L, TAIL_SHA, 60L));
+        String bad = "mgs-hash/2 " + SHA + " 100 " + HEAD_SHA + " 60 " + TAIL_SHA + " 60\n";
+        assertNull(RemoteHashes.parse(bad.getBytes(StandardCharsets.US_ASCII)));
+    }
+
+    /** v2 字段非法（坏摘要、非十进制、负长度）同样整份不采信。 */
+    @Test
+    public void chunkedBadPartsRejected() {
+        assertNull(RemoteHashes.parse(("mgs-hash/2 " + SHA + " 100 " + "z".repeat(64)
+                + " 50 " + TAIL_SHA + " 50\n").getBytes(StandardCharsets.US_ASCII)));
+        assertNull(RemoteHashes.parse(("mgs-hash/2 " + SHA + " 100 " + HEAD_SHA
+                + " x " + TAIL_SHA + " 50\n").getBytes(StandardCharsets.US_ASCII)));
+        assertNull(RemoteHashes.parse(("mgs-hash/2 " + SHA + " 100 " + HEAD_SHA
+                + " -1 " + TAIL_SHA + " 50\n").getBytes(StandardCharsets.US_ASCII)));
+        assertNull(RemoteHashes.formatChunked(SHA, 100L, HEAD_SHA, 50L, null, 0L));
+    }
+
+    /** v1 只是"上传时算过的摘要"，没有回读证据：hasChunks 必须是 false。 */
+    @Test
+    public void legacyEntryHasNoChunkEvidence() {
+        RemoteHashes.Entry entry = RemoteHashes.parse(
+                RemoteHashes.format(SHA, 10L).getBytes(StandardCharsets.US_ASCII));
+        assertNotNull(entry);
+        assertFalse(entry.hasChunks());
+    }
+
+    // ------------------------------------------------------------ 写失败语义
+
+    /** 旁车写失败只返回 false，绝不抛给上传/校验：它只是加速缓存。 */
+    @Test
+    public void writeFailureIsSwallowed() {
+        FakeIo io = new FakeIo();
+        io.failWrites = true;
+        RemoteHashes hashes = new RemoteHashes(ROOT, io);
+        assertFalse(hashes.tryWrite("/MiGallerySync/a.jpg", SHA, 10L));
+        assertFalse(hashes.tryWriteChunked("/MiGallerySync/a.jpg", SHA, 300_000L,
+                HEAD_SHA, 100_000L, TAIL_SHA, 100_000L));
+        assertEquals(2, io.writes);
+    }
+
+    /** 坏摘要 / 空路径 / 没有 Io：连写都不尝试。 */
+    @Test
+    public void invalidWriteNeverReachesIo() {
+        FakeIo io = new FakeIo();
+        RemoteHashes hashes = new RemoteHashes(ROOT, io);
+        assertFalse(hashes.tryWrite("/MiGallerySync/a.jpg", "xyz", 10L));
+        assertFalse(hashes.tryWrite("/MiGallerySync/a.jpg", null, 10L));
+        assertFalse(hashes.tryWrite("/MiGallerySync/a.jpg", SHA, -1L));
+        assertFalse(hashes.tryWrite("", SHA, 10L));
+        assertFalse(hashes.tryWrite(null, SHA, 10L));
+        assertEquals(0, io.writes);
+        assertFalse(new RemoteHashes(ROOT, null).tryWrite("/MiGallerySync/a.jpg", SHA, 10L));
+        assertNull(new RemoteHashes(ROOT, null).readOrNull("/MiGallerySync/a.jpg"));
     }
 }

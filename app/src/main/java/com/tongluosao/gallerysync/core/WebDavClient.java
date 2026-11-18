@@ -744,19 +744,49 @@ public final class WebDavClient {
                 // 有些服务器在对象刚写进去时会给出还没稳定的值
             }
 
-            // HEAD 被重定向、不给长度、或报 404 时都还不足以定论，改用 PROPFIND 问对象本身
-            Res prop = propfind(remotePath, 0);
-            if (prop == null) {
-                // 服务器不支持 PROPFIND，判不了就按通过处理，不误杀
-                return true;
+            // HEAD 被重定向、不给长度、或报 404 时都还不足以定论，改用 PROPFIND 问对象本身。
+            // 这里必须用会抛异常的严格版本：propfind() 把超时/断连都吞成 null，而 null 在这段
+            // 里的语义是"服务器不用 WebDAV 语义" —— 一次元数据超时就会被当成"判不了就按通过"，
+            // 把没落盘的 PUT 记成成功。复核的方向只能是：没有证据 = 失败，交给队列重传。
+            Res prop;
+            try {
+                prop = propfindStrict(remotePath, 0);
+            } catch (IOException e) {
+                Logger.w("event=verify_inconclusive expected=" + expectedSize
+                        + " head=" + headCode + "/" + headLength
+                        + " reason=propfind_transport detail=" + e.getMessage());
+                throw e;
             }
             propCode = prop.code;
             if (prop.code == 404
                     || (prop.body != null && NOT_FOUND_STATUS.matcher(prop.body).find())) {
                 continue;
             }
+            if (prop.code == 401 || prop.code == 403) {
+                // 鉴权被拒不是"不会答 PROPFIND"：PUT 能过、复核被拒说明这条路问不出真相
+                throw new IOException("auth failed code=" + prop.code + prop.detail
+                        + " path=" + remotePath);
+            }
+            if (prop.code >= 500 || prop.code == 429) {
+                // 5xx / 限流是暂时性故障：判失败交给退避重试，别把一次 502 记成传完了
+                return false;
+            }
             if (prop.code != 207) {
-                // 不是多状态响应，说明这台服务器不用 WebDAV 的语义答话，同样判不了
+                // 405/501 等：这台服务器确实不用 WebDAV 语义答话，判不了。但如果 HEAD 已经给出
+                // 一个与期望不符的**正**长度，就不能再按通过处理 —— 远端那个对象不是这份文件。
+                if (headCode == 401 || headCode == 403) {
+                    return false;
+                }
+                if (headCode == 200 && headLength > 0L
+                        && expectedSize > 0L && headLength != expectedSize) {
+                    return false;
+                }
+                if (headCode == 404) {
+                    // HEAD 明确说"不在"，PROPFIND 又不可用：这不是"问不出来"，而是有一条
+                    // 否定的证据。不能按通过处理，交给下面的父目录列表仲裁（真机上的
+                    // OpenList 恰好只能用列目录证明对象存在）。列表也给不出证据就判失败。
+                    break;
+                }
                 return true;
             }
             propSize = contentLengthOf(prop);
@@ -1595,14 +1625,32 @@ public final class WebDavClient {
      */
     private Res propfind(String remotePath, int depth, int cap) {
         try {
-            return send("PROPFIND", remotePath,
-                    null, PROPFIND_BODY.getBytes(StandardCharsets.UTF_8), true, depth, cap,
-                    null, null);
+            return propfindStrict(remotePath, depth, cap);
         } catch (Throwable t) {
-            // 服务器不支持 PROPFIND 时按"判不了"处理，不把它当成写失败
+            // 服务器不支持 PROPFIND 时按"判不了"处理，不把它当成写失败。
+            // 注意：调用方若要用"失败"当结论（如 storedAs 的落盘复核），必须走
+            // propfindStrict —— 这里吞掉的是"问不出来"，不是"远端没有"。
             Logger.d("event=propfind_failed reason=" + t.getMessage());
             return null;
         }
+    }
+
+    /**
+     * 会抛异常的 PROPFIND：传输失败、鉴权失败照实往外抛。
+     *
+     * <p>{@link #propfind(String, int)} 把任何异常都吞成 null（为列目录/探测服务，语义是
+     * "判不了"）。落盘复核不能用那个语义：一次 90 秒超时不是"服务器不支持 PROPFIND"，
+     * 把它当成后者会让 {@link #storedAs} 直接返回 true —— 明明没证明落盘却记成功，
+     * 相册随后清 localFlag，文件就只剩远端一个空名字。
+     */
+    private Res propfindStrict(String remotePath, int depth) throws IOException {
+        return propfindStrict(remotePath, depth, 0);
+    }
+
+    private Res propfindStrict(String remotePath, int depth, int cap) throws IOException {
+        return send("PROPFIND", remotePath,
+                null, PROPFIND_BODY.getBytes(StandardCharsets.UTF_8), true, depth, cap,
+                null, null);
     }
 
     /** 诊断用：取一个对象的 PROPFIND 响应原文（Depth 1 时可列目录），不支持则返回 null */

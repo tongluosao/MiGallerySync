@@ -24,8 +24,11 @@ import java.util.concurrent.CountDownLatch;
 public class DownloadConcurrencyTest {
 
     @Test
-    public void defaultIsThreeAndCeilingIsEight() {
-        assertEquals(3, Config.DEFAULT_DOWNLOAD_CONCURRENCY);
+    public void defaultIsSixAndCeilingIsEight() {
+        // 行为变更（有意的配置调整，不是放宽断言）：下载的瓶颈是"每对象一次握手"的等待，
+        // 真机实测 6 路明显优于 3 路，7/8 收益迅速变平。上传默认仍是 3（每个对象要跟相册
+        // provider 抢锁），下载传输期间不持 provider 锁，所以可以开得比上传多。
+        assertEquals(6, Config.DEFAULT_DOWNLOAD_CONCURRENCY);
         assertEquals(8, Config.MAX_DOWNLOAD_CONCURRENCY);
         assertEquals("download_concurrency", Config.KEY_DOWNLOAD_CONCURRENCY);
     }
