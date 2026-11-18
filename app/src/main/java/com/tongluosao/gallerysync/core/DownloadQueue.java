@@ -2248,7 +2248,9 @@ public final class DownloadQueue {
     private void transferWithStallRetry(WebDavClient client, Pending pending, File raw)
             throws IOException {
         try {
-            client.get(pending.remotePath, raw);
+            // 把计划大小交给客户端：直链缓存活多久按它算（截图短、视频长），
+            // 但"配不配走直链"与大小无关，小对象照样先取直链。
+            client.get(pending.remotePath, raw, pending.size);
             return;
         } catch (IOException first) {
             if (!consumeStalled(pending.remotePath)) {
@@ -2261,7 +2263,7 @@ public final class DownloadQueue {
                     + " direct=" + client.lastGetUsedDirectUrl());
             // 重新登记心跳：上一轮的心跳已被看门狗摘掉，不登记的话重试期间不会被再次监视
             markTransferStarted(pending.remotePath, client, pending.size);
-            client.get(pending.remotePath, raw);
+            client.get(pending.remotePath, raw, pending.size);
         }
     }
 
@@ -3794,7 +3796,10 @@ public final class DownloadQueue {
             long now = SystemClock.elapsedRealtime();
             List<StallHit> hits = new ArrayList<>();
             synchronized (mLock) {
-                for (Map.Entry<String, Long> entry : mLastByteAt.entrySet()) {
+                // 遍历的是快照：下面命中停滞时会对这些 map 调 remove()，而 HashMap 在
+                // for-each 期间被 remove 会在下一次 it.next() 抛 ConcurrentModificationException
+                // —— 那是直接杀死整个相册进程的 FATAL（真机 22:43:23 现场就是这么崩的）。
+                for (Map.Entry<String, Long> entry : new ArrayList<>(mLastByteAt.entrySet())) {
                     String remotePath = entry.getKey();
                     Long bytes = mTransferredBytes.get(remotePath);
                     long received = bytes == null ? 0L : bytes;

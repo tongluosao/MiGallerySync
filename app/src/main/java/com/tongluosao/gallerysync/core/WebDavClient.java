@@ -33,7 +33,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
@@ -113,18 +112,29 @@ public final class WebDavClient {
     private static final int RESOLVE_ATTEMPTS = 3;
     private static final long RESOLVE_RETRY_DELAY = 700L;
     /**
-     * 302 直链缓存的存活时间。
+     * 请求地址（baseUrl + path）→ {直链, 过期时刻}。
+     *
+     * <p>存活时间由 {@link DirectLinkPolicy#ttlFor(long)} 按对象大小给（见
+     * {@link #cacheDirectUrl(String, String, long)}）：小对象短、大对象长。
      *
      * <p>OpenList 这类服务端对每个 Range 请求都先回一次 302 跳转到对象存储的签名直链。手机上
      * 这一跳要额外做一次 DNS + TCP + TLS，播放时的"第一个字节"几乎全花在这上面（实测 4.4 秒）。
      * 直链本身带上签名与过期时间，短时间内重复使用是安全的；过期或被拒时下面会把缓存踢掉，
      * 下一次请求自然退回服务器换新直链。
      */
-    private static final long DIRECT_URL_TTL_MS = TimeUnit.MINUTES.toMillis(3);
-    /** 请求地址（baseUrl + path）→ {直链, 过期时刻}。 */
     private static final Map<String, String[]> sDirectUrls = new ConcurrentHashMap<>();
     /** 直链 → 它最初来自哪个请求地址，用于失效时反查。 */
     private static final Map<String, String> sDirectSources = new ConcurrentHashMap<>();
+    /**
+     * 目录 → {DirectLinkPolicy.DirectoryMode.ordinal(), 过期时刻}。
+     *
+     * <p>为什么按<b>目录</b>记而不是按对象：同一目录下几百个对象同源，服务器对"整份 GET 是
+     * 自己代理还是 302 到存储"的处置也是一致的。学一次就能决定这个目录里所有小对象要不要
+     * 花一次 Range 请求去换直链 —— 发现成本因此被摊薄到"每个目录一次"。
+     */
+    private static final Map<String, long[]> sDirectoryModes = new ConcurrentHashMap<>();
+    /** 目录判定的条目上限（目录数很少，超过就整表清空，绝不无限增长）。 */
+    private static final int DIRECTORY_MODE_MAX = 256;
     /**
      * 最近一次 {@link #get} 是否走的是缓存的 302 签名直链。
      *
@@ -133,6 +143,31 @@ public final class WebDavClient {
      * 本次传输中途就被内部回落掉了。
      */
     private volatile boolean mLastGetUsedDirectUrl;
+    /**
+     * 最近一次 {@link #get} 的体是从哪条直链路子拿到的：{@code "cache"}（命中直链缓存，
+     * 零跳）或 {@code "redirect"}（主域 302 后直连存储，一跳）；没走直链时为 null。
+     *
+     * <p>只用于日志：两种都是"体从存储直接下来"，跟"主域代理整份体"是两种量级的速度，
+     * 统计直链占比时必须分开看。</p>
+     */
+    private volatile String mLastDirectVia;
+    /**
+     * 最近一次 {@link #get} 是否真的被 302 跳转过（不论跳转后用的是直链还是缓存）。
+     *
+     * <p>它只用来学"这个目录的整份 GET 到底走哪条路"：302 过就说明主域不代理体，
+     * 以后不必再花 Range 请求去探直链；没 302 就说明体是从主域慢慢流下来的，
+     * 那才值得探。判据是**服务器实际怎么答的**，不是我们怎么配的。
+     */
+    private volatile boolean mLastGetFollowedRedirect;
+    /**
+     * 最近一次 {@link #get} 里，直链探测是否真的连上过主域主机。
+     *
+     * <p>只服务于一个老判据："这条 GET 失败时值不值得换连接再试一次"。原来的判据是
+     * {@code mSocket != null}（连已经热着，断了重连大概率能成）。探测会把连接故意关掉，
+     * 但它同时也证明了主机可达 —— 所以"连上过"要算进这个判据，否则第一次走探测的对象
+     * 一旦失败就少了一次重试机会。
+     */
+    private volatile boolean mProbeReachedServer;
     /**
      * 本次 {@link #get} 真正在读字节的派生连接（302 跳转后的存储客户端 / 直链客户端）。
      *
@@ -306,12 +341,29 @@ public final class WebDavClient {
         return new RangeCall(isolated, url, start, endInclusive);
     }
 
-    /** 记住一次 302 跳转的目的地址，供后续 Range 请求直接复用。 */
+    /** 记住一次 302 跳转的目的地址，供后续请求直接复用（大小未知，按默认 TTL）。 */
     static void cacheDirectUrl(String requestUrl, String directUrl) {
+        cacheDirectUrl(requestUrl, directUrl, -1L);
+    }
+
+    /**
+     * 记住一次 302 跳转的目的地址，存活时间按对象大小取。
+     *
+     * <p>直链的发现成本对每个对象都要付一次，所以**任何** GET 都该把它记下来：
+     * 整份下载记下来，紧接着的字节复核/旁车读就能直接连存储；重试、断点重来也走快路。
+     *
+     * @param objectSize 对象大小；{@code < 0} 表示未知。0 字节对象不缓存（见
+     *                   {@link DirectLinkPolicy#ttlFor(long)}）
+     */
+    static void cacheDirectUrl(String requestUrl, String directUrl, long objectSize) {
         if (requestUrl == null || directUrl == null || requestUrl.equals(directUrl)) {
             return;
         }
-        long expiresAt = System.currentTimeMillis() + DIRECT_URL_TTL_MS;
+        long ttlMs = DirectLinkPolicy.ttlFor(objectSize);
+        if (ttlMs <= 0L) {
+            return;
+        }
+        long expiresAt = System.currentTimeMillis() + ttlMs;
         sDirectUrls.put(requestUrl, new String[] {directUrl, Long.toString(expiresAt)});
         sDirectSources.put(directUrl, requestUrl);
     }
@@ -338,6 +390,29 @@ public final class WebDavClient {
             return null;
         }
         return entry[0];
+    }
+
+    /**
+     * 取一条仍然有效的直链缓存（连过期时刻一起给判据用）；没有或已过期返回 null。
+     *
+     * <p>{@link DirectLinkPolicy#shouldTryDirect(long, DirectLinkPolicy.CachedEntry)} 要的是
+     * "缓存活着吗"，而不是"缓存里有什么"，所以不能只拿地址。
+     */
+    static DirectLinkPolicy.CachedEntry liveDirectEntry(String requestUrl) {
+        String cached = cachedDirectUrl(requestUrl);
+        if (cached == null) {
+            return null;
+        }
+        String[] entry = sDirectUrls.get(requestUrl);
+        long expiresAt = 0L;
+        if (entry != null && entry.length >= 2) {
+            try {
+                expiresAt = Long.parseLong(entry[1]);
+            } catch (NumberFormatException ignored) {
+                expiresAt = 0L;
+            }
+        }
+        return new DirectLinkPolicy.CachedEntry(cached, expiresAt);
     }
 
     /**
@@ -1096,8 +1171,24 @@ public final class WebDavClient {
      *
      * <p>连接是复用的，所以这个方法会先把响应体完整读完（或读到分块结束）；返回前连接
      * 一定处于干净边界。进度按 64KB 回调，与上传共用 {@link ProgressListener}。
+     *
+     * <p><b>直链不再按大小分流</b>：任何对象都先看直链缓存，命中就直接连存储取体；
+     * 没命中、而所在目录已知被主域代理时，先花一次 1 字节 Range 换一条直链再取
+     * （见 {@link #probeDirectUrl(String, long)}）。直链不可用（签名过期、被拒、空响应）
+     * 立刻退回主域，并由 {@link DirectLinkPolicy#fallbackReason} 记下原因。
      */
     public void get(String remotePath, File destArg) throws IOException {
+        get(remotePath, destArg, -1L);
+    }
+
+    /**
+     * 同 {@link #get(String, File)}，但调用方告诉它对象有多大。
+     *
+     * <p>大小只影响两件事：直链缓存活多久（{@link DirectLinkPolicy#ttlFor(long)}）、
+     * 以及这个目录要不要为它花一次 Range 请求换直链 —— **绝不**影响"配不配走直链"。
+     * 知道就传，不知道传 {@code -1}。
+     */
+    public void get(String remotePath, File destArg, long objectSize) throws IOException {
         // 相对路径的 getParentFile() 是 null，`new File(null, name)` 会抛 NPE。
         // 调用方给的本就是绝对路径，这里只是把这个前提兜住
         File dest = destArg.isAbsolute() ? destArg : destArg.getAbsoluteFile();
@@ -1113,25 +1204,47 @@ public final class WebDavClient {
             String host = url.getHost();
             int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
             String target = url.getFile().isEmpty() ? "/" : url.getFile();
-            boolean reused = mSocket != null;
             mLastGetUsedDirectUrl = false;
-            Long viaDirect = getViaCachedDirectUrl(url, tmp);
+            mLastDirectVia = null;
+            mLastGetFollowedRedirect = false;
+            mProbeReachedServer = false;
+            // 重试判据按"动手之前连接热不热"取：探测会主动关连接，不能用它之后的状态
+            boolean warm = mSocket != null;
+            // 统一策略：缓存里有活着的直链就用，跟对象大小无关。大小只决定缓存活多久。
+            Long viaDirect = DirectLinkPolicy.shouldTryDirect(objectSize,
+                    liveDirectEntry(url.toString()))
+                    ? getViaCachedDirectUrl(url, tmp, objectSize) : null;
+            if (viaDirect == null
+                    && DirectLinkPolicy.shouldProbe(objectSize, directoryMode(remotePath))
+                    && probeDirectUrl(remotePath, objectSize)) {
+                // 这个目录的整份 GET 是被主域自己代理的（真机实测 0.6–0.75MB/s），
+                // 换一条直链再取体（视频走同一类 Range 请求，实测 4.4MB/s）。
+                viaDirect = getViaCachedDirectUrl(url, tmp, objectSize);
+            }
             if (viaDirect != null) {
                 // 直链命中：一次连接、一个请求就把体收回来了，没有 302 那一跳，
                 // 也就不需要为"问跳转"再握一次手
                 mLastGetUsedDirectUrl = true;
+                // 零跳：缓存的签名直链直接连存储
+                mLastDirectVia = "cache";
                 received = viaDirect;
             } else {
+                // 直链这条路可能刚刚自己把连接换掉了（探测必关连接），重试判据要按当前状态取
+                boolean reused = warm || mProbeReachedServer;
                 try {
-                    received = getOnce(host, port, target, tmp);
+                    received = getOnce(host, port, target, tmp, objectSize);
                 } catch (IOException e) {
                     dropConnection();
                     if (!reused) {
                         throw transportFailure("GET", host, e);
                     }
                     Logger.d("event=conn_reopen method=GET reason=" + e.getMessage());
-                    received = getOnce(host, port, target, tmp);
+                    received = getOnce(host, port, target, tmp, objectSize);
                 }
+                // 学一次"这个目录的整份 GET 到底跳没跳"：302 过就再也不用探，
+                // 没跳就说明体是从主域慢慢流下来的，后面的对象值得先探直链。
+                rememberDirectoryMode(remotePath,
+                        DirectLinkPolicy.modeAfterTransfer(mLastGetFollowedRedirect));
             }
             drained = true;
         } finally {
@@ -1145,6 +1258,13 @@ public final class WebDavClient {
             tmp.delete();
             throw new IOException("cannot rename temp file to " + dest.getAbsolutePath());
         }
+        if (mLastGetUsedDirectUrl) {
+            // size 用实际收到的字节：判据拿的是计划大小，这里给的是证据。
+            // via 区分"命中缓存（零跳）"与"302 后直连存储（一跳）"——两者都是体从存储下来，
+            // 但只有前者省掉了握手，统计时不能混成一个数。
+            Logger.i("event=direct_link_used size=" + received + " path=" + remotePath
+                    + " via=" + (mLastDirectVia == null ? "redirect" : mLastDirectVia));
+        }
         Logger.d("event=get_done path=" + remotePath + " bytes=" + received);
     }
 
@@ -1153,16 +1273,18 @@ public final class WebDavClient {
      *
      * @return 实际写入的字节数
      */
-    private long getOnce(String host, int port, String target, File tmp) throws IOException {
-        return getOnce(host, port, target, tmp, 5);
+    private long getOnce(String host, int port, String target, File tmp, long objectSize)
+            throws IOException {
+        return getOnce(host, port, target, tmp, 5, objectSize);
     }
 
     /**
      * 有 302 直链缓存时**直接连存储主机**取体，跳过"问 WebDAV 主机要跳转"那一跳。
      *
      * <p>每个对象两次握手（WebDAV 主机 + 存储主机）是自动下载的主要固定开销：一个对象
-     * 几百 KB，握手却和它一样贵。直链在 3 分钟内有效，所以同一个对象的**重试**
-     * （失败重传、断点后重来、被取消后重排）一律走这条快路。
+     * 几百 KB，握手却和它一样贵。缓存里的直链是按对象大小决定存活时间的
+     * （{@link DirectLinkPolicy#ttlFor(long)}），所以小到截图、大到整段视频，同一对象的
+     * **重试/复核/预览读**都走这条快路。
      *
      * <p>签名过期或被拒时把缓存踢掉（{@link #invalidateDirectUrl}）并返回 null，
      * 调用方退回普通的两跳路径 —— 既不会因为一条坏缓存下不了文件，
@@ -1170,7 +1292,7 @@ public final class WebDavClient {
      *
      * @return 实际写入的字节数；没有可用直链、或直链这次不灵时返回 {@code null}
      */
-    private Long getViaCachedDirectUrl(URL requestUrl, File tmp) {
+    private Long getViaCachedDirectUrl(URL requestUrl, File tmp, long objectSize) {
         String cached = cachedDirectUrl(requestUrl.toString());
         if (cached == null) {
             return null;
@@ -1189,7 +1311,7 @@ public final class WebDavClient {
             try {
                 int directPort = direct.getPort() < 0 ? direct.getDefaultPort() : direct.getPort();
                 long written = directClient.getOnce(direct.getHost(), directPort,
-                        direct.getFile().isEmpty() ? "/" : direct.getFile(), tmp, 5);
+                        direct.getFile().isEmpty() ? "/" : direct.getFile(), tmp, 5, objectSize);
                 if (written <= 0L && tmp.length() <= 0L) {
                     // 后端对直连路径回了一个"成功但没有体"的响应：这种连接不会报错，
                     // 只会安静地留个 0 字节临时件，必须当成直链失效退回标准路径。
@@ -1204,10 +1326,14 @@ public final class WebDavClient {
             }
         } catch (IOException | RuntimeException e) {
             invalidateDirectUrl(cached);
-            String reason = directFailureReason(e);
+            int status = e instanceof HttpStatusException ? ((HttpStatusException) e).code : 0;
+            String reason = DirectLinkPolicy.fallbackReason(true, false, status, e);
             Logger.w("event=direct_url_invalidated reason=" + reason
                     + " path=" + requestUrl.getPath());
+            // 沿用旧事件名 get_direct_miss；新事件名带 size，便于统计直链占比
             Logger.d("event=get_direct_miss reason=" + reason);
+            Logger.i("event=direct_link_miss reason=" + reason
+                    + " size=" + objectSize + " path=" + requestUrl.getPath());
             return null;
         }
     }
@@ -1215,35 +1341,15 @@ public final class WebDavClient {
     /**
      * 直链失败的原因标签（进日志，抓日志靠它分类）。
      *
-     * <p>停滞现场抛出来的往往只是 {@code SocketException: Socket closed}（连接被看门狗
-     * 关掉）或 {@code SocketTimeoutException}，从异常文本上分不清是签名过期、服务端不吐
-     * 字节还是后端对直连路径回了空响应；按类型拆成稳定标签之后，{@code direct_url_invalidated}
-     * 的 reason 分布能直接回答"直链到底坏在哪"。
+     * <p>实现在 {@link DirectLinkPolicy#failureReason(Throwable)}：它不带 Android 依赖，
+     * 能被纯 JVM 单测直接钉死每一条边界。这里保留旧名，老的调用方与日志格式不变。
      */
     static String directFailureReason(Throwable failure) {
-        if (failure == null) {
-            return "unknown";
-        }
-        if (failure instanceof java.net.SocketTimeoutException) {
-            return "timeout";
-        }
-        if (failure instanceof java.net.SocketException) {
-            String message = failure.getMessage();
-            return message != null && message.toLowerCase(Locale.US).contains("closed")
-                    ? "socket_closed" : "socket_error";
-        }
-        if (failure instanceof HttpStatusException) {
-            return "http_" + ((HttpStatusException) failure).code;
-        }
-        String message = failure.getMessage();
-        if (message != null && message.toLowerCase(Locale.US).contains("no body")) {
-            return "empty_response";
-        }
-        return failure.getClass().getSimpleName().toLowerCase(Locale.US);
+        return DirectLinkPolicy.failureReason(failure);
     }
 
-    private long getOnce(String host, int port, String target, File tmp, int redirectsLeft)
-            throws IOException {
+    private long getOnce(String host, int port, String target, File tmp, int redirectsLeft,
+            long objectSize) throws IOException {
         Socket socket = connect(host, port);
         // 下载的读超时要按**响应体**上浮，不能按请求体（GET 的请求体恒为 0）——
         // 一个 600MB 的视频在慢链路上几分钟是常态，用默认 30s 会把好好的下载掐断。
@@ -1260,13 +1366,22 @@ public final class WebDavClient {
             }
             URL current = new URL(mSecure ? "https" : "http", host, port, target);
             URL next = downloadRedirect(current, head.location);
+            mLastGetFollowedRedirect = true;
+            // 体是 302 之后直连存储拿的（一跳）：也算直链，但记成 redirect 以便区分
+            mLastGetUsedDirectUrl = true;
+            mLastDirectVia = "redirect";
             // 记住这一次 302 的目的地：同一个对象重试时直接连存储直链，省掉一次
             // "问 WebDAV 主机要跳转"的往返（那是一次 TLS 握手 + 一次请求）。
-            // 旧版只给 Range 请求记了这张表，整份下载从不写它，所以下载路径永远是两跳。
-            cacheDirectUrl(current.toString(), next.toString());
+            // 存活时间按对象大小给：截图几十秒、整段视频十分钟。
+            cacheDirectUrl(current.toString(), next.toString(), objectSize);
             // A storage signed URL must never receive the WebDAV account credentials.
             String auth = sameOrigin(current, next) ? mAuthHeader : null;
-            dropConnection(); // The redirect response body has not been consumed.
+            // 302 的响应体通常为空。能干净排空就把这条主域连接留着：下一个对象（或下一次
+            // 直链探测）就不用再付一次 TCP+TLS 握手 —— 这正是小对象"每张图都多一跳握手"
+            // 的由来。排不干净（分块断流、没给长度、服务器说 close）才当场关掉。
+            if (!drainRedirectBody(head)) {
+                dropConnection();
+            }
             String origin = next.getProtocol() + "://" + next.getAuthority();
             WebDavClient redirected = new WebDavClient(origin, auth);
             redirected.setProgressListener(mProgressListener);
@@ -1275,7 +1390,8 @@ public final class WebDavClient {
             try {
                 int nextPort = next.getPort() < 0 ? next.getDefaultPort() : next.getPort();
                 return redirected.getOnce(next.getHost(), nextPort,
-                        next.getFile().isEmpty() ? "/" : next.getFile(), tmp, redirectsLeft - 1);
+                        next.getFile().isEmpty() ? "/" : next.getFile(), tmp, redirectsLeft - 1,
+                        objectSize);
             } finally {
                 if (mActiveChildClient == redirected) {
                     mActiveChildClient = null;
@@ -1318,6 +1434,135 @@ public final class WebDavClient {
             dropConnection();
         }
         return written;
+    }
+
+    /**
+     * 把 302 的响应体排空，报告"这条连接还能不能接着用"。
+     *
+     * <p>不排空就留着连接是致命的：下一条响应会从这半截体开始解析（真机上表现为
+     * {@code conn_reopen reason=malformed status line}）。所以这里只回答一个事实问题，
+     * 答不了（没给长度、分块断流、服务器说 close）就返回 false，调用方立刻关连接。
+     */
+    private boolean drainRedirectBody(Head head) {
+        if (head.http10 || Boolean.FALSE.equals(head.keepAlive)) {
+            return false;
+        }
+        if (head.chunked) {
+            return readChunkedChecked(mReader, 0).clean;
+        }
+        if (head.contentLength > 0L) {
+            return readCappedChecked(mReader, head.contentLength, 0).clean;
+        }
+        // 没长度也不分块：体一直延伸到 EOF，这条连接不可能再复用
+        return head.contentLength == 0L;
+    }
+
+    /**
+     * 用一次 1 字节 Range 请求换一条 302 直链，并写进缓存。
+     *
+     * <p>为什么是 Range 而不是普通 GET：真机上同一个服务器，带 Range 的请求被 302 到存储
+     * （视频实测 4.4MB/s），整份 GET 却由主域自己代理（截图 0.6–0.75MB/s）。视频预热走的
+     * 就是这条路（{@code WebDavVideoSource.warmUp()}），这里把它变成"探到就缓存、体另取"。
+     *
+     * <p>只在 {@link DirectLinkPolicy#shouldProbe} 说该探时调用：已经 302 的目录探一次是纯
+     * 浪费，探不出直链的目录也不会重复白探。失败一律安静返回 false，由调用方走主域老路。
+     *
+     * @return 是否真的拿到并缓存了一条直链
+     */
+    private boolean probeDirectUrl(String remotePath, long objectSize) {
+        // 探完还想让主域连接活着：下一个对象（或这次要取体的那条 GET）就不必再握手。
+        // 小对象省下来的正是这一次握手，探完就关等于白省。
+        boolean keepConnection = false;
+        try {
+            URL url = new URL(mBaseUrl + encodePath(remotePath));
+            String host = url.getHost();
+            int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
+            String target = url.getFile().isEmpty() ? "/" : url.getFile();
+            Socket socket = connect(host, port);
+            mProbeReachedServer = true;
+            // 探针只等响应头：主域要是不理 1 字节 Range，也不该在这里耗到分钟级
+            socket.setSoTimeout(READ_TIMEOUT_BASE);
+            OutputStream out = mOut;
+            out.write(requestHead("GET", host, port, target, null, null, 0L, -1, null, null,
+                    "bytes=0-0", true));
+            out.flush();
+            Head head = readHead();
+            if (head.code == 301 || head.code == 302 || head.code == 303
+                    || head.code == 307 || head.code == 308) {
+                if (head.location != null && !head.location.isEmpty()) {
+                    URL next = downloadRedirect(url, head.location);
+                    cacheDirectUrl(url.toString(), next.toString(), objectSize);
+                    rememberDirectoryMode(remotePath,
+                            DirectLinkPolicy.modeAfterProbe(true));
+                    keepConnection = drainRedirectBody(head);
+                    Logger.d("event=direct_link_probe hit=1 size=" + objectSize
+                            + " path=" + remotePath);
+                    return cachedDirectUrl(url.toString()) != null;
+                }
+            }
+            // 不是 302：这个目录的 Range 也不给直链，记下来别再白探。
+            // 这个响应可能带着整份体，一行都不能读 —— 连接只能扔。
+            rememberDirectoryMode(remotePath, DirectLinkPolicy.modeAfterProbe(false));
+            String reason = head.code >= 400 ? "http_" + head.code : "no_302";
+            Logger.d("event=direct_link_probe hit=0 code=" + head.code
+                    + " path=" + remotePath);
+            // 统计口径：直链要么用上（direct_link_used），要么给出一个原因（direct_link_miss）
+            Logger.i("event=direct_link_miss reason=" + reason
+                    + " size=" + objectSize + " path=" + remotePath);
+            return false;
+        } catch (IOException | RuntimeException e) {
+            String reason = DirectLinkPolicy.failureReason(e);
+            Logger.d("event=direct_link_probe hit=0 reason=" + reason + " path=" + remotePath);
+            Logger.i("event=direct_link_miss reason=" + reason
+                    + " size=" + objectSize + " path=" + remotePath);
+            return false;
+        } finally {
+            if (!keepConnection) {
+                // 响应边界不可信（没排空、或服务器说 close）：留着会串包
+                dropConnection();
+            }
+        }
+    }
+
+    /** 这个对象所在目录的直链行为；没学过或已过期都是 {@code UNKNOWN}。 */
+    private DirectLinkPolicy.DirectoryMode directoryMode(String remotePath) {
+        String key = directoryKey(remotePath);
+        if (key == null) {
+            return DirectLinkPolicy.DirectoryMode.UNKNOWN;
+        }
+        long[] entry = sDirectoryModes.get(key);
+        if (entry == null || entry.length < 2) {
+            return DirectLinkPolicy.DirectoryMode.UNKNOWN;
+        }
+        if (System.currentTimeMillis() >= entry[1]) {
+            sDirectoryModes.remove(key);
+            return DirectLinkPolicy.DirectoryMode.UNKNOWN;
+        }
+        DirectLinkPolicy.DirectoryMode[] values = DirectLinkPolicy.DirectoryMode.values();
+        int ordinal = (int) entry[0];
+        return ordinal >= 0 && ordinal < values.length
+                ? values[ordinal] : DirectLinkPolicy.DirectoryMode.UNKNOWN;
+    }
+
+    /** 记住这个目录的直链行为；目录数很少，超过上限就整表清空。 */
+    private void rememberDirectoryMode(String remotePath, DirectLinkPolicy.DirectoryMode mode) {
+        String key = directoryKey(remotePath);
+        if (key == null || mode == null) {
+            return;
+        }
+        if (sDirectoryModes.size() > DIRECTORY_MODE_MAX) {
+            sDirectoryModes.clear();
+        }
+        sDirectoryModes.put(key, new long[] {mode.ordinal(),
+                System.currentTimeMillis() + DirectLinkPolicy.DIRECTORY_HINT_TTL_MS});
+    }
+
+    /** 目录键带上 baseUrl：不同服务器/不同根目录的行为互不污染。 */
+    private String directoryKey(String remotePath) {
+        if (remotePath == null || remotePath.isEmpty()) {
+            return null;
+        }
+        return mBaseUrl + "|" + parentOf(remotePath);
     }
 
     static URL downloadRedirect(URL current, String location) throws IOException {
@@ -3343,10 +3588,19 @@ public final class WebDavClient {
     private byte[] requestHead(String method, String host, int port, String target,
             File file, byte[] body, long length, int depth, String destination,
             String overwrite, String range) {
+        // 带 Range 的旧调用方一律 close：它们读完（或读一半）就把连接扔了，边界不可信。
+        // 想复用连接的调用方（直链探测）显式传 keep-alive。
+        return requestHead(method, host, port, target, file, body, length, depth,
+                destination, overwrite, range, range == null);
+    }
+
+    private byte[] requestHead(String method, String host, int port, String target,
+            File file, byte[] body, long length, int depth, String destination,
+            String overwrite, String range, boolean keepAlive) {
         StringBuilder sb = new StringBuilder(256);
         sb.append(method).append(' ').append(target).append(" HTTP/1.1\r\n")
                 .append("Host: ").append(hostHeader(host, port)).append("\r\n")
-                .append("Connection: ").append(range == null ? "keep-alive" : "close")
+                .append("Connection: ").append(keepAlive ? "keep-alive" : "close")
                 .append("\r\n")
                 .append("Accept-Encoding: identity\r\n");
         if (mAuthHeader != null) {

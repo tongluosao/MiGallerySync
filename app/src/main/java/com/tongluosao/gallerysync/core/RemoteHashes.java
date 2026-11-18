@@ -376,7 +376,9 @@ public final class RemoteHashes {
                 }
                 File tmp = File.createTempFile("hash-", ".tmp", tempDir);
                 try {
-                    client.get(remotePath, tmp);
+                    // 旁车只有几十字节，是典型的"小对象"：同样先看直链缓存，
+                    // 并用刚问到的长度定格它该活多久。
+                    client.get(remotePath, tmp, known);
                     long size = tmp.length();
                     if (size <= 0L || size > MAX_BYTES) {
                         return null;
