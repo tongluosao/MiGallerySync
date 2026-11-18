@@ -11,7 +11,7 @@ import static org.junit.Assert.*;
 /**
  * 第 4 波：高清副本的落点判据。
  *
- * <p>原地格式（jpg/jpeg 家族，以及 preserveHeic 打开时的 heic/heif）返回原文件本身 ——
+ * <p>原地格式（jpg/jpeg 家族、png，以及 preserveHeic 打开时的 heic/heif）返回原文件本身 ——
  * 预览覆盖在原路径上；其余容器仍落在隐藏侧车目录（{@code .gallerysync-slim}），
  * 不可压缩的 gif/视频不产生副本。
  */
@@ -23,6 +23,7 @@ public class DownloadQueuePreviewPathTest {
         File jpegLongExtension = new File("album/photo.jpeg");
         File heic = new File("album/IMG_0001.HEIC");
         File heif = new File("album/IMG_0002.heif");
+        File png = new File("album/screenshot.png");
 
         assertEquals(jpeg, DownloadQueue.previewPathFor(jpeg, false));
         assertEquals(jpegLongExtension, DownloadQueue.previewPathFor(jpegLongExtension, false));
@@ -31,13 +32,14 @@ public class DownloadQueuePreviewPathTest {
         assertEquals(heif, DownloadQueue.previewPathFor(heif, true));
         // preserveHeic=false 不影响 jpg 家族原地覆盖
         assertEquals(jpeg, DownloadQueue.previewPathFor(jpeg, true));
+        // PNG 有自己的无损编码器：无论“保留 HEIC”开不开都原地覆盖，且不会转成 jpg
+        assertEquals(png, DownloadQueue.previewPathFor(png, true));
+        assertEquals(png, DownloadQueue.previewPathFor(png, false));
     }
 
     @Test public void sidecarFormatsKeepTheHiddenDirectoryPreview() {
-        File png = DownloadQueue.previewPathFor(new File("album/photo.png"), false);
         File webp = DownloadQueue.previewPathFor(new File("album/photo.webp"), false);
         File bmp = DownloadQueue.previewPathFor(new File("album/photo.bmp"), false);
-        assertEquals(new File("album/.gallerysync-slim/photo.jpg"), png);
         assertEquals(new File("album/.gallerysync-slim/photo.jpg"), webp);
         assertEquals(new File("album/.gallerysync-slim/photo.jpg"), bmp);
     }
@@ -73,20 +75,24 @@ public class DownloadQueuePreviewPathTest {
     }
 
     @Test public void previewPathIsDeterministicAndUniquePerPhoto() {
-        File first = DownloadQueue.previewPathFor(new File("album/photo.png"), false);
-        File second = DownloadQueue.previewPathFor(new File("album/photo.png"), false);
+        File first = DownloadQueue.previewPathFor(new File("album/photo.webp"), false);
+        File second = DownloadQueue.previewPathFor(new File("album/photo.webp"), false);
         assertEquals(first, second);
         assertNotEquals(first,
-                DownloadQueue.previewPathFor(new File("album/other.png"), false));
-        assertNotEquals(first, DownloadQueue.previewPathFor(new File("album2/photo.png"), false));
+                DownloadQueue.previewPathFor(new File("album/other.webp"), false));
+        assertNotEquals(first, DownloadQueue.previewPathFor(new File("album2/photo.webp"), false));
+        // 原地格式同样幂等：同一张 png 永远得到它自己的路径
+        File png = new File("album/photo.png");
+        assertEquals(png, DownloadQueue.previewPathFor(png, false));
+        assertEquals(png, DownloadQueue.previewPathFor(png, true));
     }
 
     @Test public void slimDestinationKeepsThePhotoStemInsideTheHiddenDirectory() {
         // 只有侧车格式才进隐藏目录，并且与原图同 stem
         File[] originals = {
                 new File("album/IMG_0001.HEIC"),
-                new File("album/photo.png"),
                 new File("album/photo.webp"),
+                new File("album/photo.bmp"),
         };
         for (File original : originals) {
             File preview = DownloadQueue.previewPathFor(original, false);

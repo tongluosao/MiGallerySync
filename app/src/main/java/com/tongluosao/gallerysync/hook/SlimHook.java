@@ -458,9 +458,11 @@ final class SlimHook {
     /**
      * 这张图片能不能原地覆盖。
      *
-     * <p>除了容器本身（HEIC/JPG 家族），HEIF 还多一个前提：“保留 HEIC 格式”必须开着。
+     * <p>除了容器本身（HEIC/JPG 家族与 PNG），HEIF 还多一个前提：“保留 HEIC 格式”必须开着。
      * 关掉时老逻辑的编码器会产出 JPEG，而原地覆盖不允许改扩展名 —— 把 JPEG 写进 {@code .heic}
      * 就是容器不匹配，相册与远端都会把它当坏图，所以这种情况继续走侧车。
+     *
+     * <p>PNG 不受这个开关影响：它的编码器只写 PNG（无损、保留 alpha），同扩展名覆盖永远成立。
      */
     private static boolean useInplace(SlimItem item, File original, Config config) {
         if (item.serverType != 1 || original == null || config == null
@@ -540,8 +542,8 @@ final class SlimHook {
      * 把压缩预览编码到“与原文件同目录”的隐藏临时件。
      *
      * <p>同目录是硬要求：跨目录的 atomic rename 不成立，那就不再是原子发布。编码器按原文件名
-     * 选容器（heic/heif 出 HEIF、jpg/jpeg 出 JPEG），调用前已经确认过扩展名与编码器匹配。
-     * 失败返回 {@code null}，原因已经打进 {@code slim_inplace_failed}。
+     * 选容器（heic/heif 出 HEIF、jpg/jpeg 出 JPEG、png 出无损 PNG），调用前已经确认过扩展名
+     * 与编码器匹配。失败返回 {@code null}，原因已经打进 {@code slim_inplace_failed}。
      */
     private File stagedInplacePreview(SlimItem item, File original, Config config,
             InplaceCallbacks callbacks) {
@@ -562,6 +564,14 @@ final class SlimHook {
             Logger.i("event=slim_inplace_failed row=" + item.rowId
                     + " reason=preview_not_smaller path=" + item.path);
             return null;
+        }
+        if ("png".equals(InplaceSlimPolicy.targetFormat(original.getName()))) {
+            // PNG 分支单独一行：无损重编的体积表现与 JPEG 完全不同，值得单独看
+            // original/preview 是字节数，bytes 是这一次省下来的量
+            Logger.i("event=slim_inplace_png original=" + original.length()
+                    + " preview=" + staged.length()
+                    + " bytes=" + Math.max(0L, original.length() - staged.length())
+                    + " path=" + item.path);
         }
         return staged;
     }

@@ -1831,6 +1831,12 @@ public final class MetadataRestoreJob {
             facts.targetSha256 = facts.targetExists ? sha256(targetFile) : null;
         }
         MigrationDecision decision = Migration.decision(facts);
+        // TRANSCODE 不再是“留给下一波”：预览与原图容器不同，改名会把 JPEG 码流写成 .heic。
+        // 改走“从 WebDAV 取回原图 → 校验 → 行指回原路径”的专用路径。
+        if (decision.action == InplaceSlimPolicy.MigrationAction.TRANSCODE) {
+            return migrateTranscodeOne(context, config, store, target, item, row, record,
+                    preview, dryRun);
+        }
         if (!decision.reason.isEmpty()) {
             String status = Migration.isSkipReason(decision.reason) ? "skipped" : "failed";
             return migrationResult(item, status, decision.reason, decision.action,
@@ -1938,6 +1944,72 @@ public final class MetadataRestoreJob {
                 + " dryRun=false");
         return migrationResult(item, "success", "", decision.action, facts.previewLength,
                 true, false);
+    }
+
+    /**
+     * TRANSCODE：预览是 JPEG、原名是 HEIC 这类“容器不同，不能改名”的行。
+     *
+     * <p>做法不是重编码预览，而是把远端完整原图取回归属路径：{@code restoreOriginal} 会自己
+     * 按登记长度/SHA-256 校验远端字节并原子发布；这里再独立复核一次磁盘上的长度与摘要，
+     * 然后把相册行改回“本地就在原路径、没有侧车缩略图”，最后把注册表状态落回
+     * {@code ORIGINAL} 并删掉隐藏目录里那张预览。任何一步失败都保持现状（宁可下次重试，
+     * 也不留下行、文件、注册表三边不一致的半成品）。
+     */
+    private ItemResult migrateTranscodeOne(Context context, Config config, OriginalStore store,
+            String target, RequestItem item, MigrationRow row, OriginalStore.Record record,
+            File preview, boolean dryRun) throws Exception {
+        String targetPath = Migration.migrationTargetPath(row.thumbnailFile, row.fileName);
+        File targetFile = safeStoragePath(targetPath);
+        if (targetFile == null) {
+            return migrationResult(item, "failed", "migrate_path_unsafe",
+                    InplaceSlimPolicy.MigrationAction.TRANSCODE, 0L, false, false);
+        }
+        TranscodeFacts facts = new TranscodeFacts();
+        facts.rowExists = true;
+        facts.recordExists = record != null;
+        facts.target = targetFile;
+        facts.preview = preview;
+        facts.rowId = item.row;
+        facts.sha1 = row.sha1;
+        facts.originalLength = record == null ? 0L : record.originalLength;
+        facts.originalSha256 = record == null ? null : record.sha256;
+        facts.dryRun = dryRun;
+        TranscodeOutcome outcome = Transcode.run(facts, new TranscodeOps() {
+            @Override
+            public boolean hasRequiredSpace(long originalLength) {
+                return MetadataRestoreJob.hasRequiredSpace(originalLength);
+            }
+
+            @Override
+            public boolean isCurrent() {
+                return MetadataRestoreJob.this.isCurrent(target);
+            }
+
+            @Override
+            public File restoreOriginal(File destination) throws Exception {
+                return store.restoreOriginal(config, record, destination);
+            }
+
+            @Override
+            public int updateRow(String rowId, String sha1, File destination) {
+                return updateMigratedRow(context, rowId, sha1, destination);
+            }
+
+            @Override
+            public boolean markOriginal(File destination) {
+                return store.markRestoredOriginal(config, record, destination) != null;
+            }
+        });
+        if (outcome.migrated) {
+            Logger.i("event=migrate_transcode_done row=" + item.row + " bytes=" + outcome.bytes
+                    + " target=" + targetFile.getPath());
+        } else if (outcome.planned) {
+            Logger.i("event=migrate_transcode_planned row=" + item.row + " bytes=" + outcome.bytes
+                    + " target=" + targetFile.getPath() + " dryRun=true");
+        }
+        return migrationResult(item, outcome.status, outcome.reason,
+                InplaceSlimPolicy.MigrationAction.TRANSCODE, outcome.bytes, outcome.migrated,
+                outcome.planned);
     }
 
     /** 把行改成“本地在 {@code targetFile}、没有缩略图侧车”；影响行数由调用者校验。 */
@@ -4031,8 +4103,7 @@ public final class MetadataRestoreJob {
     static final class Migration {
         /** 这些理由只表示"这一项不迁移"，不是失败；其余理由都算失败。 */
         private static final Set<String> SKIP_REASONS = new HashSet<>(Arrays.asList(
-                "migrate_not_sidecar", "migrate_transcode_deferred", "migrate_sidecar_kept",
-                "migrate_skipped"));
+                "migrate_not_sidecar", "migrate_sidecar_kept", "migrate_skipped"));
 
         private Migration() {
         }
@@ -4119,8 +4190,9 @@ public final class MetadataRestoreJob {
                     }
                     return MigrationDecision.reject("migrate_target_exists", action);
                 case TRANSCODE:
-                    // 本波只做同扩展名的原地搬移；转码要重编码，留到下一波。
-                    return MigrationDecision.reject("migrate_transcode_deferred", action);
+                    // 预览容器与原名扩展名不一致，不能改名。放行给执行层去远端取回原图，
+                    // 校验后把行还给原路径；这与“重编码预览再覆盖”是两条不同的路。
+                    return MigrationDecision.proceed(action, false);
                 case SIDECAR:
                     return MigrationDecision.reject("migrate_sidecar_kept", action);
                 case SKIP:
@@ -4131,6 +4203,188 @@ public final class MetadataRestoreJob {
 
         static boolean isSkipReason(String reason) {
             return reason != null && SKIP_REASONS.contains(reason);
+        }
+    }
+
+    /** TRANSCODE 执行要用的行/注册表事实：目标路径、侧车预览、登记摘要与 dryRun。 */
+    static final class TranscodeFacts {
+        boolean rowExists;
+        boolean recordExists;
+        File target;
+        File preview;
+        String rowId;
+        String sha1;
+        long originalLength;
+        String originalSha256;
+        boolean dryRun;
+    }
+
+    /**
+     * TRANSCODE 的外部动作出口。生产实现走 Android ContentResolver / {@link OriginalStore} /
+     * WebDAV；单测实现只需记录调用顺序并写临时文件，因此“先校验、再改行、最后删预览”的
+     * 顺序可以在 JVM 里被钉死。
+     */
+    interface TranscodeOps {
+        boolean hasRequiredSpace(long originalLength);
+
+        boolean isCurrent();
+
+        File restoreOriginal(File destination) throws Exception;
+
+        int updateRow(String rowId, String sha1, File destination);
+
+        boolean markOriginal(File destination);
+    }
+
+    /** TRANSCODE 的纯执行结论：status/reason/bytes 直接映射成 {@link ItemResult}。 */
+    static final class TranscodeOutcome {
+        final String status;
+        final String reason;
+        final long bytes;
+        final boolean migrated;
+        final boolean planned;
+        final boolean previewDeleted;
+        final boolean registryMarked;
+
+        private TranscodeOutcome(String status, String reason, long bytes, boolean migrated,
+                boolean planned, boolean previewDeleted, boolean registryMarked) {
+            this.status = status;
+            this.reason = reason;
+            this.bytes = bytes;
+            this.migrated = migrated;
+            this.planned = planned;
+            this.previewDeleted = previewDeleted;
+            this.registryMarked = registryMarked;
+        }
+
+        static TranscodeOutcome failed(String reason) {
+            return new TranscodeOutcome("failed", reason, 0L, false, false, false, false);
+        }
+
+        static TranscodeOutcome cancelled() {
+            return new TranscodeOutcome("cancelled", "job_stopped", 0L, false, false, false,
+                    false);
+        }
+
+        static TranscodeOutcome planned(long bytes) {
+            return new TranscodeOutcome("planned", "", bytes, false, true, false, false);
+        }
+
+        static TranscodeOutcome success(long bytes, boolean previewDeleted,
+                boolean registryMarked) {
+            return new TranscodeOutcome("success", "", bytes, true, false, previewDeleted,
+                    registryMarked);
+        }
+    }
+
+    /**
+     * TRANSCODE 的纯执行逻辑：取回原图 → 长度/SHA-256 复核 → 修相册行 → 标记注册表 →
+     * 删侧车预览。
+     *
+     * <p>顺序是契约的一部分：<b>先</b>证明磁盘上的字节就是登记原图，<b>再</b>把行改到原路径；
+     * 行没改成就保留已恢复的文件（下次重试只需补 DB），绝不先删预览 —— 否则行还指着侧车时
+     * 预览已消失，就成了既没原图也没预览的残骸。
+     */
+    static final class Transcode {
+        private Transcode() {
+        }
+
+        static TranscodeOutcome run(TranscodeFacts facts, TranscodeOps ops) {
+            if (facts == null || !facts.rowExists) {
+                return TranscodeOutcome.failed("migrate_row_missing");
+            }
+            if (!facts.recordExists) {
+                return TranscodeOutcome.failed("migrate_no_registry_record");
+            }
+            if (facts.target == null) {
+                return TranscodeOutcome.failed("migrate_path_unsafe");
+            }
+            // dryRun 只回答“会做多少”，连一次磁盘写入都不做；空间检查留给真跑。
+            if (facts.dryRun) {
+                return TranscodeOutcome.planned(facts.originalLength);
+            }
+            if (!ops.hasRequiredSpace(facts.originalLength)) {
+                return TranscodeOutcome.failed("migrate_needs_space");
+            }
+            if (!ops.isCurrent()) {
+                return TranscodeOutcome.cancelled();
+            }
+            File restored;
+            try {
+                restored = ops.restoreOriginal(facts.target);
+            } catch (Throwable failure) {
+                return TranscodeOutcome.failed("migrate_restore_failed");
+            }
+            if (restored == null || !restored.isFile()) {
+                return TranscodeOutcome.failed("migrate_restore_failed");
+            }
+            long length;
+            String digest;
+            try {
+                length = restored.length();
+                digest = sha256(restored);
+            } catch (Throwable failure) {
+                deleteRestored(restored);
+                return TranscodeOutcome.failed("migrate_verify_failed");
+            }
+            if (length != facts.originalLength || isBlank(facts.originalSha256)
+                    || !facts.originalSha256.equalsIgnoreCase(digest)) {
+                deleteRestored(restored);
+                return TranscodeOutcome.failed("migrate_verify_failed");
+            }
+            int updated;
+            try {
+                updated = ops.updateRow(facts.rowId, facts.sha1, facts.target);
+            } catch (Throwable failure) {
+                updated = 0;
+            }
+            if (updated != 1) {
+                // 文件已经校验过，保留它；只让行与注册表停在旧状态，下次重试。
+                return TranscodeOutcome.failed("migrate_db_update_failed");
+            }
+            boolean marked;
+            try {
+                marked = ops.markOriginal(facts.target);
+            } catch (Throwable failure) {
+                marked = false;
+            }
+            boolean previewDeleted = deletePreview(facts.preview);
+            return TranscodeOutcome.success(facts.originalLength, previewDeleted, marked);
+        }
+
+        /** 校验失败只删刚恢复出来的那份文件，避免把未知字节留在相册路径上。 */
+        private static void deleteRestored(File restored) {
+            if (restored == null) return;
+            try {
+                if (restored.isFile() && !restored.delete()) {
+                    Logger.w("event=migrate_transcode_delete_restored_failed path="
+                            + restored.getPath());
+                }
+            } catch (Throwable failure) {
+                Logger.w("event=migrate_transcode_delete_restored_failed path="
+                        + restored.getPath());
+            }
+        }
+
+        /**
+         * 只删侧车目录里的普通预览文件：路径里必须有 {@code /.gallerysync-slim/}，必须是普通
+         * 文件（不是目录、不是符号链接）。删不掉只记日志并回 false，不影响这次迁移的成功。
+         */
+        static boolean deletePreview(File preview) {
+            if (preview == null) return false;
+            try {
+                if (!preview.isFile() || Files.isSymbolicLink(preview.toPath())) return false;
+                String normalized = preview.getPath().replace('\\', '/');
+                if (!normalized.contains("/" + SLIM_DIRECTORY_NAME + "/")) return false;
+                if (preview.delete()) return true;
+                Logger.w("event=migrate_transcode_preview_delete_failed path="
+                        + preview.getPath());
+                return false;
+            } catch (Throwable failure) {
+                Logger.w("event=migrate_transcode_preview_delete_failed path="
+                        + preview.getPath());
+                return false;
+            }
         }
     }
 

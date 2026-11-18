@@ -72,11 +72,14 @@ public class DownloadQueueHostScanGateTest {
         File heic = new File("/storage/emulated/0/DCIM/Camera/IMG_0001.HEIC");
         assertEquals(heic, DownloadQueue.previewPathFor(heic, true));
         assertTrue(DownloadQueue.hostScanAllowed(jpeg.getAbsolutePath()));
+        // PNG 现在也原地覆盖：副本就是原路径，不产生需要隐藏的第二个文件
+        File png = new File("/storage/emulated/0/DCIM/Camera/IMG_0003.png");
+        assertEquals(png, DownloadQueue.previewPathFor(png, false));
+        assertTrue(DownloadQueue.hostScanAllowed(png.getAbsolutePath()));
 
         // 侧车格式仍然藏在隐藏目录里，且一律不许交给宿主扫描器
         File[] sidecarOriginals = {
                 new File("/storage/emulated/0/DCIM/Camera/IMG_0001.HEIC"),
-                new File("/storage/emulated/0/DCIM/Camera/IMG_0003.png"),
                 new File("/storage/emulated/0/DCIM/Camera/IMG_0004.webp"),
         };
         for (File original : sidecarOriginals) {

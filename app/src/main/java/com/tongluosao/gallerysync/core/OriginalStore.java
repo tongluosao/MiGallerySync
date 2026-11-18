@@ -382,12 +382,29 @@ public final class OriginalStore {
         }
 
         private Record withRestoredLocal(File file) throws IOException {
+            return withRestoredLocal(file, false);
+        }
+
+        /**
+         * 归属路径换成 {@code file} 且状态回落 {@code ORIGINAL}。
+         *
+         * <p>{@code clearPreview} 供“原图取回后侧车预览会被删除”的调用点使用：连
+         * {@code previewLocalPath} 与对应的派生路径别名一起清掉，不给注册表留下指向已删文件的
+         * 幽灵预览。老 {@link #restoreOriginal} 的恢复语义仍然保留侧车预览，因此默认 {@code false}。
+         */
+        private Record withRestoredLocal(File file, boolean clearPreview) throws IOException {
             String path = canonical(file);
             Set<String> paths = new LinkedHashSet<>(derivedPaths);
             paths.remove(path);
+            String preview = clearPreview || path.equals(previewLocalPath) ? null : previewLocalPath;
+            if (clearPreview && previewLocalPath != null) {
+                paths.remove(previewLocalPath);
+            }
             Set<String> aliases = new LinkedHashSet<>(localAliases);
             aliases.add(path);
-            String preview = path.equals(previewLocalPath) ? null : previewLocalPath;
+            if (clearPreview && previewLocalPath != null) {
+                aliases.remove(previewLocalPath);
+            }
             // 恢复成功后本地又是完整原图：走默认构造，状态回落 ORIGINAL、预览字段清零
             return new Record(target, remotePath, originalLength, sha256, path, preview,
                     rowId, sha1, originalLocalMtime > 0L ? originalLocalMtime : file.lastModified(),
@@ -1113,6 +1130,38 @@ public final class OriginalStore {
                     + " path=" + safe(updated.originalLocalPath));
         }
         return updated;
+    }
+
+    /**
+     * 原图已经重新落回归属路径（外部恢复流程写盘并自行校验通过）：状态切回
+     * {@link LocalState#ORIGINAL}，归属路径指向 {@code destination}，预览登记一并清空。
+     *
+     * <p>与 {@link #restoreOriginal} 内部的 {@code saveRestoredLocal} 同一语义，区别是这里
+     * <b>不下载、不碰字节</b>，只修注册表；调用方必须自己证明文件长度与 SHA-256 都等于登记原图。
+     * 找不到记录、注册表不健康、写盘失败一律返回 {@code null}，不抛。
+     */
+    public Record markRestoredOriginal(Config config, Record record, File destination) {
+        if (config == null || record == null || destination == null) {
+            return null;
+        }
+        try {
+            synchronized (mLock) {
+                if (!mHealthy) {
+                    return null;
+                }
+                Record latest = findForUpdateLocked(targetKey(config), record);
+                if (latest == null) {
+                    return null;
+                }
+                Record updated = latest.withRestoredLocal(destination, true);
+                mRecords.put(recordKey(updated), updated);
+                saveLocked();
+                return updated;
+            }
+        } catch (Throwable failure) {
+            Logger.e("event=original_store_mark_restored_failed", failure);
+            return null;
+        }
     }
 
     /**

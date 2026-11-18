@@ -7,6 +7,7 @@ import static org.junit.Assert.assertTrue;
 
 import com.tongluosao.gallerysync.core.InplaceSlimPolicy;
 
+import org.junit.After;
 import org.junit.Assume;
 import org.junit.Test;
 
@@ -17,6 +18,10 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * 第 5 波（原地覆盖迁移）的纯逻辑测试：老侧车预览怎么迁移
@@ -66,9 +71,9 @@ public class MetadataRestoreJobMigrateTest {
         assertFalse(decision.repairOnly);
     }
 
-    /** jpg 预览 + heic 原名：策略给 TRANSCODE，本波不转码 → 只跳过，不算失败。 */
+    /** jpg 预览 + heic 原名：策略给 TRANSCODE，判定层放行给“取回原图”的执行层。 */
     @Test
-    public void transcodeDeferredWhenPreviewIsJpeg() {
+    public void transcodeProceedsWhenPreviewIsJpeg() {
         String jpegPreview = SLIM + "/a1b2c3d4e5f6.jpg";
         assertEquals(InplaceSlimPolicy.MigrationAction.TRANSCODE,
                 InplaceSlimPolicy.migrationAction(NAME, jpegPreview, "jpg", true, true));
@@ -77,22 +82,24 @@ public class MetadataRestoreJobMigrateTest {
         facts.previewFormat = "jpg";
         MetadataRestoreJob.MigrationDecision decision =
                 MetadataRestoreJob.Migration.decision(facts);
-        assertEquals("migrate_transcode_deferred", decision.reason);
+        assertEquals("", decision.reason);
         assertEquals(InplaceSlimPolicy.MigrationAction.TRANSCODE, decision.action);
-        assertTrue(MetadataRestoreJob.Migration.isSkipReason(decision.reason));
+        assertFalse(decision.repairOnly);
+        // 旧理由已经不再由判定层产生，也不该再被当成“跳过”。
+        assertFalse(MetadataRestoreJob.Migration.isSkipReason("migrate_transcode_deferred"));
     }
 
     /** png 原名 + webp 预览：容器不能原地覆盖 → 留在侧车目录，跳过而非失败。 */
     @Test
     public void sidecarKeptForUnsupportedContainer() {
-        String pngName = "IMG_20240101_120000.png";
-        String webpPreview = SLIM + "/a1b2c3d4e5f6.webp";
+        String pngName = "IMG_20240101_120000.webp";
+        String webpPreview = SLIM + "/a1b2c3d4e5f6.jpg";
         assertEquals(InplaceSlimPolicy.MigrationAction.SIDECAR,
-                InplaceSlimPolicy.migrationAction(pngName, webpPreview, "webp", true, true));
+                InplaceSlimPolicy.migrationAction(pngName, webpPreview, "jpg", true, true));
         MetadataRestoreJob.MigrationFacts facts = sidecarFacts();
         facts.fileName = pngName;
         facts.thumbnailFile = webpPreview;
-        facts.previewFormat = "webp";
+        facts.previewFormat = "jpg";
         MetadataRestoreJob.MigrationDecision decision =
                 MetadataRestoreJob.Migration.decision(facts);
         assertEquals("migrate_sidecar_kept", decision.reason);
@@ -338,6 +345,220 @@ public class MetadataRestoreJobMigrateTest {
     }
 
     // ------------------------------------------------------------------
+    // TRANSCODE：从远端取回原图（执行层的顺序与拒绝理由）
+    // ------------------------------------------------------------------
+
+    /** dryRun 只统计，不下载、不改行、不删预览。 */
+    @Test
+    public void transcodeDryRunDoesNothing() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, ".gallerysync-slim/a1b2.jpg"), new byte[]{1, 2, 3});
+        byte[] payload = payload(128);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload);
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, payload.length, sha256(payload));
+        facts.dryRun = true;
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("planned", outcome.status);
+        assertEquals("", outcome.reason);
+        assertTrue(outcome.planned);
+        assertFalse(outcome.migrated);
+        assertTrue(ops.calls.isEmpty());
+        assertFalse(target.exists());
+        assertTrue(preview.isFile());
+    }
+
+    /** 没有注册表记录：不动磁盘、不动行。 */
+    @Test
+    public void transcodeNeedsRegistryRecord() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, ".gallerysync-slim/a1b2.jpg"), new byte[]{1});
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload(32));
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, 32L, SHA256);
+        facts.recordExists = false;
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("failed", outcome.status);
+        assertEquals("migrate_no_registry_record", outcome.reason);
+        assertTrue(ops.calls.isEmpty());
+        assertFalse(target.exists());
+    }
+
+    /** 行不存在在判定层之前就被拒：同样不碰磁盘。 */
+    @Test
+    public void transcodeNeedsGalleryRow() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload(32));
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, null, 32L, SHA256);
+        facts.rowExists = false;
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("failed", outcome.status);
+        assertEquals("migrate_row_missing", outcome.reason);
+        assertTrue(ops.calls.isEmpty());
+    }
+
+    /** 长度不符：删掉刚恢复的文件，预览保持原样。 */
+    @Test
+    public void transcodeDeletesRestoredOnLengthMismatch() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, ".gallerysync-slim/a1b2.jpg"), new byte[]{1});
+        byte[] payload = payload(200);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload);
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, payload.length + 1L, sha256(payload));
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("failed", outcome.status);
+        assertEquals("migrate_verify_failed", outcome.reason);
+        assertFalse(target.exists());
+        assertTrue(preview.isFile());
+        assertEquals(Arrays.asList("space", "current", "restore"), ops.calls);
+    }
+
+    /** SHA-256 不符（长度相同）：同样删掉刚恢复的文件。 */
+    @Test
+    public void transcodeDeletesRestoredOnShaMismatch() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, ".gallerysync-slim/a1b2.jpg"), new byte[]{1});
+        byte[] payload = payload(200);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload);
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, payload.length, OTHER_SHA256);
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("failed", outcome.status);
+        assertEquals("migrate_verify_failed", outcome.reason);
+        assertFalse(target.exists());
+        assertTrue(preview.isFile());
+    }
+
+    /** DB 更新 0 行：保留已校验的原图，不标记注册表、不删预览。 */
+    @Test
+    public void transcodeKeepsRestoredWhenDbUpdateFails() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, ".gallerysync-slim/a1b2.jpg"), new byte[]{1});
+        byte[] payload = payload(200);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload);
+        ops.updateResult = 0;
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, payload.length, sha256(payload));
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("failed", outcome.status);
+        assertEquals("migrate_db_update_failed", outcome.reason);
+        assertTrue(target.isFile());
+        assertEquals(payload.length, target.length());
+        assertTrue(preview.isFile());
+        assertEquals(ROW, ops.updatedRowId);
+        assertEquals(SHA1, ops.updatedSha1);
+        assertEquals(target, ops.updatedTarget);
+        assertEquals(Arrays.asList("space", "current", "restore", "update"), ops.calls);
+    }
+
+    /** 成功路径的顺序：空间 → 当前性 → 取回 → 改行 → 标记注册表 → 删预览。 */
+    @Test
+    public void transcodeSuccessOrderAndPreviewCleanup() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, ".gallerysync-slim/a1b2.jpg"), new byte[]{1});
+        byte[] payload = payload(200);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload);
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, payload.length, sha256(payload));
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("success", outcome.status);
+        assertEquals("", outcome.reason);
+        assertTrue(outcome.migrated);
+        assertTrue(outcome.previewDeleted);
+        assertTrue(target.isFile());
+        assertEquals(payload.length, target.length());
+        assertFalse(preview.exists());
+        assertEquals(Arrays.asList("space", "current", "restore", "update", "mark"), ops.calls);
+    }
+
+    /** 预览不在隐藏目录里：迁移成功但不删它（不能误删相册文件）。 */
+    @Test
+    public void transcodeKeepsPreviewOutsideSidecarDirectory() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        File preview = writeFile(new File(album, "not-a-sidecar.jpg"), new byte[]{1});
+        byte[] payload = payload(200);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload);
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, preview, payload.length, sha256(payload));
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("success", outcome.status);
+        assertFalse(outcome.previewDeleted);
+        assertTrue(preview.isFile());
+    }
+
+    /** 空间不足：在取回之前就停，磁盘上没有半成品。 */
+    @Test
+    public void transcodeStopsWhenSpaceMissing() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload(64));
+        ops.space = false;
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, null, 64L, SHA256);
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("failed", outcome.status);
+        assertEquals("migrate_needs_space", outcome.reason);
+        assertFalse(target.exists());
+        assertEquals(Arrays.asList("space"), ops.calls);
+    }
+
+    /** 作业已被替换/取消：不开始下载。 */
+    @Test
+    public void transcodeCancelledBeforeRestore() throws Exception {
+        File album = new File(tempDir(), "DCIM/Camera");
+        File target = new File(album, NAME);
+        FakeTranscodeOps ops = new FakeTranscodeOps(payload(64));
+        ops.current = false;
+        MetadataRestoreJob.TranscodeFacts facts =
+                transcodeFacts(target, null, 64L, SHA256);
+
+        MetadataRestoreJob.TranscodeOutcome outcome =
+                MetadataRestoreJob.Transcode.run(facts, ops);
+
+        assertEquals("cancelled", outcome.status);
+        assertEquals("job_stopped", outcome.reason);
+        assertFalse(target.exists());
+        assertEquals(Arrays.asList("space", "current"), ops.calls);
+    }
+
+    // ------------------------------------------------------------------
     // 请求解析的纯部分（不依赖 org.json）
     // ------------------------------------------------------------------
 
@@ -503,6 +724,127 @@ public class MetadataRestoreJobMigrateTest {
         facts.originalLength = 4_000_000L;
         facts.originalSha256 = SHA256;
         return facts;
+    }
+
+    private final List<File> mTempDirs = new ArrayList<>();
+
+    @After
+    public void cleanTempDirs() {
+        for (File directory : mTempDirs) {
+            deleteTree(directory);
+        }
+        mTempDirs.clear();
+    }
+
+    private File tempDir() throws IOException {
+        File directory = Files.createTempDirectory("mgs-transcode").toFile();
+        mTempDirs.add(directory);
+        return directory;
+    }
+
+    private static void deleteTree(File file) {
+        if (file == null) return;
+        File[] children = file.listFiles();
+        if (children != null) {
+            for (File child : children) deleteTree(child);
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
+    }
+
+    private static File writeFile(File file, byte[] bytes) throws IOException {
+        File parent = file.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            throw new IOException("cannot create " + parent);
+        }
+        Files.write(file.toPath(), bytes);
+        return file;
+    }
+
+    private static byte[] payload(int length) {
+        byte[] bytes = new byte[length];
+        for (int index = 0; index < length; index++) {
+            bytes[index] = (byte) (index * 31 + 7);
+        }
+        return bytes;
+    }
+
+    private static String sha256(byte[] bytes) throws Exception {
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(bytes);
+        StringBuilder hex = new StringBuilder(64);
+        for (byte value : hash) {
+            hex.append(Character.forDigit((value >>> 4) & 0x0f, 16));
+            hex.append(Character.forDigit(value & 0x0f, 16));
+        }
+        return hex.toString();
+    }
+
+    private static MetadataRestoreJob.TranscodeFacts transcodeFacts(File target, File preview,
+            long originalLength, String originalSha256) {
+        MetadataRestoreJob.TranscodeFacts facts = new MetadataRestoreJob.TranscodeFacts();
+        facts.rowExists = true;
+        facts.recordExists = true;
+        facts.target = target;
+        facts.preview = preview;
+        facts.rowId = ROW;
+        facts.sha1 = SHA1;
+        facts.originalLength = originalLength;
+        facts.originalSha256 = originalSha256;
+        return facts;
+    }
+
+    /** 记录动作顺序的假执行层：restore 把 payload 真写进目标，因此校验逻辑跑的是真字节。 */
+    private static final class FakeTranscodeOps implements MetadataRestoreJob.TranscodeOps {
+        final List<String> calls = new ArrayList<>();
+        final byte[] payload;
+        boolean space = true;
+        boolean current = true;
+        int updateResult = 1;
+        String updatedRowId;
+        String updatedSha1;
+        File updatedTarget;
+
+        FakeTranscodeOps(byte[] payload) {
+            this.payload = payload;
+        }
+
+        @Override
+        public boolean hasRequiredSpace(long originalLength) {
+            calls.add("space");
+            return space;
+        }
+
+        @Override
+        public boolean isCurrent() {
+            calls.add("current");
+            return current;
+        }
+
+        @Override
+        public File restoreOriginal(File destination) throws Exception {
+            calls.add("restore");
+            File parent = destination.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                throw new IOException("cannot create " + parent);
+            }
+            Files.write(destination.toPath(), payload);
+            return destination;
+        }
+
+        @Override
+        public int updateRow(String rowId, String sha1, File destination) {
+            calls.add("update");
+            updatedRowId = rowId;
+            updatedSha1 = sha1;
+            updatedTarget = destination;
+            return updateResult;
+        }
+
+        @Override
+        public boolean markOriginal(File destination) {
+            calls.add("mark");
+            return true;
+        }
     }
 
     private static void assertInvalidDryRun(Object raw) throws Exception {

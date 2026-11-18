@@ -26,20 +26,24 @@ public class InplaceSlimPolicyTest {
 
     // ---------------------------------------------------------------- 1. 能不能原地覆盖
 
-    /** HEIF 系与 JPEG 系可以原地覆盖：编码器能产出这些容器的码流 */
+    /** HEIF 系、JPEG 系与 PNG 可以原地覆盖：编码器能产出这些容器的码流 */
     @Test
-    public void inplaceContainersAreHeifAndJpeg() {
+    public void inplaceContainersAreHeifJpegAndPng() {
         assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_20261117_101010.heic"));
         assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_20261117_101010.heif"));
         assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_20261117_101010.jpg"));
         assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_20261117_101010.jpeg"));
+        // PNG 有无损编码器：写回同扩展名既不改容器，也保得住透明通道
+        assertTrue(InplaceSlimPolicy.canOverwriteInPlace("shot.png"));
+        assertTrue(InplaceSlimPolicy.canOverwriteInPlace("shot.PNG"));
     }
 
-    /** 扩展名大小写不影响判定（相册里成片的 .HEIC/.JPG） */
+    /** 扩展名大小写不影响判定（相册里成片的 .HEIC/.JPG/.PNG） */
     @Test
     public void extensionCaseIsIgnored() {
         assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_1.HEIC"));
         assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_1.JpEg"));
+        assertTrue(InplaceSlimPolicy.canOverwriteInPlace("IMG_1.Png"));
     }
 
     /** 完整路径也认：调用方常常把整条路径当文件名传进来 */
@@ -52,10 +56,9 @@ public class InplaceSlimPolicyTest {
         assertFalse(InplaceSlimPolicy.canOverwriteInPlace("/storage/emulated/0/DCIM/v1.2/IMG_9"));
     }
 
-    /** png/webp/bmp/gif 与视频一律不许原地覆盖 */
+    /** webp/bmp/gif 与视频一律不许原地覆盖（没有能写出同名容器的编码器） */
     @Test
     public void otherContainersCannotBeOverwritten() {
-        assertFalse(InplaceSlimPolicy.canOverwriteInPlace("shot.png"));
         assertFalse(InplaceSlimPolicy.canOverwriteInPlace("shot.webp"));
         assertFalse(InplaceSlimPolicy.canOverwriteInPlace("shot.bmp"));
         assertFalse(InplaceSlimPolicy.canOverwriteInPlace("anim.gif"));
@@ -86,12 +89,15 @@ public class InplaceSlimPolicyTest {
         assertEquals("heic", InplaceSlimPolicy.targetFormat("IMG_1.heif"));
         assertEquals("jpg", InplaceSlimPolicy.targetFormat("IMG_1.jpg"));
         assertEquals("jpg", InplaceSlimPolicy.targetFormat("IMG_1.JPEG"));
+        // 原地覆盖 PNG 必须还是 PNG：回 jpg 就意味着透明通道被压成白底
+        assertEquals("png", InplaceSlimPolicy.targetFormat("shot.png"));
+        assertEquals("png", InplaceSlimPolicy.targetFormat("SHOT.PNG"));
+        assertEquals("png", InplaceSlimPolicy.targetFormat("/DCIM/Camera/shot.png"));
     }
 
     /** 不可原地覆盖的容器没有目标格式 */
     @Test
     public void targetFormatIsNullForOtherContainers() {
-        assertNull(InplaceSlimPolicy.targetFormat("shot.png"));
         assertNull(InplaceSlimPolicy.targetFormat("shot.webp"));
         assertNull(InplaceSlimPolicy.targetFormat("VID_1.mp4"));
         assertNull(InplaceSlimPolicy.targetFormat(null));
@@ -120,11 +126,27 @@ public class InplaceSlimPolicyTest {
                 InplaceSlimPolicy.migrationAction("IMG_1.HEIC", "img_1.heic", "heic", true, true));
     }
 
-    /** 同扩展名不重新编码，所以 png/webp 甚至视频也能安全地 RENAME（容器约束不适用） */
+    /**
+     * 同扩展名 png 的侧车预览：直接改名为原路径，码流一点不改（无损、透明通道原样保住）。
+     * 这就是“png 也能原地覆盖”的迁移入口。
+     */
+    @Test
+    public void pngSidecarWithSameExtensionRenames() {
+        assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
+                InplaceSlimPolicy.migrationAction("shot.png", "shot.png", "png", true, true));
+        // 大小写不同的同一个文件也算同扩展名
+        assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
+                InplaceSlimPolicy.migrationAction("shot.PNG", "shot.png", null, true, true));
+        // 预览格式是显式的 png、文件名却是别的：同扩展名判定优先，仍然 RENAME
+        assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
+                InplaceSlimPolicy.migrationAction("shot.png", "shot.png", "Png", true, true));
+    }
+
+    /** 同扩展名不重新编码，所以 webp/视频也能安全地 RENAME（容器约束不适用） */
     @Test
     public void sameExtensionRenamesEvenForNonEncodableContainers() {
         assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
-                InplaceSlimPolicy.migrationAction("shot.png", "shot.png", "png", true, true));
+                InplaceSlimPolicy.migrationAction("clip.webp", "clip.webp", "webp", true, true));
         assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
                 InplaceSlimPolicy.migrationAction("VID_1.mp4", "VID_1.mp4", "hevc", true, true));
     }
@@ -151,15 +173,23 @@ public class InplaceSlimPolicyTest {
                 InplaceSlimPolicy.migrationAction("IMG_1.heif", "IMG_1.jpeg", "jpeg", true, true));
     }
 
-    /** png/webp 等不可原地覆盖的容器：继续留在侧车目录 */
+    /** webp 等不可原地覆盖的容器，以及只能无损重编的 png + 有损预览：继续留在侧车目录 */
     @Test
     public void nonEncodableContainersStaySidecar() {
-        assertEquals(InplaceSlimPolicy.MigrationAction.SIDECAR,
-                InplaceSlimPolicy.migrationAction("shot.png", "shot.jpg", "jpg", true, true));
         assertEquals(InplaceSlimPolicy.MigrationAction.SIDECAR,
                 InplaceSlimPolicy.migrationAction("shot.webp", "shot.jpg", "jpg", true, true));
         assertEquals(InplaceSlimPolicy.MigrationAction.SIDECAR,
                 InplaceSlimPolicy.migrationAction("VID_1.mp4", "VID_1.jpg", "jpg", true, true));
+        // png 配一份有损预览：容器不一致，走“还原原图再重新优化”的 TRANSCODE
+        assertEquals(InplaceSlimPolicy.MigrationAction.TRANSCODE,
+                InplaceSlimPolicy.migrationAction("shot.png", "shot.jpg", "jpg", true, true));
+        assertEquals(InplaceSlimPolicy.MigrationAction.TRANSCODE,
+                InplaceSlimPolicy.migrationAction("shot.png", "shot.heic", "heic", true, true));
+        // 同一族的扩展名只是叫法不同，直接改名即可
+        assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
+                InplaceSlimPolicy.migrationAction("shot.jpeg", "shot.jpg", "jpg", true, true));
+        assertEquals(InplaceSlimPolicy.MigrationAction.RENAME,
+                InplaceSlimPolicy.migrationAction("shot.heif", "shot.heic", "heic", true, true));
     }
 
     /** 预览码流认不出来就不敢转码：宁可继续占侧车目录，也不往原路径写不明字节 */

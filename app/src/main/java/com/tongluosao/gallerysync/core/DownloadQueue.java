@@ -21,6 +21,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
@@ -1794,19 +1795,23 @@ public final class DownloadQueue {
 
     /**
      * 本地高清副本的位置与命名规则。<b>原地模式的格式直接返回原文件本身</b>
-     * （{@code .jpg/.jpeg}，以及 {@code preserveHeic} 打开时的 {@code .heic/.heif}）：
+     * （{@code .jpg/.jpeg}、{@code .png}，以及 {@code preserveHeic} 打开时的 {@code .heic/.heif}）：
      * 预览就覆盖在原路径、原文件名上，不再另起一份。
      *
-     * <p>其余容器（png/webp/bmp/gif/视频）与 {@code preserveHeic=false} 的 HEIC 仍走老侧车规则
-     * （{@code <相册目录>/.gallerysync-slim/<stem>.<ext>}，见 {@link #legacyPreviewPathFor}）：
-     * 这些格式不能原地覆盖 —— 关掉“保留 HEIC”时编码器产出 JPEG，写进 {@code .heic} 就是容器不匹配。
+     * <p>PNG 与 HEIC 的开关无关：它的编码器只会写 PNG（无损、保 alpha），同扩展名覆盖永远成立；
+     * 只有 HEIC 需要看 {@code preserveHeic}，因为关掉时编码器产出 JPEG，写进 {@code .heic}
+     * 就是容器不匹配。其余容器（webp/bmp/gif/视频）与 {@code preserveHeic=false} 的 HEIC 仍走
+     * 老侧车规则（{@code <相册目录>/.gallerysync-slim/<stem>.<ext>}，见 {@link #legacyPreviewPathFor}）。
      *
-     * <p>判定全部交给 {@link InplaceSlimPolicy}，调用方不要再自己拼目录或文件名。规则幂等：
-     * 同一张图片永远得到同一个路径。返回原图路径表示“这个类型就地覆盖”。
+     * <p>判定全部交给 {@link InplaceSlimPolicy} 与 {@link PreviewEncodePolicy}，调用方不要再自己
+     * 拼目录或文件名。规则幂等：同一张图片永远得到同一个路径。返回原图路径表示“这个类型就地覆盖”。
      */
     public static File previewPathFor(File original, boolean preserveHeic) {
         String format = InplaceSlimPolicy.targetFormat(original.getName());
-        if (format != null && ("jpg".equals(format) || preserveHeic)) {
+        if ("png".equals(format) || "jpg".equals(format)) {
+            return InplaceSlimPolicy.targetPath(original);
+        }
+        if ("heic".equals(format) && preserveHeic) {
             return InplaceSlimPolicy.targetPath(original);
         }
         return legacyPreviewPathFor(original, preserveHeic);
@@ -2082,47 +2087,19 @@ public final class DownloadQueue {
         return false;
     }
 
+    /**
+     * JPEG 预览：铺白底把透明压平，再按长边 {@link #PREVIEW_MAX_EDGE} 缩放。
+     *
+     * <p>解码、降采样与等比缩放都在 {@link #decodeBounded(File)} 里；那份数学与 PNG 分支共用，
+     * 不再各写一套（见 {@link PreviewEncodePolicy}）。
+     */
     private static boolean makePreview(File original, File output, boolean preserveMetadata) {
-        Bitmap decoded = null;
         Bitmap oriented = null;
         Bitmap rgb = null;
         try {
-            BitmapFactory.Options bounds = new BitmapFactory.Options();
-            bounds.inJustDecodeBounds = true;
-            BitmapFactory.decodeFile(original.getAbsolutePath(), bounds);
-            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            oriented = decodeBounded(original);
+            if (oriented == null) {
                 return false;
-            }
-            int sample = 1;
-            while (Math.max(bounds.outWidth / sample, bounds.outHeight / sample)
-                    > PREVIEW_MAX_EDGE * 2) {
-                sample *= 2;
-            }
-            BitmapFactory.Options options = new BitmapFactory.Options();
-            options.inSampleSize = sample;
-            decoded = BitmapFactory.decodeFile(original.getAbsolutePath(), options);
-            if (decoded == null) {
-                return false;
-            }
-            Matrix orientation = orientationMatrix(original);
-            if (orientation == null || orientation.isIdentity()) {
-                oriented = decoded;
-            } else {
-                oriented = Bitmap.createBitmap(decoded, 0, 0, decoded.getWidth(),
-                        decoded.getHeight(), orientation, true);
-            }
-            int longEdge = Math.max(oriented.getWidth(), oriented.getHeight());
-            if (longEdge > PREVIEW_MAX_EDGE) {
-                float scale = (float) PREVIEW_MAX_EDGE / (float) longEdge;
-                Bitmap resized = Bitmap.createScaledBitmap(oriented,
-                        Math.max(1, Math.round(oriented.getWidth() * scale)),
-                        Math.max(1, Math.round(oriented.getHeight() * scale)), true);
-                if (resized != oriented) {
-                    if (oriented != decoded) {
-                        oriented.recycle();
-                    }
-                    oriented = resized;
-                }
             }
             rgb = Bitmap.createBitmap(oriented.getWidth(), oriented.getHeight(),
                     Bitmap.Config.ARGB_8888);
@@ -2130,32 +2107,183 @@ public final class DownloadQueue {
             canvas.drawColor(Color.WHITE);
             canvas.drawBitmap(oriented, 0f, 0f, new Paint(Paint.FILTER_BITMAP_FLAG));
             try (FileOutputStream out = new FileOutputStream(output)) {
-                if (!rgb.compress(Bitmap.CompressFormat.JPEG, PREVIEW_JPEG_QUALITY, out)) {
+                if (!writeBitmap(rgb, "jpg", out)) {
                     return false;
                 }
                 out.flush();
                 out.getFD().sync();
             }
             copyCaptureTime(original, output, preserveMetadata);
-            BitmapFactory.Options verify = new BitmapFactory.Options();
-            verify.inJustDecodeBounds = true;
-            BitmapFactory.decodeFile(output.getAbsolutePath(), verify);
-            return verify.outWidth > 0 && verify.outHeight > 0
-                    && Math.max(verify.outWidth, verify.outHeight) <= PREVIEW_MAX_EDGE;
+            return dimensionsWithinLimit(output);
         } catch (Throwable t) {
             Logger.d("event=download_preview_failed reason=" + t);
             output.delete();
             return false;
         } finally {
-            if (rgb != null && !rgb.isRecycled()) {
-                rgb.recycle();
+            recycle(rgb);
+            recycle(oriented);
+        }
+    }
+
+    /**
+     * PNG 预览：<b>不铺白底</b>，ARGB_8888 直接无损写回，透明通道原样保留。
+     *
+     * <p>PNG 里没有 EXIF 可写（也不该为它塞一份伪 EXIF），能做的只有把修改时间搬过来 ——
+     * 否则相册会把这批老图排到扫描当天。iCCP 属于可选增强，见
+     * {@link #createCompressedPreview(File, File, String, Config)} 里的说明：明确跳过。
+     */
+    private static boolean makePngPreview(File original, File output) {
+        Bitmap oriented = null;
+        try {
+            oriented = decodeBounded(original);
+            if (oriented == null) {
+                return false;
             }
-            if (oriented != null && oriented != decoded && !oriented.isRecycled()) {
-                oriented.recycle();
+            try (FileOutputStream out = new FileOutputStream(output)) {
+                if (!writeBitmap(oriented, "png", out)) {
+                    return false;
+                }
+                out.flush();
+                out.getFD().sync();
             }
-            if (decoded != null && !decoded.isRecycled()) {
-                decoded.recycle();
+            preservePreviewTime(original, output);
+            if (!dimensionsWithinLimit(output)) {
+                return false;
             }
+            // 落盘后复核：真的是 PNG，且原来带透明通道时 alpha 没被压平
+            int colorType = pngColorType(output);
+            if (colorType < 0) {
+                Logger.w("event=download_preview_png_invalid output=" + output.getName());
+                return false;
+            }
+            if (oriented.hasAlpha() && !PreviewEncodePolicy.pngColorTypeKeepsAlpha(colorType)) {
+                Logger.w("event=download_preview_png_alpha_lost colorType=" + colorType);
+                return false;
+            }
+            return true;
+        } catch (Throwable t) {
+            Logger.d("event=download_preview_failed reason=" + t);
+            output.delete();
+            return false;
+        } finally {
+            recycle(oriented);
+        }
+    }
+
+    /**
+     * 把原图解码成“方向已摆正、长边不超过 {@link #PREVIEW_MAX_EDGE}”的 ARGB_8888 位图。
+     *
+     * <p>降采样倍率与缩放边长都来自 {@link PreviewEncodePolicy}（纯函数、可单测），JPEG 与 PNG
+     * 两条编码路径共用同一份数学。返回值由调用方负责 {@link #recycle(Bitmap)}；失败返回 {@code null}。
+     */
+    private static Bitmap decodeBounded(File original) {
+        Bitmap current = null;
+        boolean handedOff = false;
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(original.getAbsolutePath(), bounds);
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return null;
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = PreviewEncodePolicy.sampleSize(bounds.outWidth,
+                    bounds.outHeight, PREVIEW_MAX_EDGE);
+            // 显式要 ARGB_8888：RGBA PNG 的透明通道从解码这一步就得留下
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            current = BitmapFactory.decodeFile(original.getAbsolutePath(), options);
+            if (current == null) {
+                return null;
+            }
+            Matrix orientation = orientationMatrix(original);
+            if (orientation != null && !orientation.isIdentity()) {
+                Bitmap rotated = Bitmap.createBitmap(current, 0, 0, current.getWidth(),
+                        current.getHeight(), orientation, true);
+                if (rotated == null) {
+                    return null;
+                }
+                if (rotated != current) {
+                    current.recycle();
+                    current = rotated;
+                }
+            }
+            int width = PreviewEncodePolicy.scaledWidth(current.getWidth(), current.getHeight(),
+                    PREVIEW_MAX_EDGE);
+            int height = PreviewEncodePolicy.scaledHeight(current.getWidth(), current.getHeight(),
+                    PREVIEW_MAX_EDGE);
+            if (width != current.getWidth() || height != current.getHeight()) {
+                Bitmap resized = Bitmap.createScaledBitmap(current, width, height, true);
+                if (resized != null && resized != current) {
+                    current.recycle();
+                    current = resized;
+                }
+            }
+            Bitmap result = current;
+            handedOff = true;
+            return result;
+        } catch (Throwable t) {
+            Logger.d("event=download_preview_decode_failed reason=" + t);
+            return null;
+        } finally {
+            if (!handedOff) {
+                recycle(current);
+            }
+        }
+    }
+
+    /**
+     * 按策略给出的格式名落盘：{@code png} 走无损（quality 被忽略，固定 100），其余按
+     * {@link #PREVIEW_JPEG_QUALITY} 写 JPEG。HEIC 不在这里 —— 它由 HeifWriter 负责。
+     */
+    private static boolean writeBitmap(Bitmap bitmap, String encodeFormat, OutputStream out) {
+        boolean png = PreviewEncodePolicy.keepsAlpha(encodeFormat);
+        Bitmap.CompressFormat compressFormat = png
+                ? Bitmap.CompressFormat.PNG : Bitmap.CompressFormat.JPEG;
+        return bitmap.compress(compressFormat, png ? 100 : PREVIEW_JPEG_QUALITY, out);
+    }
+
+    /**
+     * 读 PNG IHDR 里的 color type（签名后第 25 字节）；不是合法 PNG 时返回 {@code -1}。
+     *
+     * <p>原地覆盖 .png 时容器不能变，透明通道也不能悄悄丢，所以编码完再读一次头部复核。
+     */
+    private static int pngColorType(File file) {
+        byte[] header = new byte[26];
+        try (InputStream in = new FileInputStream(file)) {
+            int total = 0;
+            while (total < header.length) {
+                int count = in.read(header, total, header.length - total);
+                if (count < 0) break;
+                total += count;
+            }
+            if (total < header.length) return -1;
+            // 8 字节签名，随后 4 字节长度 + "IHDR" + 宽(4) + 高(4) + 位深(1) + color type(1)
+            if ((header[0] & 0xff) != 0x89 || header[1] != 'P' || header[2] != 'N'
+                    || header[3] != 'G' || header[4] != 0x0D || header[5] != 0x0A
+                    || header[6] != 0x1A || header[7] != 0x0A) {
+                return -1;
+            }
+            if (header[12] != 'I' || header[13] != 'H' || header[14] != 'D' || header[15] != 'R') {
+                return -1;
+            }
+            return header[25] & 0xff;
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+
+    /** 落盘后的宽高必须读得出来，且长边不超过 {@link #PREVIEW_MAX_EDGE}。 */
+    private static boolean dimensionsWithinLimit(File file) {
+        BitmapFactory.Options verify = new BitmapFactory.Options();
+        verify.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), verify);
+        return verify.outWidth > 0 && verify.outHeight > 0
+                && Math.max(verify.outWidth, verify.outHeight) <= PREVIEW_MAX_EDGE;
+    }
+
+    private static void recycle(Bitmap bitmap) {
+        if (bitmap != null && !bitmap.isRecycled()) {
+            bitmap.recycle();
         }
     }
 
@@ -2213,6 +2341,16 @@ public final class DownloadQueue {
                 String.valueOf(ExifInterface.ORIENTATION_NORMAL));
         // A failed EXIF write aborts preview creation, keeping the original in place.
         target.saveAttributes();
+        preservePreviewTime(original, preview);
+    }
+
+    /**
+     * Re-encoding must not move old photos to today's date when the gallery scans the preview.
+     *
+     * <p>JPEG/HEIC 预览把它写在 EXIF 之后，PNG 预览没有 EXIF 可写，只剩这一步 —— 所以单独抽出来，
+     * 两条路的行为保持一致（失败就中止本次预览，原图不动）。
+     */
+    private static void preservePreviewTime(File original, File preview) throws IOException {
         if (original.lastModified() > 0
                 && !preview.setLastModified(original.lastModified())) {
             throw new IOException("cannot preserve preview file modification time");
@@ -2227,18 +2365,34 @@ public final class DownloadQueue {
         return createCompressedPreview(original, output, true);
     }
 
-    /** Apply the same format and metadata policy to downloads and storage optimization. */
+    /**
+     * Apply the same format and metadata policy to downloads and storage optimization.
+     *
+     * <p>格式名由 {@link PreviewEncodePolicy} 决定（纯函数）：{@code png} 容器必须写回 PNG
+     * （无损、保留 alpha），{@code heic} 容器按“保留 HEIC”开关写 HEIC 或 JPEG，其余落 JPEG。
+     */
     public static boolean createCompressedPreview(File original, File output,
             String originalName, Config config) {
         boolean metadata = config == null || config.isPreserveMetadata();
-        boolean heif = isHeicName(originalName)
-                && (config == null || config.isPreserveHeicFormat());
-        boolean encoded = heif
-                ? HeicPreviewEncoder.encode(original, output, PREVIEW_MAX_EDGE,
-                        PREVIEW_JPEG_QUALITY, metadata)
-                : createCompressedPreview(original, output, metadata);
-        if (encoded && metadata) {
-            embedPreviewColorProfile(original, output, heif);
+        boolean preserveHeic = config == null || config.isPreserveHeicFormat();
+        String format = PreviewEncodePolicy.encodeFormat(
+                InplaceSlimPolicy.targetFormat(originalName), preserveHeic);
+        boolean encoded;
+        if ("png".equals(format)) {
+            // PNG 没有 EXIF 可写；iCCP 要自己拼 chunk（不引新依赖就做不完整），所以这里明确跳过：
+            // 预览像素已按解码结果输出，缺一个 sRGB profile 只影响极端色彩管理场景，不影响相册显示。
+            encoded = createPngPreview(original, output);
+            if (encoded) {
+                Logger.i("event=preview_icc_skipped reason=png_iccp_unsupported format=png");
+            }
+        } else if ("heic".equals(format)) {
+            encoded = HeicPreviewEncoder.encode(original, output, PREVIEW_MAX_EDGE,
+                    PREVIEW_JPEG_QUALITY, metadata);
+        } else {
+            encoded = createCompressedPreview(original, output, metadata);
+        }
+        if (encoded && metadata && !"png".equals(format)) {
+            embedPreviewColorProfile(original, output, "heic".equals(format));
         }
         return encoded;
     }
@@ -2287,6 +2441,33 @@ public final class DownloadQueue {
                 return false;
             }
             return makePreview(original, output, preserveMetadata);
+        } catch (Throwable t) {
+            Logger.d("event=download_preview_failed reason=" + t);
+            output.delete();
+            return false;
+        }
+    }
+
+    /**
+     * Create a lossless PNG preview in a caller-selected path (原地覆盖 PNG 时用).
+     *
+     * <p>与 JPEG 入口共用同一批前置检查（存在、非动图、父目录可写），只换编码器：
+     * 输出必须还是 PNG，否则“原地覆盖 .png”的容器约定就破了。
+     */
+    private static boolean createPngPreview(File original, File output) {
+        if (original == null || output == null || !original.isFile()) {
+            return false;
+        }
+        try {
+            if (isAnimatedImage(original)) {
+                return false;
+            }
+            File parent = output.getAbsoluteFile().getParentFile();
+            if (parent == null || (!parent.isDirectory() && !parent.mkdirs()
+                    && !parent.isDirectory())) {
+                return false;
+            }
+            return makePngPreview(original, output);
         } catch (Throwable t) {
             Logger.d("event=download_preview_failed reason=" + t);
             output.delete();

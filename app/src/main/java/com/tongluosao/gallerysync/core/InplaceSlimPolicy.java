@@ -20,9 +20,14 @@ import java.util.Set;
  */
 public final class InplaceSlimPolicy {
 
-    /** 能原地覆盖的扩展名：HEIF 系与 JPEG 系。其余容器（png/webp/bmp/gif/视频）一律不许动。 */
+    /**
+     * 能原地覆盖的扩展名：HEIF 系、JPEG 系与 PNG。
+     *
+     * <p>PNG 之所以能加入：它有无损编码器（{@code Bitmap.CompressFormat.PNG}），写回同扩展名
+     * 既不改容器也不丢透明通道。其余容器（webp/bmp/gif/视频）仍一律不许动。
+     */
     private static final Set<String> INPLACE_EXTENSIONS =
-            new HashSet<>(Arrays.asList("heic", "heif", "jpg", "jpeg"));
+            new HashSet<>(Arrays.asList("heic", "heif", "jpg", "jpeg", "png"));
 
     /** 预览码流能被解码重编的格式；认不出来就不敢转码，退回侧车。 */
     private static final Set<String> DECODABLE_PREVIEW_FORMATS =
@@ -32,7 +37,7 @@ public final class InplaceSlimPolicy {
     }
 
     /**
-     * 这个容器能不能原地覆盖：只有 {@code .heic/.heif/.jpg/.jpeg} 可以。
+     * 这个容器能不能原地覆盖：{@code .heic/.heif/.jpg/.jpeg/.png} 可以。
      *
      * <p>与 {@link #targetFormat(String)} 严格一致 —— 能原地覆盖就一定能编码出目标格式，
      * 不为“能覆盖但不知道写什么格式”留第二种答案。
@@ -43,10 +48,14 @@ public final class InplaceSlimPolicy {
 
     /**
      * 原地写盘必须使用的编码格式：{@code heic}/{@code heif} → {@code "heic"}，
-     * {@code jpg}/{@code jpeg} → {@code "jpg"}，其它容器（含视频、无扩展名）→ {@code null}。
+     * {@code jpg}/{@code jpeg} → {@code "jpg"}，{@code png} → {@code "png"}，
+     * 其它容器（含视频、无扩展名）→ {@code null}。
      *
      * <p>{@code .heif} 也回 {@code "heic"}：HEIF 容器本来就能装 HEVC 静态图，写进去的码流就是
      * heic 编码，文件名保持 {@code .heif} 不变（原地覆盖不改名）。
+     *
+     * <p>{@code .png} 回 {@code "png"}（而不是 jpg）：PNG 的透明通道只有 PNG 编码能保住，
+     * 写成 JPEG 会把 alpha 压成白底，那是不可逆的降级。
      */
     public static String targetFormat(String fileName) {
         String extension = extension(fileName);
@@ -60,6 +69,8 @@ public final class InplaceSlimPolicy {
             case "jpg":
             case "jpeg":
                 return "jpg";
+            case "png":
+                return "png";
             default:
                 return null;
         }
@@ -81,7 +92,7 @@ public final class InplaceSlimPolicy {
         RENAME,
         /** 扩展名不同，但原容器可编码：解码预览后按原格式重编再覆盖原路径。 */
         TRANSCODE,
-        /** 原容器不可原地覆盖（png/webp/视频/未知）：继续留在侧车目录。 */
+        /** 原容器不可原地覆盖，或只能无损重编而不值得转码（webp/bmp/视频/png+有损预览）：继续留在侧车目录。 */
         SIDECAR,
         /** 没有预览、或预览并不更小：什么都不做。 */
         SKIP
@@ -94,11 +105,14 @@ public final class InplaceSlimPolicy {
      * <ol>
      *   <li>预览不存在，或并不比原图小 → {@link MigrationAction#SKIP}；</li>
      *   <li>预览与原图同扩展名 → {@link MigrationAction#RENAME}：直接把预览搬到原路径即可，
-     *       码流不变、容器约束不适用（连 png 这种不能编码的容器也安全）；</li>
+     *       码流不变、容器约束不适用（png 这类只能无损写回的容器也安全）；</li>
      *   <li>扩展名不同、原格式可编码（heic/jpg）、且预览码流能解码 → {@link MigrationAction#TRANSCODE}；</li>
-     *   <li>其余情况（png/webp/视频/未知预览格式/没有原文件名）→ {@link MigrationAction#SIDECAR}，
-     *       宁可继续占侧车目录，也不把不相干的字节写到原路径上。</li>
+     *   <li>其余情况（webp/视频/png 配一份有损预览/未知预览格式/没有原文件名）→
+     *       {@link MigrationAction#SIDECAR}，宁可继续占侧车目录，也不把不相干的字节写到原路径上。</li>
      * </ol>
+     *
+     * <p>png 不参与 {@code TRANSCODE}：它只有无损编码，把有损 JPEG 预览转成 PNG 只会更大，
+     * 而且先降质量再“无损”存下来没有任何收益。png 只走同扩展名的 {@code RENAME}。
      *
      * @param previewFormat 预览的实际编码格式，可空；为空时按预览文件名的扩展名判断
      */
@@ -112,13 +126,37 @@ public final class InplaceSlimPolicy {
             // 连原文件名都认不出来（空串/null/无扩展名）：不猜，保持侧车原样
             return MigrationAction.SIDECAR;
         }
-        if (originalExtension.equals(extension(previewName))) {
+        if (sameFamily(originalExtension, extension(previewName))) {
             return MigrationAction.RENAME;
         }
-        if (targetFormat(originalName) != null && isDecodable(previewFormat, previewName)) {
+        String target = targetFormat(originalName);
+        if (target != null && isDecodable(previewFormat, previewName)) {
             return MigrationAction.TRANSCODE;
         }
         return MigrationAction.SIDECAR;
+    }
+
+    /**
+     * 同一族扩展名视为等价：{@code .jpg}/{@code .jpeg}、{@code .heic}/{@code .heif}。
+     *
+     * <p>这几对只是叫法不同，码流容器完全兼容，预览可以直接改名回原路径，
+     * 不必走“先还原原图再重新优化”的重路径。
+     */
+    static boolean sameFamily(String first, String second) {
+        if (first == null || second == null) {
+            return false;
+        }
+        return familyOf(first).equals(familyOf(second));
+    }
+
+    private static String familyOf(String extension) {
+        if ("jpeg".equals(extension)) {
+            return "jpg";
+        }
+        if ("heif".equals(extension)) {
+            return "heic";
+        }
+        return extension;
     }
 
     /** 上传分类结论。 */
