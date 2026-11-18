@@ -112,6 +112,13 @@ public final class DownloadQueue {
     private final OriginalStore mOriginalStore;
     /** 用户主动删掉的垃圾副本的远端路径账本，见 {@link RemoteSuppress} */
     private final RemoteSuppress mRemoteSuppress;
+    /**
+     * 「远端内容本身坏了」的台账，见 {@link DamagedRemotes}。
+     *
+     * <p>与 {@link #mRemoteSuppress} 是两件事：那个是"用户不要了"，这个是"服务端给的是坏字节"。
+     * 两者都只在<b>计划阶段</b>拦自动排期，用户手动"下载原图"照样能试一次。
+     */
+    private final DamagedRemotes mDamagedRemotes;
     private final Object mLock = new Object();
 
     /** 认出但还没下完的项。计划线程添、worker 线程取 */
@@ -328,6 +335,7 @@ public final class DownloadQueue {
         mConfig = config;
         mOriginalStore = OriginalStore.get(mContext);
         mRemoteSuppress = RemoteSuppress.get(mContext);
+        mDamagedRemotes = DamagedRemotes.get(mContext);
         mDownloadTarget = OriginalStore.targetKey(config);
         load();
         mPlanner = new Thread(this::plannerLoop, "MiGallerySync-download-plan");
@@ -964,6 +972,14 @@ public final class DownloadQueue {
                 Logger.i("event=download_skip_suppressed remote=" + remotePath);
                 continue;
             }
+            DamagedRemotes.Damage damage = damageOf(mDamagedRemotes, target, remotePath);
+            if (damage != null) {
+                // 远端这份对象本身是坏的（服务端只回全 0 字节一类）：再下一次还是同一份坏字节。
+                // 这条闸只拦自动补齐；用户手动"下载原图"不走这里，仍然可以尝试一次。
+                Logger.i("event=download_skip_damaged row=unknown path=" + remotePath
+                        + " reason=" + damage.reason() + " size=" + damage.size());
+                continue;
+            }
             File normalLocal = downloadDestinationFor(config, remotePath, relative, entry.size);
             OriginalStore.Record occupied = mOriginalStore.findByLocalPath(normalLocal);
             if (occupied != null && !remotePath.equals(occupied.remotePath)) {
@@ -1043,6 +1059,7 @@ public final class DownloadQueue {
         int planned = 0;
         int unmapped = 0;
         int suppressed = 0;
+        int damaged = 0;
         for (OriginalStore.Record record : records) {
             if (!isPolicyCurrent(generation) || planned >= MAX_DOWNLOADS_PER_ROUND) {
                 // 本轮额度用完就停：剩下的下个相册事件再说，不能一次把 1.2 万条都过一遍
@@ -1052,6 +1069,16 @@ public final class DownloadQueue {
                 // 用户主动删掉的副本：远端还在，但它已经不是"缺失的照片"。计划期就拦住 ——
                 // 否则每轮都会排进队列、worker 里再跳过一次，白占 200 条配额还刷日志。
                 suppressed++;
+                continue;
+            }
+            DamagedRemotes.Damage damage = damageOf(mDamagedRemotes, target, record.remotePath);
+            if (damage != null) {
+                // 远端内容坏过（长度对、字节全 0 一类）：这一行永远下不成，别再占配额。
+                // 只拦自动排期 —— 用户手动"下载原图"是显式意图，仍然允许试一次。
+                damaged++;
+                Logger.i("event=download_skip_damaged row=" + row(record)
+                        + " path=" + record.remotePath + " reason=" + damage.reason()
+                        + " size=" + damage.size());
                 continue;
             }
             File albumDestination = AutoDownloadPolicy.targetPath(layout, config.getRemoteRoot(),
@@ -1111,6 +1138,12 @@ public final class DownloadQueue {
         if (suppressed > 0) {
             // 用户删掉的副本：远端还在，但账本已经写过"别再下回来"。这里只报条数。
             Logger.i("event=auto_download_skip reason=suppressed count=" + suppressed
+                    + " phase=" + phase);
+        }
+        if (damaged > 0) {
+            // 远端内容坏过的行：账本已经写过"这份字节是坏的"。逐条已在上面记了 row/path，
+            // 这里再按条数汇总一次，免得日志里只看到一堆行号、看不出这一轮到底被拦了多少。
+            Logger.i("event=auto_download_skip reason=damaged count=" + damaged
                     + " phase=" + phase);
         }
         if (planned > 0) {
@@ -1274,6 +1307,30 @@ public final class DownloadQueue {
      */
     static boolean mayDownload(RemoteSuppress ledger, Config config, String remotePath) {
         return ledger == null || !ledger.isSuppressed(config, remotePath);
+    }
+
+    /**
+     * 这条远端路径是不是已被判定为"内容坏了"（命中则返回那条记录，否则 null）。
+     *
+     * <p>与 {@link #mayDownload} 并列、但性质不同：那边是"用户不要了"，这边是"服务端给的是
+     * 坏字节"（长度对、内容全 0 一类，见 {@link DamagedRemotes#isContentDamage}）。坏字节不会
+     * 因为等一会儿自己变好，所以计划阶段直接跳过，不再白下一次。
+     *
+     * <p>只拦<b>自动排期</b>（{@link #walk} 与 {@link #planAutoDownloads}）：用户手动点
+     * "下载原图"是显式意图，仍然允许尝试一次；真下成了由 {@link DamagedRemotes#forget} 撤销记录。
+     * 账本不可用（null/读坏）时一律返回 null，行为与引入台账之前完全一致。
+     */
+    static DamagedRemotes.Damage damageOf(DamagedRemotes ledger, String target, String remotePath) {
+        if (ledger == null) {
+            return null;
+        }
+        try {
+            return ledger.find(target, remotePath);
+        } catch (Throwable t) {
+            // 台账只是优化：它自己出问题绝不能挡住计划线程
+            Logger.w("event=damaged_remote_skip reason=ledger_error path=" + remotePath);
+            return null;
+        }
     }
 
     /** Whether the host still lists a local path (exact path, or its resolved canonical form). */
@@ -1892,6 +1949,9 @@ public final class DownloadQueue {
             raw.delete();
             raw = null;
             markDone(pending.remotePath, pending.target);
+            // 真下成了就说明远端这份对象已经不坏：把台账里那条撤掉，恢复自动调度
+            // （手动"下载原图"是唯一能走到这里的路子，用户修好服务端后不必手动清账）
+            mDamagedRemotes.forget(pending.target, pending.remotePath, "download_ok");
             // 已经下成了：这一条不需要"在不在"的结论了，别让它留在缓存里占位
             mProbeCache.forget(pending.remotePath, pending.size);
             boolean rowAdopted = false;
@@ -3252,6 +3312,13 @@ public final class DownloadQueue {
             Logger.w("event=auto_download_failed row=" + (pending.rowId == null ? "unknown"
                     : pending.rowId) + " kind=" + kind.name().toLowerCase(Locale.US)
                     + " attempts=" + count + " reason=" + reason);
+        }
+        if (DamagedRemotes.isContentDamage(cause)) {
+            // 内容类损坏（长度对、字节全 0 / 摘要对不上）不会自愈：记进台账，后续自动排期
+            // 一律跳过这个远端路径。网络/超时/403 等一律不记 —— 那些等一会儿就好了。
+            // 手动"下载原图"仍可尝试一次；真下成了由 markDone 之后的 forget 撤销记录。
+            mDamagedRemotes.markDamaged(pending.target, pending.remotePath, cause.wire(),
+                    pending.size);
         }
     }
 
