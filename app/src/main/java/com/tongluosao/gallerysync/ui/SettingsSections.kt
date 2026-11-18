@@ -21,6 +21,7 @@ object SettingId {
     val REPLACE_MODE = Config.KEY_REPLACE_MODE
     val REMOTE_LAYOUT = Config.KEY_REMOTE_LAYOUT
     val WIFI_ONLY = Config.KEY_WIFI_ONLY
+    val AUTO_DOWNLOAD = Config.KEY_AUTO_DOWNLOAD
     val VERIFY_ASYNC = Config.KEY_VERIFY_ASYNC
     val SKIP_EXISTING_REMOTE = Config.KEY_SKIP_EXISTING_REMOTE
     val UPLOAD_CONCURRENCY = Config.KEY_UPLOAD_CONCURRENCY
@@ -139,6 +140,7 @@ enum class SettingsSection(val title: String, val items: List<String>) {
             SettingId.TEST_CONNECTION,
             SettingId.REPLACE_MODE,
             SettingId.WIFI_ONLY,
+            SettingId.AUTO_DOWNLOAD,
             SettingId.REMOTE_LAYOUT,
             SettingId.VERIFY_ASYNC,
             SettingId.SKIP_EXISTING_REMOTE,

@@ -144,10 +144,25 @@ public final class Config {
      * 用户要的就是"省电省性能"，逐字节校验要完整下载一遍远端文件，那是流量意义上的灾难。
      */
     public static final boolean DEFAULT_SKIP_EXISTING_REMOTE = true;
+    /**
+     * "把注册表里只有远端副本的那些行（{@code REMOTE_ONLY}）自动从 WebDAV 下回来"。
+     *
+     * <p>与"自动下载高质量图"是同一件事：接管（{@code takeover}）只登记、不下字节，
+     * 登记完之后本地一张照片都没有，必须有人真的去自建 WebDAV 拉。默认开启，因为
+     * 用户接管的意图就是"让模块管我整库"，但真正动网络还要过相册自己的原生下载事件、
+     * 仅 Wi-Fi、每轮上限与失败上限这四道闸。
+     */
+    public static final String KEY_AUTO_DOWNLOAD = "auto_download_remote_only";
+
     /** 默认保留优化图与 HQ 下载原图中的元数据。 */
     public static final boolean DEFAULT_PRESERVE_METADATA = true;
     /** 默认保留 HEIC 原格式；设备不支持处理时也应保留原件。 */
     public static final boolean DEFAULT_PRESERVE_HEIC_FORMAT = true;
+    /**
+     * 默认开启：见 {@link #KEY_AUTO_DOWNLOAD}。关着的时候 {@code REMOTE_ONLY} 行
+     * 永远不会被排进下载队列，日志里是 {@code event=auto_download_skip reason=disabled}。
+     */
+    public static final boolean DEFAULT_AUTO_DOWNLOAD = true;
     /** 默认与相册共用一条记录：升级后行为不变，不想让相册那条记录被改的人自己去开分开记录 */
     public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
 
@@ -168,6 +183,7 @@ public final class Config {
     private final boolean skipExistingRemote;
     private final boolean preserveMetadata;
     private final boolean preserveHeicFormat;
+    private final boolean autoDownload;
     private final String localFlagMode;
 
     private Config(SharedPreferences prefs) {
@@ -188,6 +204,7 @@ public final class Config {
             skipExistingRemote = DEFAULT_SKIP_EXISTING_REMOTE;
             preserveMetadata = DEFAULT_PRESERVE_METADATA;
             preserveHeicFormat = DEFAULT_PRESERVE_HEIC_FORMAT;
+            autoDownload = DEFAULT_AUTO_DOWNLOAD;
             localFlagMode = DEFAULT_LOCAL_FLAG_MODE;
         } else {
             replaceMode = prefs.getString(KEY_REPLACE_MODE, DEFAULT_REPLACE_MODE);
@@ -209,6 +226,7 @@ public final class Config {
             preserveMetadata = prefs.getBoolean(KEY_PRESERVE_METADATA, DEFAULT_PRESERVE_METADATA);
             preserveHeicFormat = prefs.getBoolean(
                     KEY_PRESERVE_HEIC_FORMAT, DEFAULT_PRESERVE_HEIC_FORMAT);
+            autoDownload = prefs.getBoolean(KEY_AUTO_DOWNLOAD, DEFAULT_AUTO_DOWNLOAD);
             localFlagMode = readFlagMode(prefs);
         }
     }
@@ -367,6 +385,11 @@ public final class Config {
         return preserveHeicFormat;
     }
 
+    /** true 表示允许把注册表里 {@code REMOTE_ONLY} 的行按需从 WebDAV 下回来 */
+    public boolean isAutoDownload() {
+        return autoDownload;
+    }
+
     /** true 表示不写相册的 localFlag，改用模块自己按目标分开的记录 */
     public boolean isLocalFlagPerTarget() {
         return FLAG_MODE_PER_TARGET.equals(localFlagMode);
@@ -387,6 +410,7 @@ public final class Config {
                 + ", workers=" + uploadConcurrency
                 + ", verifyAsync=" + verifyAsync
                 + ", skipRemote=" + skipExistingRemote
+                + ", autoDownload=" + autoDownload
                 + ", flagMode=" + localFlagMode
                 + ", maxUpload=" + describeBytes(maxUploadBytes)
                 + "}";

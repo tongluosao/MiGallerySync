@@ -632,8 +632,30 @@ public final class OriginalStore {
         return paths;
     }
 
-    private Record recordForRemotePathLocked(String target, String remotePath) {
-        String indexKey = pathKey(target, remotePath);
+    /**
+     * 这个 target 下所有记录的只读快照（插入序）。
+     *
+     * <p>给"按注册表把 {@code REMOTE_ONLY} 行排进下载队列"用：那个循环要逐行看状态、远端路径
+     * 与长度，而 {@link #findByRemotePath} 是 O(全表) 的单条查询，逐行调就成平方了。
+     * 返回的是不可变副本，调用方拿着它慢慢判，不会卡住注册表的写锁。
+     */
+    public java.util.List<Record> recordsForTarget(Config config) {
+        java.util.List<Record> out = new java.util.ArrayList<>();
+        if (config == null) {
+            return out;
+        }
+        String target = targetKey(config);
+        synchronized (mLock) {
+            for (Record record : mRecords.values()) {
+                if (target.equals(record.target)) {
+                    out.add(record);
+                }
+            }
+        }
+        return java.util.Collections.unmodifiableList(out);
+    }
+
+    private Record recordForRemotePathLocked(String target, String remotePath) {        String indexKey = pathKey(target, remotePath);
         if (indexKey == null) {
             return null;
         }
@@ -1346,6 +1368,66 @@ public final class OriginalStore {
             }
         } catch (Throwable failure) {
             Logger.e("event=original_store_mark_restored_failed", failure);
+            return null;
+        }
+    }
+
+    /**
+     * 自动下载把 {@code REMOTE_ONLY} 行的原图落回相册之后，把它升级成 {@link LocalState#ORIGINAL}。
+     *
+     * <p>为什么不复用 {@link #registerDownloadedOriginal}：那个入口走 {@code merge(old, incoming)}，
+     * 而 merge 的规则是"新登记里的 ORIGINAL 不能覆盖已登记的状态"（见 merge 里 state 那一行），
+     * 于是 {@code REMOTE_ONLY} 会被原样留下 —— 上传侧继续把它当"只有远端"，下次扫描又排一遍。
+     * 这里显式写状态，并顺手把这一次真的读过的字节摘要补进记录（接管登记时 sha256 是 null）。
+     *
+     * <p>校验放在写锁之外：长度必须与远端一致、给了摘要就必须与本地字节一致。任何一项对不上
+     * 都返回 {@code null} 且**不改注册表** —— 失败由下载队列按次数上限重试，不能把状态提前改掉。
+     *
+     * @param sha256 刚下载/刚核对过的本地字节摘要，可为 null（保持记录里已有的值）
+     * @return 更新后的记录；找不到记录、注册表不健康、校验失败都返回 null
+     */
+    public Record markAutoDownloaded(Config config, Record expected, File localFile, String sha256) {
+        if (config == null || expected == null || localFile == null) {
+            return null;
+        }
+        try {
+            if (localFile.length() != expected.originalLength || expected.originalLength <= 0L) {
+                Logger.w("event=original_store_auto_download_rejected reason=length_mismatch path="
+                        + localFile + " expected=" + expected.originalLength
+                        + " actual=" + localFile.length());
+                return null;
+            }
+            String digest = clean(sha256);
+            if (digest != null) {
+                digest = digest.toLowerCase(Locale.US);
+                if (!isSha256(digest) || !digest.equals(sha256(localFile))) {
+                    Logger.w("event=original_store_auto_download_rejected reason=digest_mismatch path="
+                            + localFile);
+                    return null;
+                }
+            }
+            synchronized (mLock) {
+                if (!mHealthy) {
+                    return null;
+                }
+                Record latest = findForUpdateLocked(targetKey(config), expected);
+                if (latest == null) {
+                    return null;
+                }
+                // withRestoredLocal(clearPreview) 已经清掉预览字段与派生别名，只差把摘要写进去
+                Record restored = latest.withRestoredLocal(localFile, true);
+                Record updated = new Record(restored.target, restored.remotePath,
+                        restored.originalLength, digest == null ? restored.sha256 : digest,
+                        restored.originalLocalPath, restored.previewLocalPath, restored.rowId,
+                        restored.sha1, restored.originalLocalMtime, restored.derivedPaths,
+                        restored.identities, restored.localAliases, restored.derivedHashes,
+                        LocalState.ORIGINAL, 0L, null, null);
+                putRecordLocked(recordKey(updated), updated);
+                saveLocked();
+                return updated;
+            }
+        } catch (Throwable failure) {
+            Logger.e("event=original_store_auto_download_failed", failure);
             return null;
         }
     }

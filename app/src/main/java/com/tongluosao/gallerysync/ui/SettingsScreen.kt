@@ -241,6 +241,15 @@ private fun PrefItem(id: String, model: SettingsModel) {
             summary = stringResource(R.string.summary_wifi_only)
         )
 
+        // 文案直接写中文：新增项没有对应的 R.string（与“接管”那一项同一处理），
+        // 本模块界面只有中文一种语言
+        SettingId.AUTO_DOWNLOAD -> SwitchPreference(
+            checked = model.autoDownload,
+            onCheckedChange = model::onAutoDownloadChange,
+            title = "自动下载高质量原图（WebDAV）",
+            summary = "把接管登记、只在 WebDAV 上有原图的行自动下回相册；仅 Wi-Fi，每轮限量，失败三次后暂停"
+        )
+
         SettingId.REMOTE_LAYOUT -> OverlayDropdownPreference(
             items = listOf(
                 stringResource(R.string.layout_album),

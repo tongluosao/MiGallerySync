@@ -231,14 +231,30 @@ public final class DownloadQueue {
         final long size;
         final String target;
         final String localPath;
+        /**
+         * 由注册表 {@code REMOTE_ONLY} 行排进来的下载：落地后要把该行升级成 ORIGINAL，
+         * 并把相册 cloud 表那一行的 localFile 指回原路径（而不是让扫描器再建一行）。
+         */
+        final boolean autoDownload;
+        /** 接管登记的相册行 id / sha1，仅 autoDownload 时非空（可能仍为 null） */
+        final String rowId;
+        final String sha1;
 
         Pending(String remotePath, String relativePath, long size, String target,
                 String localPath) {
+            this(remotePath, relativePath, size, target, localPath, false, null, null);
+        }
+
+        Pending(String remotePath, String relativePath, long size, String target,
+                String localPath, boolean autoDownload, String rowId, String sha1) {
             this.remotePath = remotePath;
             this.relativePath = relativePath;
             this.size = size;
             this.target = target;
             this.localPath = localPath;
+            this.autoDownload = autoDownload;
+            this.rowId = rowId;
+            this.sha1 = sha1;
         }
     }
 
@@ -665,6 +681,18 @@ public final class DownloadQueue {
                 }
                 // A native start can discover a large remote tree. Continue only while each
                 // bounded listing round finds new work, and cap work for one native event.
+                //
+                // 注册表驱动的"补原图"先单独排一轮：它只读本地注册表，不依赖远端枚举，
+                // 所以远端树再大、单次 PROPFIND 再慢，也不会把这条链路一起拖住。
+                try {
+                    List<Pending> auto = new ArrayList<>();
+                    planAutoDownloads(config, generation, auto);
+                    if (!auto.isEmpty()) {
+                        enqueue(auto, generation);
+                    }
+                } catch (Throwable t) {
+                    Logger.w("event=auto_download_plan_failed detail=" + t);
+                }
                 for (int round = 0; round < MAX_BATCH_ROUNDS && mRunning; round++) {
                     if (!isWorkCurrent(config, generation)) {
                         break;
@@ -722,6 +750,11 @@ public final class DownloadQueue {
             Logger.d("event=download_round_empty");
             return 0;
         }
+        return enqueue(found, generation);
+    }
+
+    /** @return 真正进了队列的条数（已排过/已落地的会被跳过） */
+    private int enqueue(List<Pending> found, int generation) {
         int added = 0;
         synchronized (mLock) {
             if (generation != mWorkGeneration || !mRunning) {
@@ -821,6 +854,163 @@ public final class DownloadQueue {
             }
             out.add(new Pending(remotePath, relative, entry.size, target,
                     normalLocal.getAbsolutePath()));
+        }
+    }
+
+    /**
+     * 按注册表把 {@code REMOTE_ONLY} 的行排进下载队列。
+     *
+     * <p>平板 HyperOS 1 上"接管"登记的行 {@code localFile} 是空的，{@link #walk} 的
+     * "宿主还知道这个路径"判据永远不成立，于是原图虽然只在我们的 WebDAV 上却一张都下不回来。
+     * 这里直接用注册表里已知的 {@code remotePath} + {@code originalLength} 排任务，不再等
+     * 远端目录枚举（接管已经证明过远端对象存在且长度一致）。
+     *
+     * <p>安全条件全部在 {@link AutoDownloadPolicy} 里（纯函数、可单测），这里只负责查状态、
+     * 记账与写日志。判据按条数汇总，不逐行刷屏：1.2 万条里绝大多数是"已经不是 REMOTE_ONLY"。
+     *
+     * @param out 与本轮远端枚举共用的待下载列表，总数同样不得越过 {@link #MAX_DOWNLOADS_PER_ROUND}
+     */
+    private void planAutoDownloads(Config config, int generation, List<Pending> out) {
+        if (!config.isAutoDownload()) {
+            Logger.i("event=auto_download_skip reason=disabled");
+            return;
+        }
+        // 这条链路只走 Wi-Fi/以太网：与"仅 Wi-Fi 上传"同一个判定，但不看 wifiOnly 开关 ——
+        // 1.2 万张原图自动回填绝不能默认烧蜂窝流量。
+        boolean wifi = NetGuard.canUpload(mContext, true);
+        if (!wifi) {
+            Logger.i("event=auto_download_skip reason=wifi_only");
+            return;
+        }
+        String layout = config.getRemoteLayout();
+        if (!Config.LAYOUT_ALBUM.equals(layout)) {
+            Logger.i("event=auto_download_skip reason=layout layout=" + layout);
+            return;
+        }
+        List<OriginalStore.Record> records = mOriginalStore.recordsForTarget(config);
+        if (records.isEmpty()) {
+            Logger.d("event=auto_download_skip reason=empty_registry");
+            return;
+        }
+        String target = OriginalStore.targetKey(config);
+        File primaryRoot = new File(PRIMARY_STORAGE_ROOT);
+        Set<String> queued = new HashSet<>();
+        for (Pending pending : out) {
+            queued.add(pending.remotePath);
+        }
+        Map<AutoDownloadPolicy.Decision, Integer> skipped = new LinkedHashMap<>();
+        int planned = 0;
+        int unmapped = 0;
+        for (OriginalStore.Record record : records) {
+            if (!isPolicyCurrent(generation) || planned >= MAX_DOWNLOADS_PER_ROUND) {
+                // 本轮额度用完就停：剩下的下个相册事件再说，不能一次把 1.2 万条都过一遍
+                break;
+            }
+            File destination = AutoDownloadPolicy.targetPath(layout, config.getRemoteRoot(),
+                    record.remotePath, primaryRoot);
+            if (destination == null) {
+                unmapped++;
+                continue;
+            }
+            boolean exists = destination.isFile();
+            long existingLength = exists ? destination.length() : -1L;
+            boolean scheduled;
+            boolean done;
+            int failures;
+            synchronized (mLock) {
+                scheduled = isScheduledLocked(record.remotePath);
+                done = mDone.containsKey(record.remotePath);
+                Integer count = mFailures.get(record.remotePath);
+                failures = count == null ? 0 : count;
+            }
+            AutoDownloadPolicy.Decision decision = AutoDownloadPolicy.decide(
+                    true, wifi, true,
+                    record.getLocalState() == OriginalStore.LocalState.REMOTE_ONLY,
+                    scheduled, done, exists, existingLength, record.originalLength,
+                    failures, MAX_FAIL_PER_PATH, planned, MAX_DOWNLOADS_PER_ROUND);
+            if (decision == AutoDownloadPolicy.Decision.PLAN) {
+                if (!queued.add(record.remotePath)) {
+                    continue;
+                }
+                out.add(new Pending(record.remotePath,
+                        AutoDownloadPolicy.relativePath(config.getRemoteRoot(), record.remotePath),
+                        record.originalLength, target, destination.getAbsolutePath(), true,
+                        record.rowId, record.sha1));
+                planned++;
+            } else if (decision == AutoDownloadPolicy.Decision.PROMOTE_EXISTING) {
+                // 目标文件已经是同长度：说明字节早就在了，登记成 ORIGINAL 即可，不重复下载。
+                if (promoteExistingOriginal(config, record, destination)) {
+                    planned++;
+                    Logger.i("event=auto_download_done row=" + row(record)
+                            + " path=" + destination.getAbsolutePath()
+                            + " bytes=" + destination.length() + " source=existing");
+                }
+            } else {
+                Integer count = skipped.get(decision);
+                skipped.put(decision, count == null ? 1 : count + 1);
+            }
+        }
+        if (unmapped > 0) {
+            Logger.w("event=auto_download_skip reason=unmapped_remote count=" + unmapped);
+        }
+        if (planned > 0) {
+            Logger.i("event=auto_download_planned count=" + planned
+                    + " queued=" + out.size() + " catalog=" + records.size());
+        }
+        for (Map.Entry<AutoDownloadPolicy.Decision, Integer> entry : skipped.entrySet()) {
+            String reason = autoDownloadReason(entry.getKey());
+            String line = "event=auto_download_skip reason=" + reason + " count=" + entry.getValue();
+            if (entry.getKey() == AutoDownloadPolicy.Decision.SKIP_NOT_REMOTE_ONLY) {
+                // 稳态：整库都是 ORIGINAL 时这一条每轮都会出现，压到 debug
+                Logger.d(line);
+            } else {
+                Logger.i(line);
+            }
+        }
+    }
+
+    /** 日志里的行标识：优先相册行号，其次 sha1（接管行两者都可能缺，缺了写 unknown）。 */
+    private static String row(OriginalStore.Record record) {
+        if (record == null) {
+            return "unknown";
+        }
+        if (record.rowId != null && !record.rowId.isEmpty()) {
+            return record.rowId;
+        }
+        return record.sha1 == null ? "unknown" : record.sha1;
+    }
+
+    /**
+     * 把"本地已经有同长度原图"的 {@code REMOTE_ONLY} 行直接升级成 ORIGINAL。
+     *
+     * <p>摘要在这里算：这一步每个文件一辈子只发生一次（升级后状态就不是 REMOTE_ONLY 了），
+     * 而上传侧只有拿到真实摘要才敢把这份文件当"已备份的原图"。
+     */
+    private boolean promoteExistingOriginal(Config config, OriginalStore.Record record,
+            File destination) {
+        String digest = null;
+        try {
+            digest = sha256(destination);
+        } catch (IOException e) {
+            Logger.d("event=auto_download_hash_failed path=" + destination + " reason=" + e);
+        }
+        return mOriginalStore.markAutoDownloaded(config, record, destination, digest) != null;
+    }
+
+    /** 纯字符串映射，日志里的 reason 必须一眼能认出来。 */
+    private static String autoDownloadReason(AutoDownloadPolicy.Decision decision) {
+        switch (decision) {
+            case SKIP_DISABLED: return "disabled";
+            case SKIP_NOT_WIFI: return "wifi_only";
+            case SKIP_LAYOUT: return "layout";
+            case SKIP_NOT_REMOTE_ONLY: return "not_remote_only";
+            case SKIP_ALREADY_SCHEDULED: return "already_scheduled";
+            case SKIP_ALREADY_DONE: return "already_done";
+            case SKIP_FAILURE_LIMIT: return "failure_limit";
+            case SKIP_ROUND_LIMIT: return "round_limit";
+            case SKIP_EXISTS_DIFFERENT: return "exists_different_length";
+            case SKIP_BAD_LENGTH: return "bad_length";
+            default: return "unknown";
         }
     }
 
@@ -1100,9 +1290,15 @@ public final class DownloadQueue {
         File raw = null;
         File staged = null;
         File compressed = null;
+        String publishedDigest = null;
         long registeredOriginalMtime = 0L;
         try {
             ensureWorkCurrent(config, generation);
+            if (pending.autoDownload && !NetGuard.canUpload(mContext, true)) {
+                // 计划之后网络从 Wi-Fi 掉到蜂窝：取消这一项，既不算失败也不动注册表，
+                // 回到 Wi-Fi 后同一项还会被重排（Pending 留在队里）。
+                throw new DownloadCancelledException();
+            }
             if (hasValidRegisteredSlimPreview(config, pending.target, pending.remotePath,
                     normalDest)) {
                 Logger.d("event=download_skip_registered_slim_preview remote="
@@ -1129,7 +1325,9 @@ public final class DownloadQueue {
                 ok = true;
                 return;
             }
-            boolean qualityRequested = isHighQualityRequested()
+            // 注册表接管行要的是"真的把原图取回来"：不走压缩预览分支，否则落地的是一张
+            // 预览、状态也不会变成 ORIGINAL，下一轮又排一遍。
+            boolean qualityRequested = !pending.autoDownload && isHighQualityRequested()
                     && isCompressibleExtension(normalDest.getName()) && pending.size > 0L;
             if (normalDest.exists()) {
                 // 本地已经有同名文件：一律不覆盖。用户可能自己改过它，也可能同名但是别的东西
@@ -1271,6 +1469,7 @@ public final class DownloadQueue {
                 registeredOriginalMtime = restoreRegisteredOriginalMtime(pending, config,
                         normalDest, raw);
                 String digest = sha256(raw);
+                publishedDigest = digest;
                 // 原路径上可能还留着第 3 波瘦身写下的原地预览：整份原图正是要把它顶掉。
                 // 只认“这条记录自己登记过的副本”，用户文件与计划之后出现的文件仍按失败处理。
                 boolean replacingInplacePreview = false;
@@ -1307,9 +1506,14 @@ public final class DownloadQueue {
             raw.delete();
             raw = null;
             markDone(pending.remotePath, pending.target);
+            boolean rowAdopted = false;
+            if (pending.autoDownload) {
+                // 接管行本来就有一行相册记录：把 localFile 精确指回原路径，绝不让扫描器建第二行。
+                rowAdopted = adoptAutoDownloadedRow(pending, config, dest, publishedDigest);
+            }
             // 原地发布已经把既有行精确改成“本地文件 = 原路径、缩略图为空”：这时再交给宿主
             // 扫描器只会让它在同一路径上多建一行，所以原地成功分支刻意跳过通知。
-            if (!inplaceCommitted) {
+            if (!inplaceCommitted && !rowAdopted) {
                 // 质量分支的 dest 在 .gallerysync-slim 里时只能挂到既有云行，不能交给宿主扫描器
                 notifyHostAfterPublish(dest, normalDest);
             }
@@ -1356,6 +1560,43 @@ public final class DownloadQueue {
                 mLock.notifyAll();
             }
         }
+    }
+
+    /**
+     * 一次"按注册表自动下载"落地之后的收尾：注册表升级成 ORIGINAL + 既有云行指回原路径。
+     *
+     * <p>顺序要紧：先改注册表（状态与摘要），再改相册行。两步都是幂等的，任一步失败都不会
+     * 让已经落地的文件被删；注册表改失败时只留一条 warning，`mDone` 与本地文件仍然保证
+     * 下一轮不会重复下载（下一轮会走 {@code PROMOTE_EXISTING} 把状态补上）。
+     *
+     * @return 是否真的改到了相册 cloud 行；false 时调用方回落到宿主扫描器
+     */
+    private boolean adoptAutoDownloadedRow(Pending pending, Config config, File dest,
+            String digest) {
+        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, pending.remotePath,
+                dest);
+        if (record == null) {
+            record = mOriginalStore.find(config, pending.rowId, pending.sha1);
+        }
+        OriginalStore.Record promoted = record == null ? null
+                : mOriginalStore.markAutoDownloaded(config, record, dest, digest);
+        Long parsedRow = parseRowId(pending.rowId);
+        Ingest ingest = mIngest;
+        boolean rowUpdated = false;
+        if (ingest != null && parsedRow != null && parsedRow > 0L) {
+            rowUpdated = ingest.updateExistingRow(dest, parsedRow, pending.sha1, "");
+        }
+        Logger.i("event=auto_download_done row=" + (pending.rowId == null ? "unknown"
+                : pending.rowId) + " path=" + dest.getAbsolutePath()
+                + " bytes=" + dest.length()
+                + " state=" + (promoted == null ? "unknown"
+                        : promoted.getLocalState().wire())
+                + " row_updated=" + rowUpdated);
+        if (promoted == null) {
+            Logger.w("event=auto_download_registry_pending row=" + pending.rowId
+                    + " path=" + dest.getAbsolutePath());
+        }
+        return rowUpdated;
     }
 
     private static void cleanupUnpublished(File raw, File staged, File compressed) {
@@ -2546,6 +2787,12 @@ public final class DownloadQueue {
         }
         Logger.w("event=download_retry remote=" + pending.remotePath + " attempts=" + count
                 + " reason=" + reason);
+        if (pending.autoDownload) {
+            // 失败只记账，不动注册表：状态仍是 REMOTE_ONLY，等下一轮（或冷却之后）重试；
+            // 达到 MAX_FAIL_PER_PATH 后计划侧会跳过这条，不再无限烧流量。
+            Logger.w("event=auto_download_failed row=" + (pending.rowId == null ? "unknown"
+                    : pending.rowId) + " reason=" + reason + " attempts=" + count);
+        }
     }
 
     private void markDone(String remotePath, String target) {

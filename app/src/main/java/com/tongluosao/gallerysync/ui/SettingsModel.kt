@@ -69,6 +69,14 @@ class SettingsModel : CoroutineScope {
     var preserveHeicFormat by mutableStateOf(Config.DEFAULT_PRESERVE_HEIC_FORMAT)
         private set
     /**
+     * 把注册表里只有远端副本（接管登记）的行自动从 WebDAV 下回来。
+     *
+     * <p>默认开启：接管只登记、不下字节，登记完本地一张都没有；但真正动网络还要相册自己的
+     * 原生下载事件、仅 Wi-Fi、每轮上限与失败上限这四道闸。
+     */
+    var autoDownload by mutableStateOf(Config.DEFAULT_AUTO_DOWNLOAD)
+        private set
+    /**
      * “接管”相册里已有的云端行：只往注册表补登记，一个字节都不下载。
      *
      * <p>默认关闭，且“立即接管”按钮只有它开着才可用 —— 接管会改变上传侧对一批老照片的
@@ -193,6 +201,11 @@ class SettingsModel : CoroutineScope {
     fun onPreserveHeicFormatChange(checked: Boolean) {
         preserveHeicFormat = checked
         writeNow(Config.KEY_PRESERVE_HEIC_FORMAT, checked)
+    }
+
+    fun onAutoDownloadChange(checked: Boolean) {
+        autoDownload = checked
+        writeNow(Config.KEY_AUTO_DOWNLOAD, checked)
     }
 
     fun onWebdavTakeoverChange(checked: Boolean) {
@@ -448,6 +461,7 @@ class SettingsModel : CoroutineScope {
         preserveHeicFormat = source.getBoolean(
             Config.KEY_PRESERVE_HEIC_FORMAT, Config.DEFAULT_PRESERVE_HEIC_FORMAT
         )
+        autoDownload = source.getBoolean(Config.KEY_AUTO_DOWNLOAD, Config.DEFAULT_AUTO_DOWNLOAD)
         webdavTakeover = source.getBoolean(KEY_WEBDAV_TAKEOVER, false)
         localFlagModeIndex = flagModeIndexOf(
             source.getString(Config.KEY_LOCAL_FLAG_MODE, Config.DEFAULT_LOCAL_FLAG_MODE)
@@ -490,6 +504,9 @@ class SettingsModel : CoroutineScope {
 
             Config.KEY_PRESERVE_HEIC_FORMAT -> preserveHeicFormat =
                 source.getBoolean(key, Config.DEFAULT_PRESERVE_HEIC_FORMAT)
+
+            Config.KEY_AUTO_DOWNLOAD -> autoDownload =
+                source.getBoolean(key, Config.DEFAULT_AUTO_DOWNLOAD)
 
             KEY_WEBDAV_TAKEOVER -> webdavTakeover = source.getBoolean(key, false)
 
@@ -588,6 +605,7 @@ class SettingsModel : CoroutineScope {
             Config.KEY_REMOTE_ROOT,
             Config.KEY_REPLACE_MODE,
             Config.KEY_WIFI_ONLY,
+            Config.KEY_AUTO_DOWNLOAD,
             Config.KEY_REMOTE_LAYOUT,
             Config.KEY_VERIFY_ASYNC,
             Config.KEY_SKIP_EXISTING_REMOTE,
