@@ -159,6 +159,13 @@ public final class DownloadQueue {
             new LinkedHashMap<>();
     /** 正在下载的远端路径，受 mLock 保护 */
     private final Set<String> mInflight = new HashSet<>();
+    /**
+     * 已经报过 {@code event=mirror_dest_preexisting} 的远端路径：历史镜像副本只记一条，不删。
+     *
+     * <p>这些文件是修复前落错目录留下的副本，占着空间，但可能是用户唯一一份 —— 自动删除
+     * 风险太大，交给维护模式人工处理。这里只保证日志不刷屏（每轮计划都会看到它们）。
+     */
+    private final Set<String> mMirrorPreexistingLogged = new HashSet<>();
 
     private volatile Config mConfig;
     /** Native Gallery auto-download gate. No host wiring means downloads stay disabled. */
@@ -335,14 +342,28 @@ public final class DownloadQueue {
         /** 接管登记的相册行 id / sha1，仅 autoDownload 时非空（可能仍为 null） */
         final String rowId;
         final String sha1;
+        /** 计划阶段判出来的落点类别，只用于日志（{@code dest_kind=album|mirror}）。 */
+        final DownloadDestinationPolicy.Kind destKind;
+        /**
+         * 落点相册路径上已有一份同尺寸的占位副本（接管行原图被系统替换成预览）：允许原地顶掉。
+         */
+        final boolean replacesAlbumStandIn;
 
         Pending(String remotePath, String relativePath, long size, String target,
                 String localPath) {
-            this(remotePath, relativePath, size, target, localPath, false, null, null);
+            this(remotePath, relativePath, size, target, localPath, false, null, null,
+                    DownloadDestinationPolicy.Kind.MIRROR, false);
         }
 
         Pending(String remotePath, String relativePath, long size, String target,
                 String localPath, boolean autoDownload, String rowId, String sha1) {
+            this(remotePath, relativePath, size, target, localPath, autoDownload, rowId, sha1,
+                    DownloadDestinationPolicy.Kind.MIRROR, false);
+        }
+
+        Pending(String remotePath, String relativePath, long size, String target,
+                String localPath, boolean autoDownload, String rowId, String sha1,
+                DownloadDestinationPolicy.Kind destKind, boolean replacesAlbumStandIn) {
             this.remotePath = remotePath;
             this.relativePath = relativePath;
             this.size = size;
@@ -351,6 +372,8 @@ public final class DownloadQueue {
             this.autoDownload = autoDownload;
             this.rowId = rowId;
             this.sha1 = sha1;
+            this.destKind = destKind == null ? DownloadDestinationPolicy.Kind.MIRROR : destKind;
+            this.replacesAlbumStandIn = replacesAlbumStandIn;
         }
     }
 
@@ -942,6 +965,9 @@ public final class DownloadQueue {
     /** @return 这一轮认出多少个新文件 */
     private int plan(Config config, int generation) {
         List<Pending> found = new ArrayList<>();
+        // 落点判定要看的"这一行是不是接管行/登记了什么原路径"只读一次：逐文件查注册表
+        // 会为同一行把整个索引走一遍，14k 行的库上够慢一整轮。
+        Map<String, OriginalStore.Record> registry = registryByRemotePath(config);
         // The directory planner must not share worker 0's connection: listing and downloading
         // concurrently on one WebDAV client can interleave response bodies.
         WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
@@ -949,7 +975,7 @@ public final class DownloadQueue {
         try {
             walk(client, config.getRemoteRoot(), "", 0, found,
                     config, OriginalStore.targetKey(config), isHighQualityRequested(),
-                    generation, new HostRows(mContext));
+                    generation, new HostRows(mContext), registry);
         } finally {
             client.close();
         }
@@ -995,7 +1021,7 @@ public final class DownloadQueue {
     /** Walk one bounded round and collect remote files that have no local match. */
     private void walk(WebDavClient client, String remoteDir, String relativeDir, int depth,
             List<Pending> out, Config config, String target, boolean highQuality,
-            int generation, HostRows hostRows) {
+            int generation, HostRows hostRows, Map<String, OriginalStore.Record> registry) {
         if (depth > MAX_DEPTH || out.size() >= mPlanCap
                 || !isPolicyCurrent(generation)) {
             return;
@@ -1042,7 +1068,7 @@ public final class DownloadQueue {
                 }
                 dirs++;
                 walk(client, WebDavClient.joinPath(remoteDir, name), relative, depth + 1, out,
-                        config, target, highQuality, generation, hostRows);
+                        config, target, highQuality, generation, hostRows, registry);
                 continue;
             }
             if (skipByExtension(name) || !isGalleryMedia(name)) {
@@ -1062,11 +1088,21 @@ public final class DownloadQueue {
                         + " reason=" + damage.reason() + " size=" + damage.size());
                 continue;
             }
-            File normalLocal = downloadDestinationFor(config, remotePath, relative, entry.size);
+            DownloadDestinationPolicy.Decision decision = downloadDestinationFor(config,
+                    remotePath, relative, entry.size, registry);
+            File normalLocal = decision.path;
+            if (normalLocal == null) {
+                normalLocal = new File(MIRROR_ROOT, relative);
+                decision = DownloadDestinationPolicy.mirrorDecision(normalLocal);
+            }
             OriginalStore.Record occupied = mOriginalStore.findByLocalPath(normalLocal);
             if (occupied != null && !remotePath.equals(occupied.remotePath)) {
                 // Another format's JPEG preview must never count as this remote original.
                 normalLocal = new File(MIRROR_ROOT, relative);
+                decision = DownloadDestinationPolicy.mirrorDecision(normalLocal);
+            }
+            if (decision.kind == DownloadDestinationPolicy.Kind.MIRROR && normalLocal.isFile()) {
+                logMirrorPreexisting(remotePath, normalLocal);
             }
             if (hasValidRegisteredSlimPreview(config, target, remotePath, normalLocal)) {
                 Logger.d("event=download_skip_registered_slim_preview remote=" + remotePath);
@@ -1086,12 +1122,15 @@ public final class DownloadQueue {
             // 分支永远走不到（计划期就被 localExists 挡掉了）。
             boolean localIsRegisteredDerivedCopy = highQuality && normalLocal.isFile()
                     && isRegisteredDerivedCopyFor(remotePath, config, normalLocal);
-            if (!shouldPlanDownload(scheduled, done, restoreMissingOriginal, normalLocal.exists(),
+            // 接管行原路径上的占位副本不算"原图已在本地"：要排进去，下完原地换回原图
+            boolean localExists = normalLocal.exists() && !decision.replacesExistingAlbumFile;
+            if (!shouldPlanDownload(scheduled, done, restoreMissingOriginal, localExists,
                     hostRows.knows(normalLocal), localIsRegisteredDerivedCopy)) {
                 continue;
             }
             out.add(new Pending(remotePath, relative, entry.size, target,
-                    normalLocal.getAbsolutePath()));
+                    normalLocal.getAbsolutePath(), false, null, null, decision.kind,
+                    decision.replacesExistingAlbumFile));
         }
     }
 
@@ -1165,18 +1204,27 @@ public final class DownloadQueue {
             }
             File albumDestination = AutoDownloadPolicy.targetPath(layout, config.getRemoteRoot(),
                     record.remotePath, primaryRoot);
-            File destination = albumDestination == null ? null
+            DownloadDestinationPolicy.Decision destination = albumDestination == null
+                    ? DownloadDestinationPolicy.mirrorDecision(null)
                     : registryAwareDestination(config, layout, record, albumDestination);
-            if (destination == null) {
+            File destinationFile = destination.path;
+            if (destinationFile == null) {
                 unmapped++;
                 continue;
+            }
+            if (destination.kind == DownloadDestinationPolicy.Kind.MIRROR
+                    && destinationFile.isFile()) {
+                // 修复前落错目录留下的副本：只记账，不删除
+                logMirrorPreexisting(record.remotePath, destinationFile);
             }
             // 相册路径上那份同名文件如果是本记录登记过的副本（原地瘦身的预览），
             // 就不能算"本地已经有原图"：正确动作是把原图写回去顶掉它。
             boolean derived = albumDestination != null && albumDestination.isFile()
                     && mOriginalStore.isRegisteredDerivedPath(record, albumDestination);
-            boolean exists = destination.isFile() && !derived;
-            long existingLength = exists ? destination.length() : -1L;
+            // 接管行的占位副本同理：那不是"原图已在本地"，而是"要在原地把它换回原图"
+            boolean exists = destinationFile.isFile() && !derived
+                    && !destination.replacesExistingAlbumFile;
+            long existingLength = exists ? destinationFile.length() : -1L;
             boolean scheduled;
             boolean done;
             int failures;
@@ -1197,16 +1245,17 @@ public final class DownloadQueue {
                 }
                 out.add(new Pending(record.remotePath,
                         AutoDownloadPolicy.relativePath(config.getRemoteRoot(), record.remotePath),
-                        record.originalLength, target, destination.getAbsolutePath(), true,
-                        record.rowId, record.sha1));
+                        record.originalLength, target, destinationFile.getAbsolutePath(), true,
+                        record.rowId, record.sha1, destination.kind,
+                        destination.replacesExistingAlbumFile));
                 planned++;
             } else if (decision == AutoDownloadPolicy.Decision.PROMOTE_EXISTING) {
                 // 目标文件已经是同长度：说明字节早就在了，登记成 ORIGINAL 即可，不重复下载。
-                if (promoteExistingOriginal(config, record, destination)) {
+                if (promoteExistingOriginal(config, record, destinationFile)) {
                     planned++;
                     Logger.i("event=auto_download_done row=" + row(record)
-                            + " path=" + destination.getAbsolutePath()
-                            + " bytes=" + destination.length() + " source=existing");
+                            + " path=" + destinationFile.getAbsolutePath()
+                            + " bytes=" + destinationFile.length() + " source=existing");
                 }
             } else {
                 Integer count = skipped.get(decision);
@@ -1804,7 +1853,15 @@ public final class DownloadQueue {
             // 一刀切挡掉，等于死代码）。守卫仍是 isRegisteredDerivedCopy：用户文件进不来。
             boolean replacingRegisteredDerived = normalDest.isFile()
                     && isRegisteredDerivedCopyFor(pending.remotePath, config, normalDest);
-            if (normalDest.exists() && !replacingRegisteredDerived) {
+            // 接管行的占位副本：相册里那份同名文件比远端对象小（系统把原图换成了预览/占位图），
+            // 计划阶段已经判成"落相册、顶掉它"。守卫只认"确实更小"，更大的同名文件（用户自己的
+            // 高清版本）仍然走下面的 skip 分支，绝不覆盖。
+            boolean replacingAlbumStandIn = isReplaceableAlbumStandIn(normalDest, pending);
+            if (pending.destKind == DownloadDestinationPolicy.Kind.MIRROR && normalDest.isFile()) {
+                // 历史镜像副本：不自动删除（可能是用户唯一一份），只留一条记录给维护模式
+                logMirrorPreexisting(pending.remotePath, normalDest);
+            }
+            if (normalDest.exists() && !replacingRegisteredDerived && !replacingAlbumStandIn) {
                 Logger.i("event=download_skip_local_exists remote=" + pending.remotePath
                         + " row=" + rowLabel(pending) + " bytes=" + normalDest.length()
                         + " local=" + normalDest);
@@ -1816,6 +1873,11 @@ public final class DownloadQueue {
                 Logger.i("event=download_replace_registered_preview row=" + rowLabel(pending)
                         + " bytes=" + normalDest.length() + " path=" + normalDest
                         + " remote=" + pending.remotePath);
+            }
+            if (replacingAlbumStandIn) {
+                Logger.i("event=download_replace_album_standin row=" + rowLabel(pending)
+                        + " bytes=" + normalDest.length() + " remote_size=" + pending.size
+                        + " path=" + normalDest + " remote=" + pending.remotePath);
             }
             if (!mayDownload(mRemoteSuppress, config, pending.remotePath)) {
                 // 计划之后账本又多了这条（删除线程与下载线程并行）：到 GET 之前再拦一次
@@ -2009,16 +2071,22 @@ public final class DownloadQueue {
                 // 原路径上可能还留着第 3 波瘦身写下的原地预览：整份原图正是要把它顶掉。
                 // 只认“这条记录自己登记过的副本”，用户文件与计划之后出现的文件仍按失败处理。
                 boolean replacingInplacePreview = false;
+                boolean replacingStandIn = false;
                 String existingRowId = "";
                 if (normalDest.exists()) {
                     OriginalStore.Record existing = mOriginalStore.findByRemotePath(config,
                             pending.remotePath, normalDest);
-                    if (!mOriginalStore.isRegisteredDerivedCopy(existing, normalDest)) {
+                    if (mOriginalStore.isRegisteredDerivedCopy(existing, normalDest)) {
+                        replacingInplacePreview = true;
+                        existingRowId = existing == null ? "" : existing.rowId;
+                    } else if (isReplaceableAlbumStandIn(normalDest, pending)) {
+                        // 接管行原路径上的占位副本：计划阶段已经批准顶掉它，这里再按当前长度确认一次
+                        replacingStandIn = true;
+                        existingRowId = existing == null ? "" : existing.rowId;
+                    } else {
                         throw new IOException("download destination appeared before publish: "
                                 + normalDest);
                     }
-                    replacingInplacePreview = true;
-                    existingRowId = existing == null ? "" : existing.rowId;
                 }
                 // 先清掉上一次进程被杀时留下的同目录临时件（点开头、扫描器看不见）
                 sweepStaleStaging(normalDest);
@@ -2029,13 +2097,18 @@ public final class DownloadQueue {
                         normalDest, raw.length(), digest);
                 dest = normalDest;
                 ensureWorkCurrent(config, generation);
-                publishStagedFile(staged, normalDest, replacingInplacePreview);
+                publishStagedFile(staged, normalDest, replacingInplacePreview || replacingStandIn);
                 staged = null;
                 if (replacingInplacePreview) {
                     // 原路径上现在是完整原图：把账本从“这里放的是预览”复位成 ORIGINAL，
                     // 否则上传分类会永远把这份文件当成派生副本拦住。
                     restoreRegistryAfterReplacement(config, pending, normalDest);
                     Logger.i("event=download_original_inplace row=" + existingRowId
+                            + " bytes=" + dest.length()
+                            + " remote=" + pending.remotePath
+                            + " local=" + normalDest.getAbsolutePath());
+                } else if (replacingStandIn) {
+                    Logger.i("event=download_album_standin_replaced row=" + existingRowId
                             + " bytes=" + dest.length()
                             + " remote=" + pending.remotePath
                             + " local=" + normalDest.getAbsolutePath());
@@ -2061,7 +2134,9 @@ public final class DownloadQueue {
                 notifyHostAfterPublish(dest, normalDest);
             }
             Logger.i("event=download_ok remote=" + pending.remotePath
-                    + " local=" + dest.getAbsolutePath() + " size=" + dest.length());
+                    + " local=" + dest.getAbsolutePath() + " size=" + dest.length()
+                    + " dest_kind=" + pending.destKind.wire
+                    + (pending.replacesAlbumStandIn ? " replaced=album_standin" : ""));
             ok = true;
         } catch (DownloadCancelledException e) {
             cleanupUnpublished(raw, staged, compressed);
@@ -2771,22 +2846,52 @@ public final class DownloadQueue {
      * 远端对象，老判据会把下载改写到 {@code DCIM/MiGallerySync}，于是同一张照片出现第二份文件、
      * 相册多出第二行。现在只要账本认得出这条路径，落点就是它。
      */
-    private File downloadDestinationFor(Config config, String remotePath, String relativePath,
-            long remoteSize) {
+    private DownloadDestinationPolicy.Decision downloadDestinationFor(Config config,
+            String remotePath, String relativePath, long remoteSize) {
+        return downloadDestinationFor(config, remotePath, relativePath, remoteSize, null);
+    }
+
+    /**
+     * 计划阶段的真实落点：在纯判据之上带上远端相对路径与注册表里这一行的状态。
+     *
+     * <p>已登记的路径一律回流到它。空间优化把原图换成同名预览之后，相册路径上的长度必然短于
+     * 远端对象，老判据会把下载改写到 {@code DCIM/MiGallerySync}，于是同一张照片出现第二份文件、
+     * 相册多出第二行。现在只要账本认得出这条路径，落点就是它。
+     *
+     * <p>接管行（{@code REMOTE_ONLY}）没有登记原路径，靠 {@code relativePath} 映射回相册：
+     * 远端路径本身带着相册内位置，{@code DCIM/Screenshots/x.jpg} 就该落
+     * {@code /storage/emulated/0/DCIM/Screenshots/x.jpg}。相册里那份同名更小的文件是系统
+     * 生成的占位副本（{@link DownloadDestinationPolicy.Decision#replacesExistingAlbumFile}），
+     * 落点仍是相册并在原地顶掉它；只有被<b>另一份不同字节的文件</b>占着才退回镜像。
+     *
+     * @param registry 本轮计划用的注册表快照（{@link #registryByRemotePath}），可空
+     */
+    private DownloadDestinationPolicy.Decision downloadDestinationFor(Config config,
+            String remotePath, String relativePath, long remoteSize,
+            Map<String, OriginalStore.Record> registry) {
         String layout = config == null ? null : config.getRemoteLayout();
-        File mirror = new File(MIRROR_ROOT, relativePath);
+        File primaryRoot = new File(PRIMARY_STORAGE_ROOT);
+        File mirrorRoot = new File(MIRROR_ROOT);
         if (!Config.LAYOUT_ALBUM.equals(layout) || !isSafeRelativePath(relativePath)) {
-            return mirror;
+            return DownloadDestinationPolicy.mirrorDecision(new File(mirrorRoot, relativePath));
         }
-        File album = new File(PRIMARY_STORAGE_ROOT, relativePath);
-        boolean sameNameSameLength = album.isFile() && remoteSize >= 0L
-                && album.length() == remoteSize;
-        OriginalStore.Record record = mOriginalStore.findByRemotePath(config, remotePath, album);
+        File album = new File(primaryRoot, relativePath);
+        OriginalStore.Record record = registry == null ? null : registry.get(remotePath);
+        if (record == null && config != null) {
+            record = mOriginalStore.findByRemotePath(config, remotePath, album);
+        }
+        if (record == null) {
+            // 完全没登记：远端相对路径就是唯一线索，相册里那份同名文件是别的东西才分流
+            return DownloadDestinationPolicy.fromRelativePath(relativePath, primaryRoot,
+                    mirrorRoot, remoteSize, null, false, false, -1L);
+        }
         // 相册里那份同名文件是本记录登记过的副本（原地瘦身预览）：写回它，不另存镜像
         boolean albumIsRegisteredDerived = album.isFile()
                 && mOriginalStore.isRegisteredDerivedPath(record, album);
-        return DownloadDestinationPolicy.resolve(album, mirror, sameNameSameLength,
-                record == null ? null : record.originalLocalPath, albumIsRegisteredDerived);
+        boolean remoteOnly = record.getLocalState() == OriginalStore.LocalState.REMOTE_ONLY;
+        return DownloadDestinationPolicy.fromRelativePath(relativePath, primaryRoot, mirrorRoot,
+                remoteSize, record.originalLocalPath, albumIsRegisteredDerived, remoteOnly,
+                record.originalLength);
     }
 
     /**
@@ -2796,18 +2901,64 @@ public final class DownloadQueue {
      * 算相册路径，<b>看不到注册表</b>。被用户改名/移动过的接管行因此会被算到第二个路径，
      * 下完就多一份文件、相册多一行。这里补上"账本优先"，与远端枚举那条链路口径一致。
      */
-    private File registryAwareDestination(Config config, String layout,
-            OriginalStore.Record record, File albumDestination) {
-        String relative = AutoDownloadPolicy.relativePath(config.getRemoteRoot(), record.remotePath);
-        File mirror = relative == null ? null : new File(MIRROR_ROOT, relative);
-        if (mirror == null) {
-            return albumDestination;
+    private DownloadDestinationPolicy.Decision registryAwareDestination(Config config,
+            String layout, OriginalStore.Record record, File albumDestination) {
+        if (albumDestination == null) {
+            return DownloadDestinationPolicy.mirrorDecision(null);
         }
-        boolean sameNameSameLength = albumDestination.isFile()
-                && record.originalLength >= 0L
-                && albumDestination.length() == record.originalLength;
-        return DownloadDestinationPolicy.resolve(albumDestination, mirror, sameNameSameLength,
-                record.originalLocalPath, false);
+        String relative = AutoDownloadPolicy.relativePath(config.getRemoteRoot(), record.remotePath);
+        File mirrorRoot = new File(MIRROR_ROOT);
+        if (relative == null) {
+            // 拼不出相对路径就留在算好的相册路径上：这一行本来就有相册位置，不该被赶到镜像
+            return DownloadDestinationPolicy.albumDecision(albumDestination);
+        }
+        boolean remoteOnly = record.getLocalState() == OriginalStore.LocalState.REMOTE_ONLY;
+        return DownloadDestinationPolicy.fromRelativePath(relative,
+                new File(PRIMARY_STORAGE_ROOT), mirrorRoot, record.originalLength,
+                record.originalLocalPath, false, remoteOnly, record.originalLength);
+    }
+
+    /**
+     * 相册路径上那份文件是不是"可以被顶掉的占位副本"：计划阶段判成占位副本，且现在确实更小。
+     *
+     * <p>发布前按实时长度再确认一遍：下载期间它要是已经变成完整原图（另一路并发下完，或用户
+     * 自己补回了高清版本），这里就不成立 —— 走 skip 分支，绝不用几分钟前的计划覆盖更好的文件。
+     */
+    private static boolean isReplaceableAlbumStandIn(File dest, Pending pending) {
+        return pending.replacesAlbumStandIn && pending.size > 0L && dest.isFile()
+                && dest.length() > 0L && dest.length() < pending.size;
+    }
+
+    /**
+     * 历史镜像副本：记一条日志供维护模式处理，<b>不删除</b>。
+     *
+     * <p>这些文件是修复前落错目录留下的，可能是用户唯一一份原图，自动删除风险太大；
+     * 同一远端路径只记一条（每轮计划都会重新看到它，不去重就会把日志刷满）。
+     */
+    private void logMirrorPreexisting(String remotePath, File mirror) {
+        synchronized (mMirrorPreexistingLogged) {
+            if (!mMirrorPreexistingLogged.add(remotePath)) {
+                return;
+            }
+        }
+        Logger.i("event=mirror_dest_preexisting path=" + mirror.getAbsolutePath()
+                + " remote=" + remotePath + " size=" + mirror.length() + " action=keep");
+    }
+
+    /** 这一轮计划用的注册表快照：远端路径 → 记录（含接管行，{@code findByRemotePath} 看不到它们）。 */
+    private Map<String, OriginalStore.Record> registryByRemotePath(Config config) {
+        Map<String, OriginalStore.Record> byPath = new HashMap<>();
+        try {
+            for (OriginalStore.Record record : mOriginalStore.recordsForTarget(config)) {
+                if (record == null || record.remotePath == null) {
+                    continue;
+                }
+                byPath.put(record.remotePath, record);
+            }
+        } catch (Throwable t) {
+            Logger.w("event=download_registry_snapshot_failed detail=" + t);
+        }
+        return byPath;
     }
 
     /**
