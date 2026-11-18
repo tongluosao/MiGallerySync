@@ -43,7 +43,7 @@ import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
 import top.yukonga.miuix.kmp.basic.ScrollBehavior
 import top.yukonga.miuix.kmp.basic.SmallTitle
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
+import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 
@@ -157,7 +157,8 @@ fun ProgressContent(
             } else {
                 null
             },
-            modifier = Modifier.weight(uploadWeight)
+            // 没内容就不参与分配高度：空区块按内容高，另一边拿走剩下的空间
+            modifier = if (uploadRows.isEmpty()) Modifier else Modifier.weight(uploadWeight)
         )
         ProgressBlock(
             title = stringResource(R.string.progress_download_section),
@@ -170,7 +171,7 @@ fun ProgressContent(
             expanded = downloadExpanded,
             onToggleExpanded = { downloadExpanded = !downloadExpanded },
             footerNote = null,
-            modifier = Modifier.weight(downloadWeight)
+            modifier = if (downloadRows.isEmpty()) Modifier else Modifier.weight(downloadWeight)
         )
     }
 }
@@ -207,20 +208,15 @@ private fun ProgressBlock(
             SectionSummaryCard(section)
         }
         if (rows.isEmpty()) {
-            // 空态只说一句"暂无进行中的…"，不报"0 项/0 B"这种没信息的数字
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(horizontal = ScreenMargin, vertical = SectionGap),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = emptyText,
-                    style = MiuixTheme.textStyles.footnote1,
-                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                )
-            }
+            // 空态只说一句"暂无进行中的…"，不报"0 项/0 B"这种没信息的数字。
+            // 不加 weight：之前它在半屏高的盒子里垂直居中，两句"暂无"之间隔着一整屏空白，
+            // 看着像页面坏了。现在紧贴标题，和下面的区块连成一段。
+            Text(
+                text = emptyText,
+                style = MiuixTheme.textStyles.footnote1,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.padding(start = HintMargin, end = ScreenMargin, top = SectionGap)
+            )
             return@Column
         }
         LazyColumn(
@@ -251,17 +247,22 @@ private fun ProgressBlock(
             )
         }
         if (fold.canExpand || fold.canCollapse) {
-            TextButton(
-                text = if (fold.canExpand) {
-                    stringResource(R.string.progress_expand_all, fold.hidden)
-                } else {
-                    stringResource(R.string.progress_collapse)
-                },
-                onClick = onToggleExpanded,
+            // Miuix 0.9.4 没有「可展开卡片」这种容器；带箭头的 Preference 行就是这套设计里
+            // "点了会展开"的标准写法，与上面的卡片同宽、同圆角，收起时也不用换一种控件
+            Card(
                 modifier = Modifier
-                    .fillMaxWidth()
                     .padding(horizontal = ScreenMargin)
-            )
+                    .padding(top = SectionGap)
+            ) {
+                ArrowPreference(
+                    title = if (fold.canExpand) {
+                        stringResource(R.string.progress_expand_all, fold.hidden)
+                    } else {
+                        stringResource(R.string.progress_collapse)
+                    },
+                    onClick = onToggleExpanded
+                )
+            }
         }
     }
 }

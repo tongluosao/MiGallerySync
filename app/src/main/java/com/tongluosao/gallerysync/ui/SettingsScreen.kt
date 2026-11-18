@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardActions
@@ -18,6 +19,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -26,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusManager
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -39,17 +42,27 @@ import androidx.compose.ui.unit.dp
 import com.tongluosao.gallerysync.R
 import com.tongluosao.gallerysync.core.Config
 import com.tongluosao.gallerysync.ui.SettingsModel.ResetState
+import kotlin.math.roundToInt
 import com.tongluosao.gallerysync.ui.SettingsModel.TestState
+import top.yukonga.miuix.kmp.basic.BasicComponent
+import top.yukonga.miuix.kmp.basic.BasicComponentDefaults
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
+import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.ScrollBehavior
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TextFieldDefaults
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.CloudFill
+import top.yukonga.miuix.kmp.icon.extended.Delete
+import top.yukonga.miuix.kmp.icon.extended.Info
+import top.yukonga.miuix.kmp.icon.extended.Refresh
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
+import top.yukonga.miuix.kmp.preference.SliderPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.LocalDismissState
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -58,6 +71,9 @@ import top.yukonga.miuix.kmp.window.WindowDialog
 
 /** 摘要里主机名最多显示几个字符，再长就截断 —— 右端还要放下状态词 */
 private const val HOST_MAX_CHARS = 11
+
+/** 导航行左侧图标的边长，与 Miuix 图标自身的 24dp 画布一致 */
+private val NavIconSize = 24.dp
 
 /**
  * 设置页的滚动区。主题控制器、顶栏与底栏都由 [MainScreen] 持有，
@@ -130,21 +146,40 @@ fun SettingsContent(
 @Composable
 private fun SettingsHome(model: SettingsModel, onOpenPage: (SettingsPage) -> Unit) {
     Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
-        NavRow(R.string.page_server, serverSummary(model)) { onOpenPage(SettingsPage.SERVER) }
-        NavRow(R.string.page_sync, syncSummary(model)) { onOpenPage(SettingsPage.SYNC) }
-        NavRow(R.string.page_space, spaceSummary(model)) { onOpenPage(SettingsPage.SPACE) }
-        NavRow(R.string.page_maintenance, maintenanceSummary(model)) {
+        NavRow(MiuixIcons.CloudFill, R.string.page_server, serverSummary(model)) {
+            onOpenPage(SettingsPage.SERVER)
+        }
+        NavRow(MiuixIcons.Refresh, R.string.page_sync, syncSummary(model)) {
+            onOpenPage(SettingsPage.SYNC)
+        }
+        NavRow(MiuixIcons.Delete, R.string.page_space, spaceSummary(model)) {
+            onOpenPage(SettingsPage.SPACE)
+        }
+        NavRow(MiuixIcons.Info, R.string.page_maintenance, maintenanceSummary(model)) {
             onOpenPage(SettingsPage.MAINTENANCE)
         }
     }
 }
 
-/** 一条导航入口：左标题、右摘要、最右箭头（箭头由 ArrowPreference 自己画） */
+/**
+ * 一条导航入口：左图标、标题、右摘要、最右箭头（箭头由 ArrowPreference 自己画）。
+ *
+ * <p>图标只做定位用（服务器/同步/空间/关于），所以不写 contentDescription ——
+ * 读屏时念标题就够了，图标再念一遍是重复。
+ */
 @Composable
-private fun NavRow(title: Int, summary: String, onClick: () -> Unit) {
+private fun NavRow(icon: ImageVector, title: Int, summary: String, onClick: () -> Unit) {
     ArrowPreference(
         title = stringResource(title),
         onClick = onClick,
+        startAction = {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MiuixTheme.colorScheme.primary,
+                modifier = Modifier.size(NavIconSize)
+            )
+        },
         endActions = {
             Text(
                 text = summary,
@@ -224,15 +259,8 @@ private fun PageContent(page: SettingsPage, model: SettingsModel) {
         runsOf(page.items).forEach { run ->
             when (run.kind) {
                 ItemKind.FIELD -> run.ids.forEach { FieldItem(it, model, focusManager) }
-                ItemKind.ACTION -> run.ids.forEach { LinkItem(it, model) }
-                ItemKind.PREFERENCE -> {
-                    PreferenceCard(run.ids, model)
-                    // 替换模式的后果比其它开关重：云端查看与释放空间会失效，提示挂在卡片外面，
-                    // 免得被当成卡片里又一行无害的说明
-                    if (model.isReplaceMode && SettingId.REPLACE_MODE in run.ids) {
-                        HintLine(stringResource(R.string.warn_replace_mode), error = true)
-                    }
-                }
+                ItemKind.ACTION -> run.ids.forEach { ActionItem(it, model) }
+                ItemKind.PREFERENCE -> PreferenceCard(run.ids, model)
             }
         }
     }
@@ -339,15 +367,19 @@ private fun FieldItem(id: String, model: SettingsModel, focusManager: FocusManag
                     masked = spec.masked,
                     modifier = Modifier.weight(1f)
                 )
-                ActionLink(
+                // Miuix 的次级按钮：比输入框矮一档的胶囊，右侧留 8dp 只做视觉分隔，
+                // 不再是一条"看着像说明文字、其实能点"的链接
+                TextButton(
                     text = stringResource(R.string.action_test),
-                    enabled = model.testState !is TestState.Running,
-                    modifier = Modifier.padding(start = HintGap),
                     onClick = {
                         // 先收键盘再测，否则"连接成功/失败"那行结果会被输入法盖住
                         focusManager.clearFocus()
                         model.testConnection()
-                    }
+                    },
+                    enabled = model.testState !is TestState.Running,
+                    minWidth = 0.dp,
+                    insideMargin = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier.padding(start = HintGap)
                 )
             }
             TestResultText(model.testState)
@@ -360,6 +392,8 @@ private fun FieldItem(id: String, model: SettingsModel, focusManager: FocusManag
 @Composable
 private fun PrefItem(id: String, model: SettingsModel) {
     when (id) {
+        // 替换模式的后果比其它开关重（云端查看与释放空间会失效），提示挂在这一行自己的
+        // bottomAction 上：贴着它，又不会被当成卡片里下一行无害的说明
         SettingId.REPLACE_MODE -> OverlayDropdownPreference(
             items = listOf(
                 stringResource(R.string.mode_replace),
@@ -368,6 +402,17 @@ private fun PrefItem(id: String, model: SettingsModel) {
             ),
             selectedIndex = model.replaceModeIndex,
             title = stringResource(R.string.label_replace_mode),
+            bottomAction = if (model.isReplaceMode) {
+                {
+                    Text(
+                        text = stringResource(R.string.warn_replace_mode),
+                        style = MiuixTheme.textStyles.body2,
+                        color = MiuixTheme.colorScheme.error
+                    )
+                }
+            } else {
+                null
+            },
             onSelectedIndexChange = model::onReplaceModeChange
         )
 
@@ -417,20 +462,20 @@ private fun PrefItem(id: String, model: SettingsModel) {
             summary = stringResource(R.string.summary_webdav_takeover)
         )
 
-        SettingId.UPLOAD_CONCURRENCY -> OverlayDropdownPreference(
-            items = SettingsModel.CONCURRENCY_ITEMS,
-            selectedIndex = model.concurrencyIndex,
+        SettingId.UPLOAD_CONCURRENCY -> ConcurrencySlider(
+            index = model.concurrencyIndex,
+            max = Config.MAX_UPLOAD_CONCURRENCY,
             title = stringResource(R.string.label_upload_concurrency),
             summary = stringResource(R.string.summary_upload_concurrency),
-            onSelectedIndexChange = model::onConcurrencyChange
+            onChange = model::onConcurrencyChange
         )
 
-        SettingId.DOWNLOAD_CONCURRENCY -> OverlayDropdownPreference(
-            items = SettingsModel.DOWNLOAD_CONCURRENCY_ITEMS,
-            selectedIndex = model.downloadConcurrencyIndex,
+        SettingId.DOWNLOAD_CONCURRENCY -> ConcurrencySlider(
+            index = model.downloadConcurrencyIndex,
+            max = Config.MAX_DOWNLOAD_CONCURRENCY,
             title = stringResource(R.string.label_download_concurrency),
             summary = stringResource(R.string.summary_download_concurrency),
-            onSelectedIndexChange = model::onDownloadConcurrencyChange
+            onChange = model::onDownloadConcurrencyChange
         )
 
         SettingId.MAX_UPLOAD_BYTES -> OverlayDropdownPreference(
@@ -495,13 +540,55 @@ private fun PrefItem(id: String, model: SettingsModel) {
     }
 }
 
-/** 独立文字链接（重新扫描接管、重置已上传标记） */
+/**
+ * 并行路数：数值型设置，Miuix 用 [SliderPreference] —— 拖到哪一格松手就落到哪一路，
+ * 右侧实时显示"几路"，不用先点开一个下拉再挑。
+ *
+ * <p>拖动过程中只更新本地值：Slider 每一帧都会回调，直接写配置会把 LSPosed 数据库
+ * 刷成一串中间值；松手（[SliderPreference.onValueChangeFinished]）才真正落盘一次。
+ * 下标与路数的换算仍走 [SettingsModel] 的既有回调（下标进、真值出）。
+ */
 @Composable
-private fun LinkItem(id: String, model: SettingsModel) {
+private fun ConcurrencySlider(
+    index: Int,
+    max: Int,
+    title: String,
+    summary: String,
+    onChange: (Int) -> Unit
+) {
+    // index 变了（例如别处写入了新值）就重新取一次，避免滑块停在旧位置
+    var pending by remember(index) { mutableFloatStateOf((index + 1).toFloat()) }
+    SliderPreference(
+        value = pending,
+        onValueChange = { pending = it },
+        onValueChangeFinished = {
+            val picked = pending.roundToInt()
+            if (picked - 1 == index) {
+                // 拖回原位：把可能带小数尾巴的本地值也归位，别在视觉上留个 2.97
+                pending = (index + 1).toFloat()
+            } else {
+                onChange(picked - 1)
+            }
+        },
+        title = title,
+        summary = summary,
+        valueText = stringResource(R.string.concurrency_value, pending.roundToInt()),
+        valueRange = 1f..max.toFloat(),
+        steps = (max - 2).coerceAtLeast(0)
+    )
+}
+
+/**
+ * 一个动作项：整行就是一整块可点的卡片（Miuix `BasicComponent`），
+ * 与上下那些开关是同一套行高、内边距与按压反馈 —— 之前只剩一行蓝字，既看不出能点，
+ * 也不像这一页的一员。
+ */
+@Composable
+private fun ActionItem(id: String, model: SettingsModel) {
     when (id) {
-        SettingId.TAKEOVER_NOW -> TakeoverLink(model)
-        SettingId.RESET_UPLOADED -> ResetUploadedLink(model)
-        else -> error("没有为 $id 定义文字链接")
+        SettingId.TAKEOVER_NOW -> TakeoverAction(model)
+        SettingId.RESET_UPLOADED -> ResetUploadedAction(model)
+        else -> error("没有为 $id 定义动作项")
     }
 }
 
@@ -512,15 +599,23 @@ private fun LinkItem(id: String, model: SettingsModel) {
  * 相册需要在运行（广播是单向的，相册不在场时会被静默丢弃）。
  */
 @Composable
-private fun TakeoverLink(model: SettingsModel) {
-    Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
-        ActionLink(
-            text = stringResource(R.string.action_rescan_takeover),
+private fun TakeoverAction(model: SettingsModel) {
+    val spec = takeoverResult(model.takeoverState)
+    val dismiss = model::dismissTakeoverResult
+    // 状态行挂在 bottomAction 里：它属于这一行，不该在卡片外面另起一行飘着
+    val result: (@Composable () -> Unit)? = if (spec == null) {
+        null
+    } else {
+        { InlineResultLine(spec.text, spec.color, dismiss) }
+    }
+    Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
+        BasicComponent(
+            title = stringResource(R.string.action_rescan_takeover),
+            summary = stringResource(R.string.summary_rescan_takeover),
             enabled = model.ready && model.takeoverState !is ResetState.Running,
-            modifier = Modifier.padding(horizontal = HintMargin),
-            onClick = model::takeoverNow
+            onClick = model::takeoverNow,
+            bottomAction = result
         )
-        TakeoverResultText(model.takeoverState, onDismiss = model::dismissTakeoverResult)
     }
 }
 
@@ -528,25 +623,36 @@ private fun TakeoverLink(model: SettingsModel) {
  * 重置“已上传标记”：只放“会真的动相册数据”的动作。
  *
  * <p>与其它配置项性质不同 —— 其余项改了只是换个行为，这一项点下去是**不可逆的重传**，
- * 所以用红字文字链接，还要过一次确认框。
+ * 所以标题用告警色的 [BasicComponent]，还要过一次确认框。
  */
 @Composable
-private fun ResetUploadedLink(model: SettingsModel) {
+private fun ResetUploadedAction(model: SettingsModel) {
     var confirming by remember { mutableStateOf(false) }
+    val spec = resetResult(model.resetState)
+    val dismiss = model::dismissResetResult
+    val result: (@Composable () -> Unit)? = if (spec == null) {
+        null
+    } else {
+        { InlineResultLine(spec.text, spec.color, dismiss) }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(HintGap)) {
-        ActionLink(
-            text = stringResource(R.string.action_reset_uploaded),
-            enabled = model.ready && model.resetState !is ResetState.Running,
-            error = true,
-            modifier = Modifier.padding(horizontal = HintMargin),
-            onClick = { confirming = true }
-        )
+        Card(modifier = Modifier.padding(horizontal = ScreenMargin)) {
+            BasicComponent(
+                title = stringResource(R.string.action_reset_uploaded),
+                titleColor = BasicComponentDefaults.titleColor(
+                    color = MiuixTheme.colorScheme.error
+                ),
+                summary = stringResource(R.string.summary_reset_uploaded),
+                enabled = model.ready && model.resetState !is ResetState.Running,
+                onClick = { confirming = true },
+                bottomAction = result
+            )
+        }
         // 替换模式下相册的"已上传"标记归模块管，重置才有意义；别的模式下相册自己
         // 还在跟小米云打交道，替它重置等于打乱它自己的账
         if (!model.isReplaceMode) {
             HintLine(stringResource(R.string.warn_reset_needs_replace), error = true)
         }
-        ResetResultText(model.resetState, onDismiss = model::dismissResetResult)
     }
 
     WindowDialog(
@@ -577,29 +683,8 @@ private fun ResetUploadedLink(model: SettingsModel) {
     )
 }
 
-/** 单个文字链接。禁用态用弱化色，危险动作用告警色 */
-@Composable
-private fun ActionLink(
-    text: String,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    error: Boolean = false,
-    onClick: () -> Unit
-) {
-    val color = when {
-        !enabled -> MiuixTheme.colorScheme.disabledOnSecondaryVariant
-        error -> MiuixTheme.colorScheme.error
-        else -> MiuixTheme.colorScheme.primary
-    }
-    Text(
-        text = text,
-        modifier = modifier
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = HintGap),
-        style = MiuixTheme.textStyles.body1,
-        color = color
-    )
-}
+/** 一次动作的结果：文案 + 该用什么颜色（成功、进行中、失败各有各的色） */
+private class ResultSpec(val text: String, val color: Color)
 
 @Composable
 private fun TestResultText(state: TestState) {
@@ -624,49 +709,56 @@ private fun TestResultText(state: TestState) {
 }
 
 @Composable
-private fun TakeoverResultText(state: ResetState, onDismiss: () -> Unit) {
+private fun takeoverResult(state: ResetState): ResultSpec? {
     val text = when (state) {
         ResetState.Idle -> null
         ResetState.Running -> stringResource(R.string.msg_takeover_running)
         ResetState.Sent -> stringResource(R.string.msg_takeover_sent)
         is ResetState.Failed -> stringResource(R.string.msg_takeover_failed, state.detail)
-    }
+    } ?: return null
     val color = when (state) {
         ResetState.Sent -> MiuixTheme.colorScheme.primary
         ResetState.Running -> MiuixTheme.colorScheme.onSurfaceVariantSummary
         else -> MiuixTheme.colorScheme.error
     }
-    if (text != null) {
-        ResultLine(text, color, onDismiss = onDismiss)
-    }
+    return ResultSpec(text, color)
 }
 
 @Composable
-private fun ResetResultText(state: ResetState, onDismiss: () -> Unit) {
+private fun resetResult(state: ResetState): ResultSpec? {
     val text = when (state) {
         ResetState.Idle -> null
         ResetState.Running -> stringResource(R.string.msg_reset_running)
         ResetState.Sent -> stringResource(R.string.msg_reset_sent)
         is ResetState.Failed -> stringResource(R.string.msg_reset_failed, state.detail)
-    }
+    } ?: return null
     val color = when (state) {
         ResetState.Sent -> MiuixTheme.colorScheme.primary
         ResetState.Running -> MiuixTheme.colorScheme.onSurfaceVariantSummary
         else -> MiuixTheme.colorScheme.error
     }
-    if (text != null) {
-        ResultLine(text, color, onDismiss = onDismiss)
-    }
+    return ResultSpec(text, color)
 }
 
 /** 动作结果一行：点一下可以收起（不需要用户处理，只是别一直留在页面上） */
 @Composable
-private fun ResultLine(text: String, color: Color, onDismiss: (() -> Unit)? = null) {
+private fun ResultLine(text: String, color: Color) {
+    Text(
+        text = text,
+        modifier = Modifier.padding(horizontal = HintMargin),
+        style = MiuixTheme.textStyles.body2,
+        color = color
+    )
+}
+
+/** 卡片行内的结果行：左右内边距已经由 BasicComponent 的 16dp 提供，这里不再重复让位 */
+@Composable
+private fun InlineResultLine(text: String, color: Color, onDismiss: () -> Unit) {
     Text(
         text = text,
         modifier = Modifier
-            .padding(horizontal = HintMargin)
-            .let { if (onDismiss == null) it else it.clickable { onDismiss() } },
+            .clickable { onDismiss() }
+            .padding(vertical = HintGap),
         style = MiuixTheme.textStyles.body2,
         color = color
     )

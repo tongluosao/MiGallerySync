@@ -100,6 +100,7 @@
     <string name="summary_verify_async">发完即走，复核在后台</string>
     <string name="label_upload_concurrency">并行上传路数</string>
     <string name="summary_upload_concurrency">默认 3 路，越多越吃带宽</string>
+    <string name="concurrency_value">%1$d 路</string>
 
     <string name="label_auto_download">自动下载原图</string>
     <string name="summary_auto_download">自动下回只有云端的原图</string>
@@ -123,6 +124,7 @@
     <string name="summary_reset_uploaded">把「已上传」全部退回并重传</string>
     <string name="warn_reset_needs_replace">只在「替换：只传 WebDAV」模式下可用</string>
     <string name="action_rescan_takeover">重新扫描未接管的照片</string>
+    <string name="summary_rescan_takeover">只登记已有的云端记录，不下载字节</string>
     <string name="msg_takeover_running">正在通知相册…</string>
     <string name="msg_takeover_sent">已通知相册，处理进度见日志</string>
     <string name="msg_takeover_failed">发送失败：%1$s</string>

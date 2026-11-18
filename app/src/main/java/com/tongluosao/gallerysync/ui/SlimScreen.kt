@@ -1,6 +1,5 @@
 package com.tongluosao.gallerysync.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,12 +33,14 @@ import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.ScrollBehavior
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -83,12 +84,8 @@ fun SlimScreen(
                 title = stringResource(R.string.slim_title),
                 scrollBehavior = scrollBehavior,
                 navigationIcon = {
-                    Box(
-                        modifier = Modifier
-                            .clickable(onClick = onBack)
-                            .padding(horizontal = ScreenMargin, vertical = HintGap),
-                        contentAlignment = Alignment.Center
-                    ) {
+                    // 与主界面二级页用同一个 Miuix IconButton：热区、按压反馈一致
+                    IconButton(onClick = onBack) {
                         Icon(
                             imageVector = MiuixIcons.Back,
                             contentDescription = stringResource(R.string.action_back)
@@ -158,16 +155,16 @@ fun SlimContent(
             SlimActionRow(state = state, onStart = onStart, onStop = onStop)
         }
         if (state.items.isEmpty()) {
-            item(key = "items_empty") {
-                Box(Modifier.padding(horizontal = HintMargin)) {
-                    Text(
-                        text = stringResource(
-                            if (state.received) R.string.slim_items_empty
-                            else R.string.slim_waiting
-                        ),
-                        style = MiuixTheme.textStyles.footnote1,
-                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                    )
+            // 一帧都没收到时上面那张卡已经写了"等待相册进程上报…"，这里再来一遍是重复
+            if (state.received) {
+                item(key = "items_empty") {
+                    Box(Modifier.padding(horizontal = HintMargin)) {
+                        Text(
+                            text = stringResource(R.string.slim_items_empty),
+                            style = MiuixTheme.textStyles.footnote1,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+                        )
+                    }
                 }
             }
         } else {
@@ -309,69 +306,68 @@ private fun SlimSummaryCard(state: SlimState, now: Long, stale: Boolean) {
 }
 
 /**
- * 页内的动作行：一个主按钮（开始/停止）+ 相册自带优化入口。
+ * 页内的动作区：一个整宽的主按钮（开始/停止）+ 一个次级按钮（相册自带优化）。
  *
- * 不放进底栏：主界面已经有自己的底栏，再把这一页的按钮塞进 Scaffold 会变成两层底栏。
+ * <p>主按钮不再缩在卡片里跟一行小字挤在一起：Miuix 的主操作就是一整条填色按钮，
+ * 占满内容宽度、比卡片更抢眼；次级入口用次级按钮（浅底），层级一眼分得开。
+ *
+ * <p>不放进底栏：主界面已经有自己的底栏，再把这一页的按钮塞进 Scaffold 会变成两层底栏。
  */
 @Composable
 private fun SlimActionRow(state: SlimState, onStart: (Int) -> Unit, onStop: () -> Unit) {
     val context = LocalContext.current
     var nativeUnavailable by remember { mutableStateOf(false) }
-    Card(
+    Column(
         modifier = Modifier.padding(horizontal = ScreenMargin),
-        insideMargin = PaddingValues(12.dp)
+        verticalArrangement = Arrangement.spacedBy(HintGap)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(BlockGap)
-        ) {
-            if (state.running) {
-                Button(
-                    onClick = onStop,
-                    modifier = Modifier.weight(1f),
-                    // 已经点了停止就别再下发第二次，否则队列会收到一串重复的停止命令
-                    enabled = !state.stopping
-                ) {
-                    Text(
-                        text = stringResource(
-                            if (state.stopping) R.string.slim_action_stopping
-                            else R.string.slim_action_stop
-                        )
-                    )
-                }
-            } else {
-                Button(
-                    onClick = { onStart(DEFAULT_CONCURRENCY) },
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.buttonColorsPrimary(
-                        // 与设置页一致：默认禁用态白字压浅蓝底，几乎读不清
-                        disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
-                    )
-                ) {
-                    Text(text = stringResource(R.string.slim_action_start))
-                }
-            }
-            // 逃生口：相册被禁用/卸载时返回 false，就地提示，不弹对话框打断
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        if (state.running) {
+            // 停止用默认（次级）色：它不推进任何事情，只是刹车，不该和"开始"一样抢眼
+            Button(
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth(),
+                // 已经点了停止就别再下发第二次，否则队列会收到一串重复的停止命令
+                enabled = !state.stopping
+            ) {
                 Text(
-                    text = stringResource(R.string.slim_action_native),
-                    modifier = Modifier.clickable {
-                        nativeUnavailable = !openNativeSlim(context)
-                    },
-                    style = MiuixTheme.textStyles.footnote1,
-                    color = MiuixTheme.colorScheme.primary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                if (nativeUnavailable) {
-                    Text(
-                        text = stringResource(R.string.slim_native_unavailable),
-                        style = MiuixTheme.textStyles.footnote1,
-                        color = MiuixTheme.colorScheme.error
+                    text = stringResource(
+                        if (state.stopping) R.string.slim_action_stopping
+                        else R.string.slim_action_stop
                     )
-                }
+                )
             }
+        } else {
+            Button(
+                onClick = { onStart(DEFAULT_CONCURRENCY) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColorsPrimary(
+                    // 与设置页一致：默认禁用态白字压浅蓝底，几乎读不清
+                    disabledContentColor = MiuixTheme.colorScheme.onSurfaceVariantSummary
+                )
+            ) {
+                Text(text = stringResource(R.string.slim_action_start))
+            }
+        }
+        // 逃生口：相册被禁用/卸载时返回 false，就地提示，不弹对话框打断
+        TextButton(
+            text = stringResource(R.string.slim_action_native),
+            onClick = { nativeUnavailable = !openNativeSlim(context) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        if (nativeUnavailable) {
+            Text(
+                text = stringResource(R.string.slim_native_unavailable),
+                style = MiuixTheme.textStyles.footnote1,
+                color = MiuixTheme.colorScheme.error
+            )
+        }
+        if (!state.running) {
+            // 空闲时解释这一页会做什么：光一个按钮，用户不知道点下去要等多久、会改哪些照片
+            Text(
+                text = stringResource(R.string.slim_idle_summary),
+                style = MiuixTheme.textStyles.footnote1,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+            )
         }
     }
 }

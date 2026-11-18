@@ -1,20 +1,17 @@
 package com.tongluosao.gallerysync.ui
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import com.tongluosao.gallerysync.R
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.NavigationBar
 import top.yukonga.miuix.kmp.basic.NavigationBarItem
@@ -99,12 +96,9 @@ fun MainScreen(
                         title = stringResource(pageTitle(detail)),
                         scrollBehavior = scrollBehavior,
                         navigationIcon = {
-                            Box(
-                                modifier = Modifier
-                                    .clickable { pageIndex = NO_PAGE }
-                                    .padding(horizontal = ScreenMargin, vertical = HintGap),
-                                contentAlignment = Alignment.Center
-                            ) {
+                            // 用 Miuix 的 IconButton 而不是自己拼 Box + clickable：
+                            // 点击热区、按下反馈、无障碍角色都由组件给，与顶栏其它图标一致
+                            IconButton(onClick = { pageIndex = NO_PAGE }) {
                                 Icon(
                                     imageVector = MiuixIcons.Back,
                                     contentDescription = stringResource(R.string.action_back)
