@@ -1031,15 +1031,22 @@ public final class WebDavClient {
             int port = url.getPort() == -1 ? url.getDefaultPort() : url.getPort();
             String target = url.getFile().isEmpty() ? "/" : url.getFile();
             boolean reused = mSocket != null;
-            try {
-                received = getOnce(host, port, target, tmp);
-            } catch (IOException e) {
-                dropConnection();
-                if (!reused) {
-                    throw transportFailure("GET", host, e);
+            Long viaDirect = getViaCachedDirectUrl(url, tmp);
+            if (viaDirect != null) {
+                // 直链命中：一次连接、一个请求就把体收回来了，没有 302 那一跳，
+                // 也就不需要为"问跳转"再握一次手
+                received = viaDirect;
+            } else {
+                try {
+                    received = getOnce(host, port, target, tmp);
+                } catch (IOException e) {
+                    dropConnection();
+                    if (!reused) {
+                        throw transportFailure("GET", host, e);
+                    }
+                    Logger.d("event=conn_reopen method=GET reason=" + e.getMessage());
+                    received = getOnce(host, port, target, tmp);
                 }
-                Logger.d("event=conn_reopen method=GET reason=" + e.getMessage());
-                received = getOnce(host, port, target, tmp);
             }
             drained = true;
         } finally {
@@ -1065,6 +1072,48 @@ public final class WebDavClient {
         return getOnce(host, port, target, tmp, 5);
     }
 
+    /**
+     * 有 302 直链缓存时**直接连存储主机**取体，跳过"问 WebDAV 主机要跳转"那一跳。
+     *
+     * <p>每个对象两次握手（WebDAV 主机 + 存储主机）是自动下载的主要固定开销：一个对象
+     * 几百 KB，握手却和它一样贵。直链在 3 分钟内有效，所以同一个对象的**重试**
+     * （失败重传、断点后重来、被取消后重排）一律走这条快路。
+     *
+     * <p>签名过期或被拒时把缓存踢掉（{@link #invalidateDirectUrl}）并返回 null，
+     * 调用方退回普通的两跳路径 —— 既不会因为一条坏缓存下不了文件，
+     * 也不会把"直链失败"当成"远端没有这个对象"。
+     *
+     * @return 实际写入的字节数；没有可用直链、或直链这次不灵时返回 {@code null}
+     */
+    private Long getViaCachedDirectUrl(URL requestUrl, File tmp) {
+        String cached = cachedDirectUrl(requestUrl.toString());
+        if (cached == null) {
+            return null;
+        }
+        try {
+            URL direct = new URL(cached);
+            String protocol = direct.getProtocol();
+            if (!("http".equalsIgnoreCase(protocol) || "https".equalsIgnoreCase(protocol))) {
+                throw new IOException("unsupported direct url scheme");
+            }
+            // 签名直链自带授权：不能再带 WebDAV 凭据（跨域，带了反而会被拒）
+            WebDavClient directClient = new WebDavClient(
+                    protocol + "://" + direct.getAuthority(), null);
+            directClient.setProgressListener(mProgressListener);
+            try {
+                int directPort = direct.getPort() < 0 ? direct.getDefaultPort() : direct.getPort();
+                return directClient.getOnce(direct.getHost(), directPort,
+                        direct.getFile().isEmpty() ? "/" : direct.getFile(), tmp, 5);
+            } finally {
+                directClient.close();
+            }
+        } catch (IOException | RuntimeException e) {
+            invalidateDirectUrl(cached);
+            Logger.d("event=get_direct_miss reason=" + e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
     private long getOnce(String host, int port, String target, File tmp, int redirectsLeft)
             throws IOException {
         Socket socket = connect(host, port);
@@ -1083,6 +1132,10 @@ public final class WebDavClient {
             }
             URL current = new URL(mSecure ? "https" : "http", host, port, target);
             URL next = downloadRedirect(current, head.location);
+            // 记住这一次 302 的目的地：同一个对象重试时直接连存储直链，省掉一次
+            // "问 WebDAV 主机要跳转"的往返（那是一次 TLS 握手 + 一次请求）。
+            // 旧版只给 Range 请求记了这张表，整份下载从不写它，所以下载路径永远是两跳。
+            cacheDirectUrl(current.toString(), next.toString());
             // A storage signed URL must never receive the WebDAV account credentials.
             String auth = sameOrigin(current, next) ? mAuthHeader : null;
             dropConnection(); // The redirect response body has not been consumed.
@@ -1106,7 +1159,7 @@ public final class WebDavClient {
                     ? readChunked(mReader, DETAIL_LIMIT)
                     : readCapped(mReader, head.contentLength, DETAIL_LIMIT);
             // Do not log signed redirect URLs or response bodies containing credentials.
-            throw new IOException("GET failed code=" + head.code);
+            throw new HttpStatusException(head.code, "GET failed code=" + head.code);
         }
 
         long written;
@@ -2126,6 +2179,25 @@ public final class WebDavClient {
     public static class TransportFailure extends IOException {
         public TransportFailure(String message, Throwable cause) {
             super(message, cause);
+        }
+    }
+
+    /**
+     * 服务器**答话**了，但答的是失败码（404/403/…）。
+     *
+     * <p>为什么要一个类型：下载侧要从"这次失败"里学到东西 —— 404 说明远端对象确实没了，
+     * 可以记进 {@link DownloadProbeCache}，接下来的重试在 5 分钟内一次握手都不用花；
+     * 而连接层失败（{@link TransportFailure}）什么也证明不了，绝不能写成"远端没有"。
+     * 靠解析异常消息里的 {@code code=404} 也能做，但那是拿日志格式当 API。
+     *
+     * <p>消息文本与旧版完全一致（{@code "GET failed code=404"}），旧调用方与日志格式不变。
+     */
+    public static class HttpStatusException extends IOException {
+        public final int code;
+
+        public HttpStatusException(int code, String message) {
+            super(message);
+            this.code = code;
         }
     }
 

@@ -14,6 +14,18 @@ import com.tongluosao.gallerysync.core.Logger
 import com.tongluosao.gallerysync.core.ProgressProtocol
 import org.json.JSONObject
 
+/**
+ * 刚完成的下载项在列表里留多久。
+ *
+ * <p>自动下载的单张原图在局域网上可能几百毫秒就传完，2Hz 的进度帧本来就跟不上它；
+ * 3 分钟足够"打开进度页 → 切个后台再回来"看到这一轮下载过什么，又不会把几小时前的
+ * 旧记录一直顶着"刚完成"。
+ */
+private const val DONE_RETENTION_MS = 3 * 60_000L
+
+/** 下载栏里最多留几行"刚完成"：再多只会把正在传的行挤出屏幕 */
+private const val DONE_MAX = 12
+
 /** 一帧里的一项正在传的任务。下载方向的项除了 [dir] 之外与上传项同构 */
 data class ActiveUpload(
     val key: String,
@@ -49,19 +61,30 @@ data class ProgressTask(
     val size: Long,
     val video: Boolean,
     val sent: Long?,
-    val dir: String
+    val dir: String,
+    /**
+     * 刚刚完成、暂时留在列表里的一行（只有下载方向会用）。
+     *
+     * <p>自动下载的单项可能只活几百毫秒：2Hz 的帧刚把它带上来，下一帧它就已经被
+     * `taskEnd` 摘掉了。不留一段"已完成"，用户一抬头就什么都看不到了。
+     */
+    val completed: Boolean = false
 ) {
-    val uploading: Boolean get() = sent != null
+    val uploading: Boolean get() = sent != null && !completed
 
     val downloading: Boolean get() = dir == ProgressProtocol.DIR_DOWN
 
     /** 进度条用。size 为 0 时按 0 处理，别除出 NaN */
     val fraction: Float =
-        if (sent == null || size <= 0L) 0f
+        if (completed) 1f
+        else if (sent == null || size <= 0L) 0f
         else (sent.toDouble() / size).coerceIn(0.0, 1.0).toFloat()
 
     /** 右侧百分比。未在传时为 null，那时显示体积 */
-    val percent: Int? = if (sent == null) null else (fraction * 100f).toInt()
+    val percent: Int? =
+        if (completed) 100
+        else if (sent == null) null
+        else (fraction * 100f).toInt()
 }
 
 /**
@@ -75,6 +98,10 @@ data class ProgressUiState(
     val active: List<ActiveUpload> = emptyList(),
     val queued: List<QueuedUpload> = emptyList(),
     val tasks: List<ProgressTask> = emptyList(),
+    /** 刚完成、还留在下载栏里的项（时间倒序，最新的在前） */
+    val completed: List<ProgressTask> = emptyList(),
+    /** 下载栏里有几项正在传（排队与刚完成都不算） */
+    val activeDownloads: Int = 0,
     val pending: Int = 0,
     val pendingPhotos: Int = 0,
     val pendingVideos: Int = 0,
@@ -99,6 +126,25 @@ data class ProgressUiState(
      * `pending` 是"还没轮到的项数"（不含在传），所以要加上在传的几项才是队列总量。
      */
     val queuedHidden: Int get() = (pending + active.size - tasks.size).coerceAtLeast(0)
+
+    /**
+     * 下载栏的内容：在传 → 刚完成 → 排队。
+     *
+     * <p>"刚完成"的键要从排队部分里剔掉：发布端的排队列表含在传项（客户端按 key 去重），
+     * 一项刚传完时它可能还留在上一份 `pl` 里，不去重就会出现两行同 key —— LazyColumn 会直接崩。
+     */
+    val downloads: List<ProgressTask>
+        get() {
+            val doneKeys = completed.mapTo(HashSet(completed.size * 2)) { it.key }
+            val activeDown = tasks.filter { it.downloading && it.uploading }
+            val queuedDown = tasks.filter {
+                it.downloading && !it.uploading && it.key !in doneKeys
+            }
+            return activeDown + completed + queuedDown
+        }
+
+    /** 下载以外（上传）的行 */
+    val uploads: List<ProgressTask> get() = tasks.filter { !it.downloading }
 }
 
 /**
@@ -126,6 +172,25 @@ class ProgressModel {
     var mediaPermission by mutableStateOf(false)
         private set
 
+    /**
+     * 整体下载速度的采样窗口（最近 4 秒的总已下载字节）。
+     *
+     * <p>放在模型里而不是帧里：速度是"帧与帧之间"的量，发布端 2Hz 只报累计字节，
+     * 客户端按收到的时刻自己滑窗。收到非下载帧时清空 —— 队列空掉后旧窗口没有意义。
+     */
+    var speedSamples by mutableStateOf(emptyList<SpeedSample>())
+        private set
+
+    /**
+     * 已经不在活动集合里、但还留在下载栏的项（按完成时刻倒序）。
+     *
+     * <p>键是发布端给的去重键：同一项完成后再被重排（失败重试）时先按它清掉旧行，
+     * 免得列表里同时出现"已完成"和"排队中"两条同 key。
+     */
+    private val finishedDown = ArrayList<ProgressTask>()
+
+    private var lastDownCount = 0
+
     private var registered = false
 
     private val receiver = object : BroadcastReceiver() {
@@ -144,6 +209,18 @@ class ProgressModel {
             // 状态切换才记，帧本身 2Hz 一帧，每帧都记会把日志刷满
             if (previous != frame.state) {
                 Logger.i("event=progress_state state=${frame.state} active=${frame.active.size}")
+            }
+            // 下载项进出活动集合时记一行：现场排查"进度页里有没有下载行"只看这一处
+            if (frame.activeDownloads != lastDownCount) {
+                lastDownCount = frame.activeDownloads
+                val speed = DownloadSpeed.bytesPerSecond(
+                    speedSamples,
+                    System.currentTimeMillis()
+                )
+                Logger.i(
+                    "event=progress_download_active active=${frame.activeDownloads}" +
+                        " shown=${frame.downloads.size} speed=${DownloadSpeed.format(speed)}"
+                )
             }
         }
     }
@@ -264,11 +341,16 @@ class ProgressModel {
                 ui.queued
             }
             val tasks = buildTasks(queued, active)
+            val now = System.currentTimeMillis()
+            recordFinished(active, now)
+            updateSpeedSamples(active, now)
             ProgressUiState(
                 state = root.optString("state", ProgressProtocol.STATE_IDLE),
                 active = active,
                 queued = queued,
                 tasks = tasks,
+                completed = ArrayList(finishedDown),
+                activeDownloads = tasks.count { it.downloading && it.uploading },
                 pending = root.optInt("pending", 0),
                 pendingPhotos = root.optInt("ph", 0),
                 pendingVideos = root.optInt("pv", 0),
@@ -282,6 +364,84 @@ class ProgressModel {
             Logger.w("event=progress_parse_failed detail=$t")
             null
         }
+    }
+
+    /**
+     * 把"上一帧还在传、这一帧没了"的下载项记成刚完成。
+     *
+     * <p>发布端在 `taskEnd` 里就把项从活动集合摘掉，成功、失败、取消一视同仁 ——
+     * 对进度页来说三者都是"不再动了"，所以这里不区分，只保证这一行不会凭空消失。
+     * 同一项如果重新排队（失败重试），[recordFinished] 会先把旧的完成行删掉。
+     */
+    private fun recordFinished(active: List<ActiveUpload>, now: Long) {
+        val stillActive = HashSet<String>(active.size * 2)
+        for (item in active) {
+            if (item.dir == ProgressProtocol.DIR_DOWN) {
+                stillActive.add(item.key)
+            }
+        }
+        // 重新开始的项：把旧的"已完成"行换成新的进行中行，避免同 key 两行
+        finishedDown.removeAll { stillActive.contains(it.key) }
+        for (item in ui.active) {
+            if (item.dir != ProgressProtocol.DIR_DOWN) {
+                continue
+            }
+            if (stillActive.contains(item.key) || item.size <= 0L) {
+                continue
+            }
+            finishedDown.add(
+                0,
+                ProgressTask(
+                    key = item.key,
+                    name = item.name,
+                    path = item.path,
+                    size = item.size,
+                    video = item.video,
+                    sent = item.size,
+                    dir = ProgressProtocol.DIR_DOWN,
+                    completed = true
+                )
+            )
+            finishTimes[item.key] = now
+        }
+        val expired = finishTimes.filterValues { now - it > DONE_RETENTION_MS }.keys
+        if (expired.isNotEmpty()) {
+            finishedDown.removeAll { it.key in expired }
+            finishTimes.keys.removeAll(expired)
+        }
+        while (finishedDown.size > DONE_MAX) {
+            val removed = finishedDown.removeAt(finishedDown.size - 1)
+            finishTimes.remove(removed.key)
+        }
+    }
+
+    /** 完成行的时刻没有单独字段：按 key 记在模型里，用来做保留期裁剪 */
+    private val finishTimes = HashMap<String, Long>()
+
+    /**
+     * 用这一帧的活动下载项更新速度窗口。
+     *
+     * <p>只有下载项参与：上传与下载抢同一条链路，混在一起算出来的既不是上传速度
+     * 也不是下载速度。没有活动下载项时直接清空窗口 —— 否则下次开下载，第一帧会和
+     * 几小时前的旧采样相减。
+     */
+    private fun updateSpeedSamples(active: List<ActiveUpload>, now: Long) {
+        var bytes = 0L
+        var count = 0
+        for (item in active) {
+            if (item.dir != ProgressProtocol.DIR_DOWN) {
+                continue
+            }
+            count++
+            bytes += if (item.sent <= 0L) 0L else minOf(item.sent, item.size)
+        }
+        if (count == 0) {
+            if (speedSamples.isNotEmpty()) {
+                speedSamples = emptyList()
+            }
+            return
+        }
+        speedSamples = DownloadSpeed.append(speedSamples, SpeedSample(now, bytes))
     }
 
     /**

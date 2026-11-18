@@ -119,9 +119,28 @@ fun ProgressContent(
                 TotalProgressCard(state, stale)
             }
         }
+        // 下载项单独一块：自动下载是"平板上把云端原图拉回来"，和上传是两件事，
+        // 混在一张列表里既看不出谁在动，也没地方挂整体速度
+        val downloads = state.downloads
+        if (downloads.isNotEmpty()) {
+            item(key = "download_header") {
+                DownloadHeader(
+                    active = state.activeDownloads,
+                    completed = state.completed.size,
+                    speed = DownloadSpeed.bytesPerSecond(progress.speedSamples, now)
+                )
+            }
+            items(downloads, key = { "dl|" + it.key }) { task ->
+                TaskRow(
+                    task = task,
+                    permissionGranted = progress.mediaPermission,
+                    modifier = Modifier.animateItem()
+                )
+            }
+        }
         // key 用帧里带的去重键（路径+大小+时间），不是列表下标：
         // 一项传完消失时，剩下的行不该被重新绑定到别人的数据上
-        items(state.tasks, key = { it.key }) { task ->
+        items(state.uploads, key = { "up|" + it.key }) { task ->
             TaskRow(
                 task = task,
                 permissionGranted = progress.mediaPermission,
@@ -135,7 +154,7 @@ fun ProgressContent(
                 }
             }
         }
-        if (state.tasks.isEmpty()) {
+        if (state.tasks.isEmpty() && state.completed.isEmpty()) {
             item(key = "empty") {
                 Box(Modifier.padding(top = SectionGap)) {
                     EmptyHint(everReceived = progress.everReceived, stale = stale)
@@ -177,7 +196,7 @@ private fun TaskRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                if (task.uploading) {
+                if (task.uploading || task.completed) {
                     LinearProgressIndicator(
                         progress = task.fraction,
                         height = RowProgressHeight,
@@ -203,9 +222,12 @@ private fun TaskRow(
     }
 }
 
-/** 右侧那一段：在传时给百分比，排队时给体积 */
+/** 右侧那一段：刚完成给"已完成"，在传给百分比，排队时给体积 */
 @Composable
 private fun trailingText(task: ProgressTask): String {
+    if (task.completed) {
+        return stringResource(R.string.progress_task_done)
+    }
     val percent = task.percent
     if (percent == null) {
         return formatBytes(task.size)
@@ -299,6 +321,42 @@ private fun TotalProgressCard(state: ProgressUiState, stale: Boolean) {
             if (stale) {
                 AlertText(stringResource(R.string.progress_stale))
             }
+        }
+    }
+}
+
+/**
+ * 下载栏头部：标题 + 整体下载速度。
+ *
+ * <p>速度是"最近 4 秒的总字节差"，由 [DownloadSpeed.bytesPerSecond] 从模型里的采样算出来；
+ * 这一页本来就有 1Hz 的走时钟，所以窗口滑动、速度自然衰减到 0 都会跟着刷新，
+ * 不需要为速度再开一条定时器。
+ */
+@Composable
+private fun DownloadHeader(active: Int, completed: Int, speed: Long) {
+    val detail = when {
+        active > 0 -> DownloadSpeed.summary(speed, active)
+        completed > 0 -> stringResource(R.string.progress_download_done_count, completed)
+        else -> stringResource(R.string.progress_download_idle)
+    }
+    Card(
+        modifier = Modifier.padding(horizontal = ScreenMargin),
+        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = stringResource(R.string.progress_download_section),
+                style = MiuixTheme.textStyles.body1,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = detail,
+                style = MiuixTheme.textStyles.footnote1,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary
+            )
         }
     }
 }

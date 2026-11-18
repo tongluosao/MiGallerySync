@@ -90,6 +90,15 @@ class SettingsModel : CoroutineScope {
     /** 并行路数，取值下标 = 路数 - 1，对应 [CONCURRENCY_ITEMS] */
     var concurrencyIndex by mutableStateOf(Config.DEFAULT_UPLOAD_CONCURRENCY - 1)
         private set
+
+    /**
+     * 自动下载的并行路数，下标 = 路数 - 1，对应 [DOWNLOAD_CONCURRENCY_ITEMS]。
+     *
+     * <p>和上传那一条分开：上传是"把本机照片推上去"，下载是"把云端原图拉回来"，
+     * 两者的瓶颈经常不是同一条线路，共用一个数字会让用户为了下载调高上传。
+     */
+    var downloadConcurrencyIndex by mutableStateOf(Config.DEFAULT_DOWNLOAD_CONCURRENCY - 1)
+        private set
     /** 单文件体积上限的选项下标，取值见 [SIZE_CAP_VALUES]，下标 0 = 不限 */
     var maxUploadBytesIndex by mutableStateOf(SIZE_CAP_DEFAULT_INDEX)
         private set
@@ -223,6 +232,12 @@ class SettingsModel : CoroutineScope {
     fun onConcurrencyChange(index: Int) {
         concurrencyIndex = index.coerceIn(0, CONCURRENCY_ITEMS.lastIndex)
         writeNow(Config.KEY_UPLOAD_CONCURRENCY, concurrencyIndex + 1)
+    }
+
+    /** 自动下载的路数，与上传那一条同构：下标进、真值出 */
+    fun onDownloadConcurrencyChange(index: Int) {
+        downloadConcurrencyIndex = index.coerceIn(0, DOWNLOAD_CONCURRENCY_ITEMS.lastIndex)
+        writeNow(Config.KEY_DOWNLOAD_CONCURRENCY, downloadConcurrencyIndex + 1)
     }
 
     /**
@@ -469,6 +484,9 @@ class SettingsModel : CoroutineScope {
         concurrencyIndex = concurrencyIndexOf(
             source.getInt(Config.KEY_UPLOAD_CONCURRENCY, Config.DEFAULT_UPLOAD_CONCURRENCY)
         )
+        downloadConcurrencyIndex = downloadConcurrencyIndexOf(
+            source.getInt(Config.KEY_DOWNLOAD_CONCURRENCY, Config.DEFAULT_DOWNLOAD_CONCURRENCY)
+        )
         maxUploadBytesIndex = sizeCapIndexOf(
             readLong(source, Config.KEY_MAX_UPLOAD_BYTES, Config.DEFAULT_MAX_UPLOAD_BYTES)
         )
@@ -516,6 +534,10 @@ class SettingsModel : CoroutineScope {
 
             Config.KEY_UPLOAD_CONCURRENCY -> concurrencyIndex = concurrencyIndexOf(
                 source.getInt(key, Config.DEFAULT_UPLOAD_CONCURRENCY)
+            )
+
+            Config.KEY_DOWNLOAD_CONCURRENCY -> downloadConcurrencyIndex = downloadConcurrencyIndexOf(
+                source.getInt(key, Config.DEFAULT_DOWNLOAD_CONCURRENCY)
             )
 
             Config.KEY_MAX_UPLOAD_BYTES -> maxUploadBytesIndex = sizeCapIndexOf(
@@ -611,6 +633,7 @@ class SettingsModel : CoroutineScope {
             Config.KEY_SKIP_EXISTING_REMOTE,
             KEY_WEBDAV_TAKEOVER,
             Config.KEY_UPLOAD_CONCURRENCY,
+            Config.KEY_DOWNLOAD_CONCURRENCY,
             Config.KEY_MAX_UPLOAD_BYTES,
             Config.KEY_PRESERVE_METADATA,
             Config.KEY_PRESERVE_HEIC_FORMAT,
@@ -635,6 +658,10 @@ class SettingsModel : CoroutineScope {
 
         /** 并行路数的选项文案，下标 = 路数 - 1 */
         val CONCURRENCY_ITEMS = (1..Config.MAX_UPLOAD_CONCURRENCY).map { it.toString() }
+
+        /** 自动下载并行的选项文案，下标 = 路数 - 1；上限与上传分开配，故另立一份 */
+        val DOWNLOAD_CONCURRENCY_ITEMS =
+            (1..Config.MAX_DOWNLOAD_CONCURRENCY).map { it.toString() }
 
         /**
          * 单文件体积上限的落盘值（字节），顺序必须与界面下拉的文案一致：
@@ -692,6 +719,11 @@ class SettingsModel : CoroutineScope {
          */
         private fun concurrencyIndexOf(value: Int): Int {
             return Config.clampConcurrency(value) - 1
+        }
+
+        /** 自动下载路数换算成下标，夹取口径与 [Config.clampDownloadConcurrency] 同源 */
+        private fun downloadConcurrencyIndexOf(value: Int): Int {
+            return Config.clampDownloadConcurrency(value) - 1
         }
 
         /**

@@ -25,6 +25,7 @@ object SettingId {
     val VERIFY_ASYNC = Config.KEY_VERIFY_ASYNC
     val SKIP_EXISTING_REMOTE = Config.KEY_SKIP_EXISTING_REMOTE
     val UPLOAD_CONCURRENCY = Config.KEY_UPLOAD_CONCURRENCY
+    val DOWNLOAD_CONCURRENCY = Config.KEY_DOWNLOAD_CONCURRENCY
     val MAX_UPLOAD_BYTES = Config.KEY_MAX_UPLOAD_BYTES
     val PRESERVE_METADATA = Config.KEY_PRESERVE_METADATA
     val PRESERVE_HEIC_FORMAT = Config.KEY_PRESERVE_HEIC_FORMAT
@@ -147,6 +148,7 @@ enum class SettingsSection(val title: String, val items: List<String>) {
             SettingId.WEBDAV_TAKEOVER,
             SettingId.TAKEOVER_NOW,
             SettingId.UPLOAD_CONCURRENCY,
+            SettingId.DOWNLOAD_CONCURRENCY,
             SettingId.MAX_UPLOAD_BYTES
         )
     ),

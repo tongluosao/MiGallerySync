@@ -153,6 +153,19 @@ public final class Config {
      * 仅 Wi-Fi、每轮上限与失败上限这四道闸。
      */
     public static final String KEY_AUTO_DOWNLOAD = "auto_download_remote_only";
+    /**
+     * 自动下载（按注册表把 {@code REMOTE_ONLY} 行下回来）的并行路数，
+     * 1..{@link #MAX_DOWNLOAD_CONCURRENCY}。
+     *
+     * <p>与 {@link #KEY_UPLOAD_CONCURRENCY} 对称：自动下载永远是"一批几十上百个对象"，
+     * 每个对象一次握手（PROPFIND/302/TLS），单路排队时瓶颈根本不在带宽，而在
+     * 一个一个建的连接上。下载走向与小上传不同（数据流是服务端 → 本机），
+     * 所以单独给一个路数，不跟上传共用同一个数字。
+     *
+     * <p>这些路数只用于**自动下载**（注册表驱动的那条链路）；普通补齐下载仍走
+     * {@code DownloadQueue.THREADS} 那两路固定 worker，两者互不抢占。
+     */
+    public static final String KEY_DOWNLOAD_CONCURRENCY = "download_concurrency";
 
     /** 默认保留优化图与 HQ 下载原图中的元数据。 */
     public static final boolean DEFAULT_PRESERVE_METADATA = true;
@@ -163,6 +176,13 @@ public final class Config {
      * 永远不会被排进下载队列，日志里是 {@code event=auto_download_skip reason=disabled}。
      */
     public static final boolean DEFAULT_AUTO_DOWNLOAD = true;
+    /**
+     * 自动下载默认 3 路：与上传的默认值一致，够把"每对象一次握手"的等待叠起来，
+     * 又不至于让自建 WebDAV 或挂载型后端（OpenList 一类）一次开太多连接。
+     */
+    public static final int DEFAULT_DOWNLOAD_CONCURRENCY = 3;
+    /** 与 {@link #MAX_UPLOAD_CONCURRENCY} 同口径：再高对服务端就是压测，收益已经很小 */
+    public static final int MAX_DOWNLOAD_CONCURRENCY = 8;
     /** 默认与相册共用一条记录：升级后行为不变，不想让相册那条记录被改的人自己去开分开记录 */
     public static final String DEFAULT_LOCAL_FLAG_MODE = FLAG_MODE_SHARED;
 
@@ -185,6 +205,8 @@ public final class Config {
     private final boolean preserveHeicFormat;
     private final boolean autoDownload;
     private final String localFlagMode;
+    /** 自动下载并行路数，见 {@link #KEY_DOWNLOAD_CONCURRENCY} */
+    private final int downloadConcurrency;
 
     private Config(SharedPreferences prefs) {
         if (prefs == null) {
@@ -206,6 +228,7 @@ public final class Config {
             preserveHeicFormat = DEFAULT_PRESERVE_HEIC_FORMAT;
             autoDownload = DEFAULT_AUTO_DOWNLOAD;
             localFlagMode = DEFAULT_LOCAL_FLAG_MODE;
+            downloadConcurrency = DEFAULT_DOWNLOAD_CONCURRENCY;
         } else {
             replaceMode = prefs.getString(KEY_REPLACE_MODE, DEFAULT_REPLACE_MODE);
             baseUrl = prefs.getString(KEY_BASE_URL, "");
@@ -228,6 +251,7 @@ public final class Config {
                     KEY_PRESERVE_HEIC_FORMAT, DEFAULT_PRESERVE_HEIC_FORMAT);
             autoDownload = prefs.getBoolean(KEY_AUTO_DOWNLOAD, DEFAULT_AUTO_DOWNLOAD);
             localFlagMode = readFlagMode(prefs);
+            downloadConcurrency = clampDownloadConcurrency(readDownloadConcurrency(prefs));
         }
     }
 
@@ -270,6 +294,36 @@ public final class Config {
             return 1;
         }
         return Math.min(value, MAX_UPLOAD_CONCURRENCY);
+    }
+
+    /**
+     * 把自动下载路数夹进 1..{@link #MAX_DOWNLOAD_CONCURRENCY}。
+     *
+     * <p>与 {@link #clampConcurrency} 同一个思路、同一套边界：0 会让自动下载一路都不开
+     * （表现成"接管了却一张都下不回来"），过大则把服务端打满。两个方法的边界值故意
+     * 保持一致（都是 1..8），但**不合并**：将来两侧若各自调整上限，界面与日志里
+     * 仍然能一眼看出是哪一侧的判据在起作用。
+     */
+    public static int clampDownloadConcurrency(int value) {
+        if (value < 1) {
+            return 1;
+        }
+        return Math.min(value, MAX_DOWNLOAD_CONCURRENCY);
+    }
+
+    /**
+     * 读自动下载路数。
+     *
+     * <p>与 {@link #readMaxUploadBytes} 同一套兜底：共享偏好由别的进程写，值可能来自
+     * 旧版本、手改的 XML 或写成别的类型。读不出来就用默认值，**不抛** ——
+     * 在构造器里抛出去等于整个配置解析失败，下载队列会直接起不来。
+     */
+    private static int readDownloadConcurrency(SharedPreferences prefs) {
+        try {
+            return prefs.getInt(KEY_DOWNLOAD_CONCURRENCY, DEFAULT_DOWNLOAD_CONCURRENCY);
+        } catch (Throwable t) {
+            return DEFAULT_DOWNLOAD_CONCURRENCY;
+        }
     }
 
     /**
@@ -399,6 +453,11 @@ public final class Config {
         return localFlagMode;
     }
 
+    /** 自动下载并行路数，已保证在 1..{@link #MAX_DOWNLOAD_CONCURRENCY} 内 */
+    public int getDownloadConcurrency() {
+        return downloadConcurrency;
+    }
+
 
     @Override
     public String toString() {
@@ -408,6 +467,7 @@ public final class Config {
                 + ", layout=" + remoteLayout
                 + ", wifiOnly=" + wifiOnly
                 + ", workers=" + uploadConcurrency
+                + ", downloadWorkers=" + downloadConcurrency
                 + ", verifyAsync=" + verifyAsync
                 + ", skipRemote=" + skipExistingRemote
                 + ", autoDownload=" + autoDownload

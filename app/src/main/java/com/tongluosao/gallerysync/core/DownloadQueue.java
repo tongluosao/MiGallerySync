@@ -139,8 +139,34 @@ public final class DownloadQueue {
 
     private final Thread[] mWorkers = new Thread[THREADS];
     private Thread mPlanner;
-    private final WebDavClient[] mClients = new WebDavClient[THREADS];
-    private final String[] mClientTargets = new String[THREADS];
+    /**
+     * 自动下载专用 worker，路数由 {@link Config#KEY_DOWNLOAD_CONCURRENCY} 决定。
+     *
+     * <p>为什么不直接加在 {@link #THREADS} 上：那两路是**补齐**下载（远端枚举出来的项），
+     * 它们的数量是"远端枚举多快"的配平；自动下载是"注册表里几千条 REMOTE_ONLY 一条条
+     * 握手取回"的另一条链路，瓶颈在每对象的握手与排队，两者共用一个数字只会让一边
+     * 把另一边饿死。这里各走各的通道，唯一共享的是 {@link #mLock} 保护的队列与账本。
+     */
+    private final Thread[] mAutoWorkers = new Thread[Config.MAX_DOWNLOAD_CONCURRENCY];
+    /** 当前生效的自动下载路数；调小时旧线程按“下标越界”自己退出 */
+    private volatile int mAutoConcurrency;
+    /** 路数改动的互斥：setConfig 与构造器都可能调用，不能同时开同一个下标 */
+    private final Object mAutoGate = new Object();
+    /**
+     * 每路一条连接：{@code [0, THREADS)} 给通用 worker，其后是自动下载的每一路。
+     *
+     * <p>绝不能共用：两个线程同时读同一个响应体必然串包（这是"列表与下载不能共用
+     * 一条连接"那条注释的同一个道理，只是换成了 worker 之间）。
+     */
+    private final WebDavClient[] mClients =
+            new WebDavClient[THREADS + Config.MAX_DOWNLOAD_CONCURRENCY];
+    private final String[] mClientTargets =
+            new String[THREADS + Config.MAX_DOWNLOAD_CONCURRENCY];
+    /**
+     * 本轮已知的"远端对象在不在"：目录枚举名单 + 5 分钟内的逐条结论。
+     * 用它替掉自动下载里逐条的 {@code propfindSize}，见 {@link DownloadProbeCache}。
+     */
+    private final DownloadProbeCache mProbeCache = new DownloadProbeCache();
 
     /** 进度发布器（与上传共用一个），由 Hook 侧接线 */
     private volatile UploadProgressPublisher mPublisher;
@@ -280,6 +306,8 @@ public final class DownloadQueue {
             mWorkers[i] = thread;
             thread.start();
         }
+        applyAutoConcurrency(config == null
+                ? Config.DEFAULT_DOWNLOAD_CONCURRENCY : config.getDownloadConcurrency());
     }
 
     public static DownloadQueue get(Context context, Config config) {
@@ -313,6 +341,46 @@ public final class DownloadQueue {
         }
         if (targetChanged) {
             closeClients();
+            // 换目标之后旧的目录名单全部作废：那是另一个远端根的结论
+            mProbeCache.clearListings();
+        }
+        if (config != null) {
+            applyAutoConcurrency(config.getDownloadConcurrency());
+        }
+    }
+
+    /**
+     * 按配置开/收自动下载的路数。
+     *
+     * <p>只补开、不掐断：调小时不动正在下载的那几路，让下标越界的线程下次醒来自己退出
+     * （{@link #autoWorkerLoop} 的循环条件就是 {@code index < mAutoConcurrency}）——
+     * 中途把一条正在下文件的连接关掉，会把那一项白白记成一次失败。
+     *
+     * <p>线程对象只在**死了**的时候才换新的：{@link Thread#isAlive()} 为 false 说明这一路
+     * 已经按收缩退出了，再调大时必须补开，否则那条通道就永久消失了。
+     */
+    private void applyAutoConcurrency(int requested) {
+        int target = Config.clampDownloadConcurrency(requested);
+        int previous;
+        synchronized (mAutoGate) {
+            previous = mAutoConcurrency;
+            if (target == previous) {
+                return;
+            }
+            mAutoConcurrency = target;
+            for (int index : lanesToStart(target, mAutoWorkers)) {
+                Thread worker = new Thread(() -> autoWorkerLoop(index),
+                        "MiGallerySync-autodl-" + index);
+                // daemon：下载线程绝不能拖住相册进程不让它退出
+                worker.setDaemon(true);
+                mAutoWorkers[index] = worker;
+                worker.start();
+            }
+        }
+        Logger.i("event=auto_download_concurrency n=" + target + " previous=" + previous);
+        synchronized (mLock) {
+            // 调大之后新开的那几路要立刻能领到已经在排队的项
+            mLock.notifyAll();
         }
     }
 
@@ -686,6 +754,9 @@ public final class DownloadQueue {
                 // 所以远端树再大、单次 PROPFIND 再慢，也不会把这条链路一起拖住。
                 try {
                     List<Pending> auto = new ArrayList<>();
+                    // 目录名单只活在"这一轮"里：跨轮复用等于拿几分钟前（甚至几小时前）
+                    // 的目录快照判断远端有没有，删掉的照片会被反复判成还在
+                    mProbeCache.clearListings();
                     planAutoDownloads(config, generation, auto);
                     if (!auto.isEmpty()) {
                         enqueue(auto, generation);
@@ -720,6 +791,12 @@ public final class DownloadQueue {
                         Logger.i("event=download_batch_limit rounds=" + MAX_BATCH_ROUNDS);
                     }
                 }
+                // 这一轮自动下载的探测缓存收尾：hit = 因为"本轮已经知道答案"而省掉的握手次数，
+                // miss = 仍然得自己去探的次数，listings = 本轮枚举过并留下的目录名单条数。
+                // 打在这里（走完枚举之后）才有意义：计划侧跑在枚举之前，那时还一个名单都没有。
+                // 取走即清零，下一轮从 0 重新算。
+                Logger.i("event=auto_download_probe_cache " + mProbeCache.takeStatsLine()
+                        + " listings=" + mProbeCache.listingCount());
             } finally {
                 synchronized (mLock) {
                     mPlannerBusy = false;
@@ -795,6 +872,16 @@ public final class DownloadQueue {
         if (entries == null) {
             return;
         }
+        // 这份名单是**完整**的（list() 顶到额度就返回 null，不会给半份），所以名字不在里面
+        // 就是"远端确实没有"。顺手喂给探测缓存：本轮自动下载里凡是落在这个目录的项，
+        // 都能凭名字与长度直接判在不在，一次 PROPFIND 替掉目录内逐文件各一次。
+        LinkedHashMap<String, Long> listedFiles = new LinkedHashMap<>();
+        for (WebDavClient.RemoteEntry entry : entries) {
+            if (!entry.dir && entry.name != null) {
+                listedFiles.put(entry.name, entry.size);
+            }
+        }
+        mProbeCache.putListing(remoteDir, listedFiles);
         int dirs = 0;
         for (WebDavClient.RemoteEntry entry : entries) {
             if (out.size() >= MAX_DOWNLOADS_PER_ROUND || dirs >= MAX_DIRS_PER_ROUND
@@ -956,6 +1043,11 @@ public final class DownloadQueue {
         if (planned > 0) {
             Logger.i("event=auto_download_planned count=" + planned
                     + " queued=" + out.size() + " catalog=" + records.size());
+            // 这批任务会被几路自动下载并行执行、以及本轮总共排了多少：
+            // 单看"下了几张"分不清是路数没生效还是服务端慢，这两个数字能分开
+            Logger.i("event=auto_download_batch planned=" + planned
+                    + " parallel=" + mAutoConcurrency
+                    + " queued=" + out.size() + " catalog=" + records.size());
         }
         for (Map.Entry<AutoDownloadPolicy.Decision, Integer> entry : skipped.entrySet()) {
             String reason = autoDownloadReason(entry.getKey());
@@ -1023,6 +1115,34 @@ public final class DownloadQueue {
             case SKIP_BAD_LENGTH: return "bad_length";
             default: return "unknown";
         }
+    }
+
+    /**
+     * 目标路数之下，真正需要**补开**的通道下标。
+     *
+     * <p>抽成纯函数是为了能直接单测：判据只有两条 —— 目标路数之内的每一路，
+     * 线程还不存在（第一次开）或已经不活了（之前收缩时退出了）就要开；已在跑的不动，
+     * 否则每次改设置都会把进行中的下载掐断，白记一次失败。
+     *
+     * @param target  期望的路数（调用方已夹到 1..{@link Config#MAX_DOWNLOAD_CONCURRENCY}）
+     * @param workers 逐路线程表，长度不小于 {@code target}；元素可为 null
+     */
+    static int[] lanesToStart(int target, Thread[] workers) {
+        if (target <= 0 || workers == null) {
+            return new int[0];
+        }
+        int limit = Math.min(target, workers.length);
+        int[] wanted = new int[limit];
+        int count = 0;
+        for (int i = 0; i < limit; i++) {
+            Thread worker = workers[i];
+            if (worker == null || !worker.isAlive()) {
+                wanted[count++] = i;
+            }
+        }
+        int[] out = new int[count];
+        System.arraycopy(wanted, 0, out, 0, count);
+        return out;
     }
 
     /**
@@ -1267,21 +1387,108 @@ public final class DownloadQueue {
         Iterator<Pending> it = mPending.iterator();
         while (it.hasNext()) {
             Pending pending = it.next();
-            if (mInflight.contains(pending.remotePath)) {
+            // 自动下载的项归 auto 那几路领：通用两路的数量是给"远端枚举出来的补齐项"配的，
+            // 让它们也抢自动项的话，几千条 REMOTE_ONLY 会把补齐项永远压在队尾
+            if (pending.autoDownload) {
                 continue;
             }
-            Integer failures = mFailures.get(pending.remotePath);
-            if (failures != null && failures >= MAX_FAIL_PER_PATH) {
-                it.remove();
-                mPendingVersion++;
-                Logger.w("event=download_give_up remote=" + pending.remotePath
-                        + " attempts=" + failures);
-                continue;
+            Pending claimed = claimLocked(it, pending);
+            if (claimed != null) {
+                return claimed;
             }
-            mInflight.add(pending.remotePath);
-            return pending;
         }
         return null;
+    }
+
+    /**
+     * 领取一项自动下载：只认 {@code autoDownload} 的项。
+     *
+     * <p>与 {@link #takeLocked()} 共用 {@link #claimLocked} 的判据，所以"同一 remotePath
+     * 不重复下载""失败上限""超限项自动出队"这三条对两条链路完全一致 ——
+     * 领走的一刻就把路径记进 {@link #mInflight}，别的路再也领不到同一项。
+     */
+    private Pending takeAutoLocked() {
+        Iterator<Pending> it = mPending.iterator();
+        while (it.hasNext()) {
+            Pending pending = it.next();
+            if (!pending.autoDownload) {
+                continue;
+            }
+            Pending claimed = claimLocked(it, pending);
+            if (claimed != null) {
+                return claimed;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 试着领走一项；领不到返回 null（正在别处下载 / 已达失败上限）。
+     *
+     * @return 领到的那一项（调用方负责 {@code download(...)}）；超限项在这里顺手移出队列
+     */
+    private Pending claimLocked(Iterator<Pending> it, Pending pending) {
+        if (mInflight.contains(pending.remotePath)) {
+            return null;
+        }
+        Integer failures = mFailures.get(pending.remotePath);
+        if (failures != null && failures >= MAX_FAIL_PER_PATH) {
+            it.remove();
+            mPendingVersion++;
+            Logger.w("event=download_give_up remote=" + pending.remotePath
+                    + " attempts=" + failures);
+            return null;
+        }
+        mInflight.add(pending.remotePath);
+        return pending;
+    }
+
+    /**
+     * 自动下载的一路 worker。
+     *
+     * <p>与 {@link #workerLoop()} 只差三处：
+     * <ol>
+     *   <li>只领 {@code autoDownload} 的项（通用 worker 反过来只领普通项，两边不交叉）；</li>
+     *   <li>网络闸门固定用 {@code NetGuard.canUpload(mContext, true)}：这条链路**永远**只走
+     *       Wi-Fi/以太网，与 {@link #planAutoDownloads} 的判据同口径。用
+     *       {@code config.isWifiOnly()} 的话，用户关掉"仅 Wi-Fi 上传"时自动下载会在蜂窝上
+     *       被领走、再在 {@code download} 里取消，白转一圈；</li>
+     *   <li>路数可变：{@code index} 越界就退出（{@link #applyAutoConcurrency} 调小时靠这个收线程）。</li>
+     * </ol>
+     */
+    private void autoWorkerLoop(int index) {
+        while (mRunning && index < mAutoConcurrency) {
+            Config config = mConfig;
+            if (!refreshPolicyState() || config == null || !config.isReady()
+                    || !NetGuard.canUpload(mContext, true)) {
+                waitForSignal();
+                continue;
+            }
+            Pending next = null;
+            int generation;
+            synchronized (mLock) {
+                while (mRunning && next == null && index < mAutoConcurrency) {
+                    next = takeAutoLocked();
+                    if (next == null) {
+                        try {
+                            mLock.wait();
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                }
+                if (!mRunning) {
+                    return;
+                }
+                generation = mWorkGeneration;
+            }
+            if (next != null) {
+                download(next, config, generation);
+            }
+        }
+        Logger.d("event=auto_download_worker_exit index=" + index
+                + " concurrency=" + mAutoConcurrency);
     }
 
     private void download(Pending pending, Config config, int generation) {
@@ -1360,6 +1567,29 @@ public final class DownloadQueue {
                 Logger.i("event=download_skip_suppressed remote=" + pending.remotePath);
                 ok = true;
                 return;
+            }
+            if (pending.autoDownload) {
+                // 远端在不在，本轮可能已经知道了：目录名单里有名字 = 在（还能顺带核对长度），
+                // 名单里没有 = 不在；两者都不必再为"这一步"握一次手。拿不到结论时照旧直接下载，
+                // 不额外加探测 —— 加一次 PROPFIND 只会让正常路径更慢。
+                DownloadProbeCache.Presence presence =
+                        mProbeCache.probe(pending.remotePath, pending.size);
+                if (presence == DownloadProbeCache.Presence.MISSING) {
+                    Logger.i("event=auto_download_skip reason=probe_missing remote="
+                            + pending.remotePath);
+                    throw new IOException("remote object is absent (listed/probed this round)");
+                }
+                if (presence == DownloadProbeCache.Presence.PRESENT) {
+                    long listed = mProbeCache.listedSize(pending.remotePath);
+                    if (listed > 0L && pending.size > 0L && listed != pending.size) {
+                        // 远端长度与注册表不一致：整份下来也过不了长度校验，不如省掉这次传输
+                        Logger.w("event=auto_download_skip reason=probe_size_mismatch remote="
+                                + pending.remotePath + " listed=" + listed
+                                + " expected=" + pending.size);
+                        throw new IOException("remote size changed listed=" + listed
+                                + " expected=" + pending.size);
+                    }
+                }
             }
             WebDavClient client = clientFor(config, index);
             client.setProgressListener((done, total) -> {
@@ -1529,6 +1759,8 @@ public final class DownloadQueue {
             raw.delete();
             raw = null;
             markDone(pending.remotePath, pending.target);
+            // 已经下成了：这一条不需要"在不在"的结论了，别让它留在缓存里占位
+            mProbeCache.forget(pending.remotePath, pending.size);
             boolean rowAdopted = false;
             if (pending.autoDownload) {
                 // 接管行本来就有一行相册记录：把 localFile 精确指回原路径，绝不让扫描器建第二行。
@@ -1556,6 +1788,7 @@ public final class DownloadQueue {
             }
         } catch (IOException e) {
             cleanupUnpublished(raw, staged, compressed);
+            noteProbeFailure(pending, e);
             if (isWorkCurrent(config, generation)) {
                 failureReason = String.valueOf(e.getMessage());
                 fail(pending, failureReason);
@@ -2826,6 +3059,28 @@ public final class DownloadQueue {
         }
     }
 
+    /**
+     * 下载失败时顺手修正探测缓存：只有"服务端明确说 404"才算"远端没有"。
+     *
+     * <p>别的失败（超时、401、5xx、磁盘写不进去）都不说明远端在不在，绝不能记成
+     * MISSING —— 那会让下一轮直接跳过这张图，用户永远下不回原图。命中缓存却拿到 404
+     * 也说明缓存已经过时（或名字被别处改了），{@link DownloadProbeCache#recordProbe}
+     * 会把它覆盖成 MISSING，下一轮就不会再为它握手。
+     */
+    private void noteProbeFailure(Pending pending, IOException e) {
+        if (!pending.autoDownload) {
+            return;
+        }
+        if (!(e instanceof WebDavClient.HttpStatusException)) {
+            return;
+        }
+        if (((WebDavClient.HttpStatusException) e).code != 404) {
+            return;
+        }
+        mProbeCache.recordProbe(pending.remotePath, pending.size, false);
+        Logger.d("event=auto_download_probe_absent remote=" + pending.remotePath);
+    }
+
     private void markDone(String remotePath, String target) {
         synchronized (mLock) {
             if (!target.equals(mDownloadTarget)) {
@@ -2935,12 +3190,23 @@ public final class DownloadQueue {
         return client;
     }
 
-    /** 每个 worker 一路连接，所以只需要区分"我是第几路" */
+    /**
+     * 每个 worker 一路连接，所以只需要区分"我是第几路"。
+     *
+     * <p>自动下载的几路排在通用两路之后（{@code THREADS + i}），因此两拨线程
+     * 绝不会共用同一条连接：共用的话一路的 302 会让另一路读到别人的响应体，
+     * 表现为"下回来的图是本机另一张"。认不出来（不该发生的线程）退到 0 号。
+     */
     private int workerIndex() {
         Thread current = Thread.currentThread();
         for (int i = 0; i < mWorkers.length; i++) {
             if (mWorkers[i] == current) {
                 return i;
+            }
+        }
+        for (int i = 0; i < mAutoWorkers.length; i++) {
+            if (mAutoWorkers[i] == current) {
+                return THREADS + i;
             }
         }
         return 0;

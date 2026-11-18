@@ -292,6 +292,14 @@ private fun PrefItem(id: String, model: SettingsModel) {
             onSelectedIndexChange = model::onConcurrencyChange
         )
 
+        SettingId.DOWNLOAD_CONCURRENCY -> OverlayDropdownPreference(
+            items = SettingsModel.DOWNLOAD_CONCURRENCY_ITEMS,
+            selectedIndex = model.downloadConcurrencyIndex,
+            title = "自动下载并行路数",
+            summary = "同时从云端拉回几张原图。1 最稳，越高越吃带宽；只有自动下载的通道会变，通用下载不变",
+            onSelectedIndexChange = model::onDownloadConcurrencyChange
+        )
+
         SettingId.MAX_UPLOAD_BYTES -> OverlayDropdownPreference(
             items = listOf(
                 stringResource(R.string.size_cap_unlimited),
