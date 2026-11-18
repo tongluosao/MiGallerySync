@@ -980,6 +980,17 @@ public final class DownloadQueue {
         return record.sha1 == null ? "unknown" : record.sha1;
     }
 
+    /** 与 {@link #row(OriginalStore.Record)} 同一口径，给进度/日志用的待下载项版本。 */
+    private static String rowLabel(Pending pending) {
+        if (pending == null) {
+            return "unknown";
+        }
+        if (pending.rowId != null && !pending.rowId.isEmpty()) {
+            return pending.rowId;
+        }
+        return pending.sha1 == null || pending.sha1.isEmpty() ? "unknown" : pending.sha1;
+    }
+
     /**
      * 把"本地已经有同长度原图"的 {@code REMOTE_ONLY} 行直接升级成 ORIGINAL。
      *
@@ -1281,11 +1292,18 @@ public final class DownloadQueue {
         File dest = normalDest;
         String key = key(pending);
         boolean ok = false;
+        /** 失败原因：只用于自动下载的终态日志（成功/取消时保持 null） */
+        String failureReason = null;
         /** 这一项是否已经按原地模式提交（预览就在原路径上，DB 行也已经精确改过） */
         boolean inplaceCommitted = false;
         if (publisher != null) {
             publisher.taskStart(key, baseName(pending.relativePath), normalDest.getAbsolutePath(),
                     size, false, ProgressProtocol.DIR_DOWN);
+            if (pending.autoDownload) {
+                // 自动下载的每条都在进度页占一行（DIR_DOWN），与手动下载同一套字段
+                Logger.d("event=auto_download_progress_publish row=" + rowLabel(pending)
+                        + " bytes=0/" + size + " state=running");
+            }
         }
         File raw = null;
         File staged = null;
@@ -1352,7 +1370,12 @@ public final class DownloadQueue {
                 }
                 UploadProgressPublisher target = mPublisher;
                 if (target != null) {
-                    target.taskBytes(key, done);
+                    if (pending.autoDownload) {
+                        // 自动下载走带日志节流的入口；帧仍然由发布器的心跳统一发
+                        target.taskProgress(key, rowLabel(pending), done, size);
+                    } else {
+                        target.taskBytes(key, done);
+                    }
                 }
             });
             if (qualityRequested) {
@@ -1526,28 +1549,36 @@ public final class DownloadQueue {
         } catch (WebDavClient.TransportFailure e) {
             cleanupUnpublished(raw, staged, compressed);
             if (isWorkCurrent(config, generation)) {
-                fail(pending, e.getMessage());
+                failureReason = String.valueOf(e.getMessage());
+                fail(pending, failureReason);
             } else {
                 Logger.d("event=download_cancelled remote=" + pending.remotePath);
             }
         } catch (IOException e) {
             cleanupUnpublished(raw, staged, compressed);
             if (isWorkCurrent(config, generation)) {
-                fail(pending, e.getMessage());
+                failureReason = String.valueOf(e.getMessage());
+                fail(pending, failureReason);
             } else {
                 Logger.d("event=download_cancelled remote=" + pending.remotePath);
             }
         } catch (Throwable t) {
             cleanupUnpublished(raw, staged, compressed);
             if (isWorkCurrent(config, generation)) {
-                fail(pending, String.valueOf(t));
+                failureReason = String.valueOf(t);
+                fail(pending, failureReason);
                 Logger.w("event=download_error remote=" + pending.remotePath, t);
             } else {
                 Logger.d("event=download_cancelled remote=" + pending.remotePath);
             }
         } finally {
             if (publisher != null) {
-                publisher.taskEnd(key, ok);
+                if (pending.autoDownload) {
+                    // 终态收敛：项从在传集合里摘掉（进度页不再显示"进行中"），并记一行终态日志
+                    publisher.autoDownloadEnd(key, rowLabel(pending), ok, failureReason);
+                } else {
+                    publisher.taskEnd(key, ok);
+                }
             }
             synchronized (mLock) {
                 mInflight.remove(pending.remotePath);

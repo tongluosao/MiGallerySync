@@ -18,6 +18,7 @@ import com.tongluosao.gallerysync.core.OriginalStore;
 import com.tongluosao.gallerysync.core.ProgressProtocol;
 import com.tongluosao.gallerysync.core.SyncMarker;
 import com.tongluosao.gallerysync.core.TrashQueue;
+import com.tongluosao.gallerysync.core.UploadProgressPublisher;
 import com.tongluosao.gallerysync.core.UploadQueue;
 import com.tongluosao.gallerysync.core.WebDavClient;
 import com.tongluosao.gallerysync.hook.gallery.Profiles;
@@ -65,6 +66,18 @@ public final class GalleryHooks {
     private volatile UploadQueue mQueue;
     /** 下载队列；第一次上传见底时才建（开关关着也建，方便用户随时打开） */
     private volatile DownloadQueue mDownload;
+    /**
+     * 下载队列先于上传队列建时用的兜底发布器。
+     *
+     * <p>上传与下载共用一张进度页，正常情况下下载直接挂 {@link UploadQueue#publisher()}。
+     * 但下载队列是相册自己的原生下载事件唤起时建的，完全可能早于上传队列（配置晚到、
+     * 进程刚起来时上传队列还没建）。那种情况下若还等上传队列，下载队列的 {@code mPublisher}
+     * 就一直为 null，自动下载的进度项永远不会出现在进度页。所以这里按
+     * {@link UploadQueue} 同一条路径先起一条发布器顶上，等上传队列建起来再换回去。
+     */
+    private volatile UploadProgressPublisher mDownloadPublisher;
+    /** 下载队列当前是否挂在上面那条兜底发布器上：上传队列出现时必须补挂一次 */
+    private boolean mDownloadOnFallbackPublisher;
     /** 回收站：删除 hook 往里排，"上传空转"时搬。与下载同一个节拍 */
     private volatile TrashQueue mTrash;
     /** 删除方向的 hook。它只需要一个 Context 与回收站队列，与上传队列无关 */
@@ -767,8 +780,38 @@ public final class GalleryHooks {
             }
             // 回收站要读 cloud 表、要落盘，与上传队列同一条件（拿到宿主 Context）
             ensureTrashLocked();
+            // 上传队列建好之后补挂一次：下载队列若先建，刚才挂的是兜底发布器，
+            // 现在换成上传队列这条（一张进度页只该有一条心跳线程在发帧），并停掉兜底的
+            rewireDownloadPublisherLocked();
             return mQueue;
         }
+    }
+
+    /**
+     * 把下载队列从兜底发布器换到上传队列的发布器上。调用方必须持有 this 锁。
+     *
+     * <p>下载队列先建、上传队列后建时才会走到；反过来（上传已存在）下载建的时候
+     * 就直接挂的上传那条，这里什么都不做。
+     */
+    private void rewireDownloadPublisherLocked() {
+        DownloadQueue download = mDownload;
+        UploadQueue upload = mQueue;
+        if (download == null || upload == null || !mDownloadOnFallbackPublisher) {
+            return;
+        }
+        UploadProgressPublisher publisher = upload.publisher();
+        if (publisher == null) {
+            return;
+        }
+        download.addQueueView(publisher);
+        mDownloadOnFallbackPublisher = false;
+        UploadProgressPublisher fallback = mDownloadPublisher;
+        mDownloadPublisher = null;
+        if (fallback != null) {
+            // 停掉兜底心跳：它的队列视图里还有一条下载视图，留着会让同一帧发两遍
+            fallback.stop();
+        }
+        Logger.i("event=download_progress_publisher_rewired");
     }
 
     /**
@@ -795,9 +838,18 @@ public final class GalleryHooks {
                 queue.setHighQualityPolicy(nativeDownload::isHighQuality);
                 queue.setDownloadPolicy(nativeDownload);
             }
+            // 发布器与上传队列是否存在无关：进度页要能看到下载项，就必须有一条在发帧的发布器。
+            // 上传队列已经在时直接复用它的（上传/下载共用一张进度页），不在时按 UploadQueue
+            // 同一条路径先起一条兜底发布器 —— 等上传队列建起来再由 rewireDownloadPublisherLocked
+            // 换回上传那条，全程不会出现 mPublisher == null 的窗口
             UploadQueue upload = mQueue;
-            if (upload != null) {
-                queue.addQueueView(upload.publisher());
+            UploadProgressPublisher publisher = upload == null
+                    ? ensureDownloadPublisherLocked(context) : upload.publisher();
+            if (publisher != null) {
+                queue.addQueueView(publisher);
+                mDownloadOnFallbackPublisher = upload == null;
+            } else {
+                Logger.w("event=download_queue_no_publisher");
             }
             // 用实例而不是方法引用：隐藏目录里的预览要走 adoptPreview（改既有云行），
             // 不是 ingest（宿主扫描器会建新行）
@@ -805,6 +857,22 @@ public final class GalleryHooks {
             mDownload = queue;
             Logger.i("event=download_queue_ready");
         }
+    }
+
+    /**
+     * 下载队列专用发布器：上传队列还没建时先顶一条。调用方必须持有 this 锁。
+     *
+     * <p>与 {@link UploadQueue} 构造函数里 {@code UploadProgressPublisher.start(mContext)}
+     * 是同一条路径、同一个包名定向广播，客户端不用区分是谁发的。
+     */
+    private UploadProgressPublisher ensureDownloadPublisherLocked(Context context) {
+        UploadProgressPublisher publisher = mDownloadPublisher;
+        if (publisher == null) {
+            publisher = UploadProgressPublisher.start(context);
+            mDownloadPublisher = publisher;
+            Logger.i("event=download_progress_publisher_ready reason=upload_queue_absent");
+        }
+        return publisher;
     }
 
     /** Upload-idle cleanup is independent of Gallery's native download schedule. */
@@ -1014,6 +1082,7 @@ public final class GalleryHooks {
     public void shutdown() {
         UploadQueue queue;
         DownloadQueue download;
+        UploadProgressPublisher downloadPublisher;
         TrashQueue trash;
         BroadcastReceiver receiver;
         OriginalRestoreHook restoreHook;
@@ -1022,6 +1091,9 @@ public final class GalleryHooks {
             mQueue = null;
             download = mDownload;
             mDownload = null;
+            downloadPublisher = mDownloadPublisher;
+            mDownloadPublisher = null;
+            mDownloadOnFallbackPublisher = false;
             trash = mTrash;
             mTrash = null;
             receiver = mCommandReceiver;
@@ -1035,6 +1107,10 @@ public final class GalleryHooks {
         }
         if (restoreHook != null) restoreHook.shutdown();
         mMetadataRestoreJob.shutdown();
+        // 换代前把自己起的兜底心跳停掉；上传队列那条会跟着 queue.shutdown() 一起停
+        if (downloadPublisher != null) {
+            downloadPublisher.stop();
+        }
         if (receiver != null) {
             try {
                 HostContext.get(mClassLoader).unregisterReceiver(receiver);

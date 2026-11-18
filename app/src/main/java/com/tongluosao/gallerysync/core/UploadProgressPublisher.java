@@ -59,6 +59,17 @@ public final class UploadProgressPublisher {
     private static final long PENDING_REFRESH_MS = 3_000;
 
     /**
+     * 自动下载进度日志的节流步长。
+     *
+     * <p>下载回调按 64KB 一片来，一张 20MB 的原图会回调三百多次；每片都记一行会把相册日志
+     * 刷满，而进度页本身只按 2Hz 发帧，根本看不到更细的粒度。所以日志按"5% 或 1MB，先到先记"。
+     */
+    private static final long PROGRESS_LOG_STEP_BYTES = 1024L * 1024L;
+
+    /** 百分比节流步长：5% */
+    private static final int PROGRESS_LOG_STEP_PERCENT = 5;
+
+    /**
      * 队列侧的几个数字与列表，由 {@link UploadQueue} 提供。
      *
      * <p>用接口而不是直接持有 UploadQueue：队列的字段都在它自己的锁里，进度线程不该
@@ -125,6 +136,8 @@ public final class UploadProgressPublisher {
         final String dir;
         /** 由 worker 线程写、心跳线程读 */
         volatile long sent;
+        /** 上一次记进度日志时的字节数（只在 {@link #taskProgress} 里读写） */
+        long loggedSent;
 
         Active(String key, String name, String path, long size, boolean video, String dir) {
             this.key = key;
@@ -241,6 +254,72 @@ public final class UploadProgressPublisher {
         if (active != null) {
             active.sent = sent;
         }
+    }
+
+    /**
+     * 自动下载的单步字节进度：与 {@link #taskBytes} 走同一条在传通道（同一个 key、同一条
+     * {@link ProgressProtocol#DIR_DOWN} 项），只额外按"5% 或 1MB"节流记一行 debug 日志。
+     *
+     * <p>这条链路不自己发帧：帧仍由心跳线程统一发，所以这里只更新内存里的数字。
+     * 传完之后迟到的回调直接丢（项已经不在 {@link #mActive} 里），避免"幽灵进度"把已经
+     * 收敛的项又点亮。
+     *
+     * @param row 相册行号或 sha1，只用于日志定位是哪一条自动下载
+     */
+    public void taskProgress(String key, String row, long sent, long total) {
+        synchronized (mLock) {
+            Active active = mActive.get(key);
+            if (active == null) {
+                return;
+            }
+            active.sent = sent;
+            if (!progressLogDue(active.loggedSent, sent, total)) {
+                return;
+            }
+            active.loggedSent = sent;
+        }
+        Logger.d("event=auto_download_progress_publish row=" + row + " bytes=" + sent + "/" + total);
+    }
+
+    /**
+     * 自动下载结束：先按常规 {@link #taskEnd} 把该项从在传集合里收敛掉（进度页立刻变完成态），
+     * 再补一行带终态的日志。成功、失败、取消都走这里 —— 无论哪条路径，这一项都不会永久
+     * 停在"进行中"。
+     *
+     * @param reason 失败原因；成功或取消时传 null
+     */
+    public void autoDownloadEnd(String key, String row, boolean ok, String reason) {
+        Active active;
+        synchronized (mLock) {
+            active = mActive.get(key);
+        }
+        long sent = active == null ? 0L : active.sent;
+        long total = active == null ? 0L : active.size;
+        taskEnd(key, ok);
+        String state = ok ? "done" : (reason == null ? "cancelled" : "failed");
+        Logger.d("event=auto_download_progress_publish row=" + row + " bytes=" + sent + "/" + total
+                + " state=" + state + (ok || reason == null ? "" : " reason=" + reason));
+    }
+
+    /**
+     * 这条字节进度是否值得记一行：5% 或 1MB，先到者记。纯函数，方便单测。
+     *
+     * <p>完成时不会额外多记一行 —— {@link #autoDownloadEnd} 会打终态行；
+     * 这里只在"真的往前走了且跨过阈值"时返回 true。
+     */
+    static boolean progressLogDue(long lastLogged, long sent, long total) {
+        if (sent <= lastLogged) {
+            return false;
+        }
+        if (sent - lastLogged >= PROGRESS_LOG_STEP_BYTES) {
+            return true;
+        }
+        if (total <= 0L) {
+            return false;
+        }
+        long before = Math.min(100L, lastLogged * 100L / total);
+        long now = Math.min(100L, sent * 100L / total);
+        return now - before >= PROGRESS_LOG_STEP_PERCENT;
     }
 
     /**

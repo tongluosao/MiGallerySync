@@ -19,14 +19,21 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.tongluosao.gallerysync.core.Config;
 import com.tongluosao.gallerysync.core.Logger;
+import com.tongluosao.gallerysync.core.OriginalClickProbe;
 import com.tongluosao.gallerysync.core.OriginalStore;
 import com.tongluosao.gallerysync.core.PreviewStateRules;
 import com.tongluosao.gallerysync.core.VideoCacheRetryPolicy;
@@ -85,6 +92,22 @@ final class OriginalRestoreHook {
     private static final long VIDEO_CACHE_IDLE_FINISH_MS = 30_000L;
     private static final long VIDEO_CACHE_THROTTLE_POLL_MS = 200L;
     private static final long VIDEO_CACHE_THROTTLE_LOG_MS = 5_000L;
+    /**
+     * “下载原图”点击前那次远端探测的总预算（含排队），与 {@code UploadQueue.PROBE_DEADLINE_MS}
+     * 同一套口径：截止一到就当“问不出来”，立刻回退小米云。
+     *
+     * <p>为什么必须有上限：平板 + OpenList(S3) 上对一个**不存在**的对象做 Depth 0 PROPFIND，
+     * 冷启动能等十几秒（见 {@code ProbeDecision} 的实测记录）。onClick 落在相册主线程，干等就是
+     * ANR，所以只等到 6 秒，剩下的交给原生下载。
+     */
+    private static final long PROBE_DEADLINE_MS = 6_000L;
+    /**
+     * 探测结论缓存的有效期。只缓存“远端确认在且大小相符”的结论，过期就重问：远端被删这件事
+     * 最多让用户多试一次 WebDAV 还原，而缓存“不在”会把明明能还原的那一份误判成回退。
+     */
+    private static final long PROBE_HIT_TTL_MS = 120_000L;
+    /** 缓存条数上限：翻几千张照片的菜单不该把这张表撑大，超了直接清空重来。 */
+    private static final int PROBE_HIT_LIMIT = 256;
 
     private final XposedInterface mXposed;
     private final ClassLoader mLoader;
@@ -98,6 +121,29 @@ final class OriginalRestoreHook {
         thread.setDaemon(true);
         return thread;
     });
+    /**
+     * 点击探测专用线程：{@code chain.proceed()} 只能在拦截器线程同步调用，所以“等结果”留在
+     * 拦截器里，“发 PROPFIND”必须甩到这条线程上。队列 0 格（{@code SynchronousQueue}）：
+     * 上一次探测还没收尾就立刻拒绝，绝不排队 —— 排队等待正是这次要消除的“点了没反应”。
+     */
+    private final ExecutorService mProbeWorker = new ThreadPoolExecutor(1, 1, 0L,
+            TimeUnit.MILLISECONDS, new SynchronousQueue<>(), r -> {
+                Thread thread = new Thread(r, "gallery-original-probe");
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
+    /**
+     * 菜单判定时顺手预热的那条线程，与点击探测**分开**：预热再慢也挤不掉真正的那次探测
+     * （共用一条线程时，被拒绝的会是用户刚点下去的那一次，直接误回退小米云）。
+     */
+    private final ExecutorService mProbePrefetchWorker = new ThreadPoolExecutor(1, 1, 0L,
+            TimeUnit.MILLISECONDS, new SynchronousQueue<>(), r -> {
+                Thread thread = new Thread(r, "gallery-original-probe-prefetch");
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.DiscardPolicy());
+    /** 探测结论缓存：key = {@code target|remotePath}，value = {远端大小, 记录时刻}。 */
+    private final Map<String, long[]> mProbeHits = new ConcurrentHashMap<>();
     private final Handler mMain = new Handler(Looper.getMainLooper());
     private final Object mVideoSourceLock = new Object();
     private final AtomicLong mVideoPlaybackGeneration = new AtomicLong();
@@ -130,6 +176,8 @@ final class OriginalRestoreHook {
                 mVideoPlaybackGeneration.incrementAndGet();
                 mActiveVideoPlayback = null;
                 closeVideoSourceLocked();
+                // 换了服务器/账号，缓存里的“远端在”就是另一个空间的结论，必须整体作废
+                mProbeHits.clear();
             }
         }
     }
@@ -1359,10 +1407,11 @@ final class OriginalRestoreHook {
      * 平板相册的“下载原图”直接落在 {@code DownloadOriginal.onClick(BaseDataItem)} 上，不像手机端
      * 那样必经 {@code PhotoPageItem$DownloadManager.downloadOrigin(DownloadType)}
      * → {@code CloudImageLoader.loadImage(...)}（后者由 {@link #installCloudLoaderHook()} 接管）。
-     * 这里在点击入口再判一次同一张注册表：命中登记的行绝不放行到小米云，改为复用
-     * {@link OriginalStore#restoreOriginal} 在后台把原件写回原路径；未登记（或模块未就绪）的行原样
-     * 放行，与未装模块时完全一致。任何反射/线程异常都回落到 {@code chain.proceed()}，不会让用户
-     * 点了没反应。
+     * 这里在点击入口再判一次同一张注册表：命中登记的行先做一次**有界远端探测**
+     * （{@link #probeRemoteOriginal}，判定见 {@link OriginalClickProbe}），远端确实还在才复用
+     * {@link OriginalStore#restoreOriginal} 在后台把原件写回原路径；远端被删/问不出来/大小不符
+     * 一律 {@code chain.proceed()} 放行给小米云。未登记（或模块未就绪）的行原样放行，与未装模块时
+     * 完全一致。任何反射/线程异常都回落到 {@code chain.proceed()}，不会让用户点了没反应。
      */
     private void installManagedOriginalClickHook() {
         try {
@@ -1385,13 +1434,25 @@ final class OriginalRestoreHook {
                             return chain.proceed();
                         }
                         try {
+                            // 探测在这里同步做完（内部只等 ≤ PROBE_DEADLINE_MS），因为
+                            // chain.proceed() 必须在拦截器线程上调用，不能事后从后台线程补。
                             ClickRequest request = clickRestoreForItem(dataItem);
                             if (request == null) {
                                 Logger.d("event=managed_original_click_passthrough");
                                 return chain.proceed();
                             }
-                            Logger.i("event=managed_original_click_restore row="
-                                    + request.record.rowId + " remote=" + request.record.remotePath);
+                            if (!OriginalClickProbe.usesWebDav(request.probe)) {
+                                // 远端没有 / 问不出来 / 大小不符：放行原生下载，让小米云接手
+                                Logger.i("event=managed_original_click_fallback_xiaomi row="
+                                        + request.record.rowId
+                                        + " remote=" + request.record.remotePath
+                                        + " probe=" + OriginalClickProbe.logToken(request.probe)
+                                        + " size=" + request.remoteSize);
+                                return chain.proceed();
+                            }
+                            Logger.i("event=managed_original_click_webdav row="
+                                    + request.record.rowId + " remote=" + request.record.remotePath
+                                    + " size=" + request.remoteSize);
                             if (!restoreClickOffThread(request)) {
                                 Logger.w("event=managed_original_click_fallback"
                                         + " reason=worker_unavailable row=" + request.record.rowId);
@@ -1416,7 +1477,11 @@ final class OriginalRestoreHook {
 
     /**
      * 点击分支的行判定，与菜单钩子同源：{@link #recordForItem} 认这张注册表，再确认这条记录确实
-     * 能还原（有远端路径、有落盘目标）。认不出来就返回 null，让调用方原样放行。
+     * 能还原（有远端路径、有落盘目标），最后做一次有界远端探测。
+     *
+     * <p>探测放在这里而不是调用方：判定“这一行该不该由 WebDAV 接手”只取决于这张注册表和远端现状，
+     * 调用方拿到的 {@link ClickRequest#probe} 就是结论（{@link OriginalClickProbe}）。探测失败不会
+     * 让这里返回 null —— 那等于“未登记”，会把“远端没了”和“这行不归我管”混成同一条日志。
      */
     private ClickRequest clickRestoreForItem(Object item) throws Exception {
         Config config = mConfig;
@@ -1433,7 +1498,164 @@ final class OriginalRestoreHook {
             return null;
         }
         boolean targetMatches = OriginalStore.targetKey(config).equals(record.target);
-        return new ClickRequest(item, record, config, destination, targetMatches);
+        ProbeResult probe = probeRemoteOriginal(config, record);
+        return new ClickRequest(item, record, config, destination, targetMatches,
+                probe.outcome, probe.remoteSize);
+    }
+
+    /** 探测的一次观测：结论 + 远端报告的大小（判定用不上它，只进日志）。 */
+    private static final class ProbeResult {
+        final OriginalClickProbe.Outcome outcome;
+        final long remoteSize;
+
+        ProbeResult(OriginalClickProbe.Outcome outcome, long remoteSize) {
+            this.outcome = outcome;
+            this.remoteSize = remoteSize;
+        }
+    }
+
+    /**
+     * 点击前的有界远端探测：{@code PROPFIND Depth 0} 问一次大小，结论交给
+     * {@link OriginalClickProbe#classify}。
+     *
+     * <p><b>为什么网络那一句必须离开调用线程</b>：onClick 落在相册主线程，直接在这里发 PROPFIND
+     * 就是一次最长十几秒的 ANR。所以请求提交给 {@link #mProbeWorker}，本方法只等到硬截止
+     * （{@link #PROBE_DEADLINE_MS}）—— 与 {@code UploadQueue.probeRemoteExists} 同一套做法：
+     * 单线程、0 格队列、{@code Future.get(deadline)}。
+     *
+     * <p><b>超时不强杀请求</b>：{@code cancel(true)} 会打断它，但 HTTP 读不一定立刻可中断，它可能
+     * 在后台跑完。没关系 —— 它用的是自己那条连接（每次都新建 {@link WebDavClient}），结果也只会
+     * 进日志，已经不在任何判定里。
+     *
+     * <p>只有 {@link OriginalClickProbe.Outcome#PRESENT} 才允许接管这次点击；“探测没答上来”不等于
+     * “远端有”，一律按回退处理。
+     */
+    private ProbeResult probeRemoteOriginal(Config config, OriginalStore.Record record) {
+        long expected = record.originalLength;
+        long cached = cachedProbeSize(record);
+        if (cached > 0L) {
+            OriginalClickProbe.Outcome hit = OriginalClickProbe.classify(cached, expected);
+            Logger.d("event=managed_original_click_probe_hit row=" + record.rowId
+                    + " remote=" + record.remotePath + " size=" + cached
+                    + " probe=" + OriginalClickProbe.logToken(hit));
+            return new ProbeResult(hit, cached);
+        }
+        final long start = System.currentTimeMillis();
+        java.util.concurrent.Callable<Long> probe = () -> remoteSizeForClick(config, record);
+        Future<Long> future;
+        try {
+            future = mProbeWorker.submit(probe);
+        } catch (Throwable rejected) {
+            // 上一条探测还没收尾：绝不排队等它，直接按“问不出来”回退
+            Logger.w("event=managed_original_click_probe_rejected row=" + record.rowId, rejected);
+            return new ProbeResult(OriginalClickProbe.Outcome.UNKNOWN, 0L);
+        }
+        try {
+            Long remoteSize = future.get(PROBE_DEADLINE_MS, TimeUnit.MILLISECONDS);
+            long waited = System.currentTimeMillis() - start;
+            if (remoteSize == null) {
+                Logger.d("event=managed_original_click_probe_error row=" + record.rowId
+                        + " waited_ms=" + waited);
+                return new ProbeResult(OriginalClickProbe.Outcome.ERROR, 0L);
+            }
+            OriginalClickProbe.Outcome outcome = OriginalClickProbe.classify(remoteSize, expected);
+            rememberProbeSize(record, remoteSize);
+            Logger.d("event=managed_original_click_probe_done row=" + record.rowId
+                    + " remote=" + record.remotePath + " size=" + remoteSize
+                    + " expected=" + expected + " probe=" + OriginalClickProbe.logToken(outcome)
+                    + " waited_ms=" + waited);
+            return new ProbeResult(outcome, remoteSize);
+        } catch (TimeoutException timeout) {
+            future.cancel(true);
+            Logger.w("event=managed_original_click_probe_timeout row=" + record.rowId
+                    + " remote=" + record.remotePath + " deadline_ms=" + PROBE_DEADLINE_MS);
+            return new ProbeResult(OriginalClickProbe.Outcome.TIMEOUT, 0L);
+        } catch (InterruptedException interrupted) {
+            future.cancel(true);
+            // 把中断标志还回去：拦截器线程可能还要靠它退出
+            Thread.currentThread().interrupt();
+            return new ProbeResult(OriginalClickProbe.Outcome.ERROR, 0L);
+        } catch (Throwable failure) {
+            future.cancel(true);
+            Logger.w("event=managed_original_click_probe_failed row=" + record.rowId
+                    + " remote=" + record.remotePath, failure);
+            return new ProbeResult(OriginalClickProbe.Outcome.ERROR, 0L);
+        }
+    }
+
+    /** 真正发请求的那一句，只在 {@link #mProbeWorker} 上跑；每次自带一条连接，用完就关。 */
+    private Long remoteSizeForClick(Config config, OriginalStore.Record record) throws IOException {
+        long at = System.currentTimeMillis();
+        WebDavClient client = new WebDavClient(config.getBaseUrl(), config.getUsername(),
+                config.getPassword());
+        try {
+            long size = client.propfindSize(record.remotePath);
+            Logger.d("event=managed_original_click_probe_task row=" + record.rowId
+                    + " size=" + size + " probe_ms=" + (System.currentTimeMillis() - at));
+            return size;
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * 菜单判定时的预热：菜单已经显示出来，用户几乎必然紧接着就会点，先把这次探测做掉，
+     * 点击时就直接命中缓存、主线程一点都不用等。
+     *
+     * <p>完全尽力而为：这条线程满了、探测失败、远端是坏的，都只留一行日志，不影响菜单。
+     */
+    private void prefetchRemoteProbe(final Config config, final OriginalStore.Record record) {
+        if (config == null || record == null || record.remotePath == null
+                || record.remotePath.isEmpty()) {
+            return;
+        }
+        if (cachedProbeSize(record) > 0L) return;
+        try {
+            mProbePrefetchWorker.execute(() -> {
+                long size;
+                try {
+                    size = remoteSizeForClick(config, record);
+                } catch (Throwable t) {
+                    Logger.d("event=managed_original_probe_prefetch_failed row=" + record.rowId
+                            + " detail=" + t);
+                    return;
+                }
+                rememberProbeSize(record, size);
+                Logger.d("event=managed_original_probe_prefetch row=" + record.rowId
+                        + " remote=" + record.remotePath + " size=" + size);
+            });
+        } catch (Throwable rejected) {
+            Logger.d("event=managed_original_probe_prefetch_skipped row=" + record.rowId
+                    + " detail=" + rejected);
+        }
+    }
+
+    /** 缓存键：同一行换了服务器/目标空间就是另一条结论，所以 target 必须进键。 */
+    private static String probeKey(OriginalStore.Record record) {
+        return String.valueOf(record.target) + '|' + record.remotePath;
+    }
+
+    /** 命中且未过期的缓存大小；没有/过期返回 0（合法大小一定 > 0）。 */
+    private long cachedProbeSize(OriginalStore.Record record) {
+        String key = probeKey(record);
+        long[] hit = mProbeHits.get(key);
+        if (hit == null) return 0L;
+        long age = System.currentTimeMillis() - hit[1];
+        if (age < 0L || age > PROBE_HIT_TTL_MS) {
+            mProbeHits.remove(key, hit);
+            return 0L;
+        }
+        return hit[0];
+    }
+
+    /**
+     * 只缓存“远端确认在且给了大小”的结论：缓存“不在/问不出来”会让一次网络抖动把接下来两分钟的
+     * 点击全部误判成回退，而缓存“在”最多让用户多试一次 WebDAV 还原。
+     */
+    private void rememberProbeSize(OriginalStore.Record record, long size) {
+        if (record == null || size <= 0L) return;
+        if (mProbeHits.size() >= PROBE_HIT_LIMIT) mProbeHits.clear();
+        mProbeHits.put(probeKey(record), new long[]{size, System.currentTimeMillis()});
     }
 
     /**
@@ -1539,6 +1761,9 @@ final class OriginalRestoreHook {
             OriginalStore.Record record = recordForItem(item, store, config);
             if (record == null) return false;
             boolean show = localBytesNeedRestore(item, record);
+            // 菜单已经要显示出来了：用户几乎必然紧接着就点，先把点击时那次远端探测做掉，
+            // 真正点击时就命中缓存、主线程完全不用等那 6 秒预算。
+            if (show) prefetchRemoteProbe(config, record);
             // 每次菜单可见性询问都记一行：排查“为什么没优化也显示下载原图”时只需看这一条。
             Logger.d("event=download_original_menu row=" + record.rowId
                     + " state=" + record.getLocalState().wire()
@@ -1859,6 +2084,9 @@ final class OriginalRestoreHook {
         mActiveVideoPlayback = null;
         mOriginHookReady = false;
         mImageLoaderHookReady = false;
+        mProbeHits.clear();
+        mProbeWorker.shutdownNow();
+        mProbePrefetchWorker.shutdownNow();
         mWorker.shutdownNow();
         mVideoSourceWorker.shutdownNow();
     }
@@ -1891,21 +2119,27 @@ final class OriginalRestoreHook {
         }
     }
 
-    /** 平板“下载原图”点击分支捕获到的一行：不需要 Gallery 的监听器，只要注册表记录与落盘目标。 */
+    /** 平板“下载原图”点击分支捕获到的一行：注册表记录、落盘目标，以及那次远端探测的结论。 */
     private static final class ClickRequest {
         final Object item;
         final OriginalStore.Record record;
         final Config config;
         final String destination;
         final boolean targetMatches;
+        /** 远端探测结论；只有 {@link OriginalClickProbe.Outcome#PRESENT} 才由本模块接管这次点击。 */
+        final OriginalClickProbe.Outcome probe;
+        /** 远端报告的大小（0 = 探测没给出来），只进日志。 */
+        final long remoteSize;
 
         ClickRequest(Object item, OriginalStore.Record record, Config config, String destination,
-                boolean targetMatches) {
+                boolean targetMatches, OriginalClickProbe.Outcome probe, long remoteSize) {
             this.item = item;
             this.record = record;
             this.config = config;
             this.destination = destination;
             this.targetMatches = targetMatches;
+            this.probe = probe;
+            this.remoteSize = remoteSize;
         }
     }
 
