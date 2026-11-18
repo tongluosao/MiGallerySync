@@ -121,12 +121,4 @@ class DownloadSpeedTest {
         assertEquals("1.2 MB/s", DownloadSpeed.format(1_258_291L))
         assertEquals("2.0 GB/s", DownloadSpeed.format(2L * 1024 * 1024 * 1024))
     }
-
-    @Test
-    fun summaryShowsRateAndCount() {
-        assertEquals("", DownloadSpeed.summary(1_258_291L, 0))
-        assertEquals("1.2 MB/s · 3 项进行中", DownloadSpeed.summary(1_258_291L, 3))
-        // 进行中但没有可用的窗口（刚打开）：0 B/s 也要带上项数，不能空着
-        assertEquals("0 B/s · 1 项进行中", DownloadSpeed.summary(0L, 1))
-    }
 }

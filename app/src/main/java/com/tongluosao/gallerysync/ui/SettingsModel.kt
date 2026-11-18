@@ -6,6 +6,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.tongluosao.gallerysync.App
+import com.tongluosao.gallerysync.R
 import com.tongluosao.gallerysync.core.Config
 import com.tongluosao.gallerysync.core.Logger
 import com.tongluosao.gallerysync.core.ProgressProtocol
@@ -79,8 +80,8 @@ class SettingsModel : CoroutineScope {
     /**
      * “接管”相册里已有的云端行：只往注册表补登记，一个字节都不下载。
      *
-     * <p>默认关闭，且“立即接管”按钮只有它开着才可用 —— 接管会改变上传侧对一批老照片的
-     * 判断（登记成 REMOTE_ONLY 后不再上传），必须由用户明确打开。
+     * <p>默认关闭。接管本身已改由 [autoTakeoverOnce] 在首次进设置页时自动跑一次，
+     * 这条开关只保留配置与回调（键与默认值不变），不再作为按钮的可用条件。
      */
     var webdavTakeover by mutableStateOf(false)
         private set
@@ -270,7 +271,7 @@ class SettingsModel : CoroutineScope {
         }
         val app = App.application()
         if (app == null) {
-            resetState = ResetState.Failed("应用未就绪")
+            resetState = ResetState.Failed(text(R.string.msg_app_not_ready))
             return
         }
         resetState = ResetState.Running
@@ -294,23 +295,44 @@ class SettingsModel : CoroutineScope {
     }
 
     /**
+     * 首次进入设置页时在后台补跑一次接管，同一进程只跑一次。
+     *
+     * <p>“立即接管”按钮已经去掉，改由这里兜底：进设置页时顺手把注册表补齐，不必再点。
+     * 三条纪律：
+     * <ul>
+     *   <li>只跑一次 —— [autoTakeoverAttempted] 是进程级标志，失败也不重试，免得每次
+     *       进设置页都往相册发一条广播；</li>
+     *   <li>不看开关 —— 接管只补注册表记录（不下载、不删除、不改照片与相册行），
+     *       相册不在场时广播被静默丢弃，所以没有“必须先打开某个开关”的前置条件；</li>
+     *   <li>不因未就绪而消耗掉这一次机会 —— 框架还没连上时直接返回，等 ready 后再来。</li>
+     * </ul>
+     */
+    fun autoTakeoverOnce() {
+        if (autoTakeoverAttempted) {
+            return
+        }
+        if (!ready) {
+            return
+        }
+        autoTakeoverAttempted = true
+        Logger.i("event=ui_takeover_auto_start")
+        takeoverNow()
+    }
+
+    /**
      * 让相册进程把已有的云端行登记进注册表（一个字节都不下载）。
      *
      * <p>与 [resetUploaded] 同一条通道（定向广播给相册进程），因为只有相册能读自己的
-     * cloud 表。开关关着时这里直接拒绝 —— 按钮本身也会置灰，这道判断是兜底：
-     * 接管会往注册表里写记录，不能靠界面状态来保证"用户真的打开过"。
+     * cloud 表。维护页里的“重新扫描未接管的照片”与首次进页的自动接管都走这里 ——
+     * 后者只跑一次（见 [autoTakeoverOnce]），前者是用户显式再点一次。
      */
     fun takeoverNow() {
         if (takeoverState is ResetState.Running) {
             return
         }
-        if (!webdavTakeover) {
-            takeoverState = ResetState.Failed("请先打开「接管相册已有照片」")
-            return
-        }
         val app = App.application()
         if (app == null) {
-            takeoverState = ResetState.Failed("应用未就绪")
+            takeoverState = ResetState.Failed(text(R.string.msg_app_not_ready))
             return
         }
         takeoverState = ResetState.Running
@@ -397,6 +419,9 @@ class SettingsModel : CoroutineScope {
             }
         }
     }
+
+    /** 界面文案一律走字符串资源（中文字面量不进代码）；application 未就绪时给空串 */
+    private fun text(resId: Int): String = App.application()?.getString(resId).orEmpty()
 
     /** 离开界面前把防抖中的输入全部落盘，避免最后一次编辑被吞掉 */
     fun flushPending() {
@@ -689,10 +714,21 @@ class SettingsModel : CoroutineScope {
 
         /**
          * “接管相册已有照片”的开关。同样是仅界面/相册侧读的键：[Config] 不认识它，
-         * 相册进程（`MetadataRestoreJob`）只在收到“立即接管”命令时才动手，
-         * 模块 App 侧只需要这个开关来决定按钮可不可用。
+         * 相册进程（`MetadataRestoreJob`）只在收到“接管”命令时才动手。
+         *
+         * <p>首次进设置页的自动接管不再读它（见 [autoTakeoverOnce]），保留键与回调
+         * 只为不改动已有配置。
          */
         const val KEY_WEBDAV_TAKEOVER = "webdavTakeover"
+
+        /**
+         * 自动接管是否已经试过（进程级，不是配置）。
+         *
+         * <p>只在内存里记：App 进程重启后允许再试一次，与“同一进程只跑一次、失败不重试”
+         * 的约定一致。
+         */
+        private var autoTakeoverAttempted = false
+
         private const val DEBOUNCE_MS = 500L
         private const val PROBE_NAME = ".migallerysync_probe"
 

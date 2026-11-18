@@ -3,15 +3,16 @@ package com.tongluosao.gallerysync.ui
 import java.util.Locale
 
 /**
- * 一个"总字节数"采样点：某一时刻所有**进行中**下载项的已下载字节之和。
+ * 一个"总字节数"采样点：某一时刻某个方向上所有**进行中**项的已传字节之和。
  *
- * <p>只统计下载项（`dir=down`），上传走的另一条链路：两个方向抢同一条带宽，
- * 混在一起算出来的数字既不是上传速度也不是下载速度。
+ * <p>上传、下载各喂各的窗口（见 [ProgressModel.updateSpeedSamples]）：两个方向抢同一条带宽，
+ * 混在一起算出来的数字既不是上传速度也不是下载速度。文件名带 Download 是历史原因 ——
+ * 下载是这条路第一个使用者，后来上传也用了同一套窗口算法。
  */
 data class SpeedSample(val atMs: Long, val bytes: Long)
 
 /**
- * 整体下载速度：滑动窗口内的字节差 ÷ 时间差。
+ * 整体速度（某个方向）：滑动窗口内的字节差 ÷ 时间差。
  *
  * <p>为什么不用相邻两帧的差值：帧是 2Hz，单帧差值只是一瞬间的抖动（64KB 一块的回调
  * 落点也不均匀）；用最近 3–5 秒的窗口既能把抖动摊平，又不会慢到看不出"下载停了"。
@@ -108,18 +109,5 @@ object DownloadSpeed {
             unit++
         }
         return String.format(Locale.US, "%.1f %s", value, units[unit])
-    }
-
-    /**
-     * 下载栏头部那一行：`1.2 MB/s · 3 项进行中`。
-     *
-     * <p>没有进行中的项时返回空串 —— 那时界面要显示的是"暂无进行中的下载"或
-     * "最近完成 N 项"，不该显示一个 0 B/s 假装还在测速。
-     */
-    fun summary(bytesPerSecond: Long, activeCount: Int): String {
-        if (activeCount <= 0) {
-            return ""
-        }
-        return format(bytesPerSecond) + " · " + activeCount + " 项进行中"
     }
 }

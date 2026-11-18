@@ -182,6 +182,23 @@ class ProgressModel {
         private set
 
     /**
+     * 整体上传速度的采样窗口。与 [speedSamples] 同构、方向相反。
+     *
+     * <p>分成两条窗口而不是一条：上传和下载抢同一条链路，混着算出来的数字谁也不代表。
+     */
+    var uploadSpeedSamples by mutableStateOf(emptyList<SpeedSample>())
+        private set
+
+    /**
+     * 逐项速度（行内那一行"1.2 MB/s"）。
+     *
+     * <p>每项一条自己的窗口：聚合速度只回答"这一块整体多快"，看不出是哪一项在拖后腿。
+     * 只保留这一帧还在传的项，项结束了就丢。
+     */
+    var taskSpeeds by mutableStateOf(TaskSpeeds.EMPTY)
+        private set
+
+    /**
      * 已经不在活动集合里、但还留在下载栏的项（按完成时刻倒序）。
      *
      * <p>键是发布端给的去重键：同一项完成后再被重排（失败重试）时先按它清掉旧行，
@@ -344,6 +361,7 @@ class ProgressModel {
             val now = System.currentTimeMillis()
             recordFinished(active, now)
             updateSpeedSamples(active, now)
+            taskSpeeds = ProgressSections.trackTaskSpeeds(taskSpeeds, active, now)
             ProgressUiState(
                 state = root.optString("state", ProgressProtocol.STATE_IDLE),
                 active = active,
@@ -419,29 +437,27 @@ class ProgressModel {
     private val finishTimes = HashMap<String, Long>()
 
     /**
-     * 用这一帧的活动下载项更新速度窗口。
+     * 用这一帧的活动项更新两条速度窗口。
      *
-     * <p>只有下载项参与：上传与下载抢同一条链路，混在一起算出来的既不是上传速度
-     * 也不是下载速度。没有活动下载项时直接清空窗口 —— 否则下次开下载，第一帧会和
-     * 几小时前的旧采样相减。
+     * <p>上传、下载各算各的：两个方向抢同一条链路，混在一起算出来的既不是上传速度
+     * 也不是下载速度。某个方向没有在传的项时直接清空它那条窗口 —— 否则下次开传，
+     * 第一帧会和几小时前的旧采样相减。
      */
     private fun updateSpeedSamples(active: List<ActiveUpload>, now: Long) {
-        var bytes = 0L
-        var count = 0
-        for (item in active) {
-            if (item.dir != ProgressProtocol.DIR_DOWN) {
-                continue
-            }
-            count++
-            bytes += if (item.sent <= 0L) 0L else minOf(item.sent, item.size)
-        }
-        if (count == 0) {
-            if (speedSamples.isNotEmpty()) {
-                speedSamples = emptyList()
-            }
-            return
-        }
-        speedSamples = DownloadSpeed.append(speedSamples, SpeedSample(now, bytes))
+        val uploadCount = active.count { it.dir != ProgressProtocol.DIR_DOWN }
+        uploadSpeedSamples = ProgressSections.nextWindow(
+            uploadSpeedSamples,
+            ProgressSections.aggregateBytes(active, down = false),
+            uploadCount,
+            now
+        )
+        val downCount = active.count { it.dir == ProgressProtocol.DIR_DOWN }
+        speedSamples = ProgressSections.nextWindow(
+            speedSamples,
+            ProgressSections.aggregateBytes(active, down = true),
+            downCount,
+            now
+        )
     }
 
     /**

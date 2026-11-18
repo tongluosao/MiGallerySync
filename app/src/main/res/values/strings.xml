@@ -15,6 +15,32 @@
     <string name="tab_settings">设置</string>
     <string name="slim_title">空间优化</string>
 
+    <!-- 设置页：导航主页的四个类目与二级页标题 -->
+    <string name="page_server">服务器</string>
+    <string name="page_sync">同步</string>
+    <string name="page_space">空间优化</string>
+    <string name="page_maintenance">维护与关于</string>
+
+    <!-- 导航主页：每行右侧的一行摘要 -->
+    <string name="nav_server_summary">%1$s · %2$s</string>
+    <string name="nav_sync_summary">%1$s · 并行 %2$d 路 · 自动下载%3$s</string>
+    <string name="nav_space_summary">%1$s · %2$s · 并行 %3$d 路</string>
+    <string name="nav_maintenance_summary">%1$s · %2$s</string>
+    <string name="nav_value_unset">未填写</string>
+    <string name="nav_status_connected">已连接</string>
+    <string name="nav_status_configured">已配置</string>
+    <string name="nav_status_testing">测试中</string>
+    <string name="nav_wifi_only">仅 Wi-Fi</string>
+    <string name="nav_any_network">任意网络</string>
+    <string name="nav_state_on">开</string>
+    <string name="nav_state_off">关</string>
+    <string name="nav_keep_metadata">保留元数据</string>
+    <string name="nav_drop_metadata">不留元数据</string>
+    <string name="nav_keep_heic">保持 HEIC</string>
+    <string name="nav_to_jpeg">转 JPEG</string>
+    <string name="nav_flag_shared">共用标记</string>
+    <string name="nav_flag_per_target">分开记标记</string>
+
     <string name="slim_status_idle">空闲</string>
     <string name="slim_status_running">正在优化</string>
     <string name="slim_status_stopping">正在停止…</string>
@@ -52,10 +78,9 @@
     <string name="hint_password">密码或应用专用口令</string>
     <string name="hint_remote_root">远端根目录</string>
 
-    <string name="summary_base_url">例如 https://dav.example.com/backup</string>
-    <string name="summary_remote_root">这个目录下的结构由「远端目录结构」决定</string>
-    <string name="summary_password">明文存于 LSPosed 数据库，建议用应用专用口令</string>
-    <string name="warn_replace_mode">替换后相册的云端查看与释放空间会失效</string>
+    <string name="summary_remote_root">挂在服务器上的起始目录</string>
+    <string name="summary_password">明文存于 LSPosed 数据库</string>
+    <string name="warn_replace_mode">云端查看与释放空间将失效</string>
 
     <string name="label_replace_mode">备份模式</string>
     <string name="mode_replace">替换：只传 WebDAV</string>
@@ -65,31 +90,43 @@
     <string name="label_wifi_only">仅在 Wi-Fi 下上传</string>
     <string name="summary_wifi_only">移动网络不上传</string>
     <string name="label_ui_mask">伪装备份服务商入口</string>
-    <string name="summary_ui_mask">相册设置页显示入口，点击打开本页</string>
+    <string name="summary_ui_mask">相册设置页显示入口</string>
     <string name="label_remote_layout">远端目录结构</string>
     <string name="layout_album">按相册：DCIM/Camera/照片.jpg</string>
     <string name="layout_date">按时间：2026/09/照片.jpg</string>
     <string name="layout_flat">全平铺：照片.jpg</string>
 
     <string name="label_verify_async">100% 后不等复核</string>
-    <string name="summary_verify_async">发完立刻让出上传通道去传下一项，落盘复核在后台做。服务器假写仍会被发现并重传</string>
+    <string name="summary_verify_async">发完即走，复核在后台</string>
     <string name="label_upload_concurrency">并行上传路数</string>
-    <string name="summary_upload_concurrency">同时上传几张，1-8，默认 3。调大能加速，太多会压满服务器</string>
+    <string name="summary_upload_concurrency">默认 3 路，越多越吃带宽</string>
+
+    <string name="label_auto_download">自动下载原图</string>
+    <string name="summary_auto_download">自动下回只有云端的原图</string>
+    <string name="label_download_concurrency">自动下载并行路数</string>
+    <string name="summary_download_concurrency">默认 1 路，越高越吃带宽</string>
+    <string name="label_webdav_takeover">接管相册已有照片</string>
+    <string name="summary_webdav_takeover">只登记，不下载字节</string>
 
     <string name="label_skip_existing_remote">远端有同名文件就跳过</string>
-    <string name="summary_skip_existing_remote">上传前先看一眼远端有没有同名的，有就当已备份、不比对内容直接跳过。省流量但不会发现内容不同的旧文件</string>
+    <string name="summary_skip_existing_remote">省流量，但不比对内容</string>
     <string name="label_preserve_metadata">保留元数据</string>
-    <string name="summary_preserve_metadata">优化与高质量下载保留拍摄时间、位置及相机等元数据；无法安全保留时保留原件</string>
+    <string name="summary_preserve_metadata">保留拍摄时间、位置等元数据</string>
     <string name="label_preserve_heic_format">HEIC 优化/下载保持原格式</string>
-    <string name="summary_preserve_heic_format">关闭后可将 HEIC 转为 JPEG；开启后保持 HEIC，遇到不支持处理的情况则保留原件</string>
+    <string name="summary_preserve_heic_format">关闭则转成 JPEG</string>
     <string name="label_local_flag_mode">已上传标记记录方式</string>
-    <string name="summary_local_flag_mode">与相册共用一条记录最省事，但换账号/换目录后相册仍认为传过了；分开记则各账号各记一份，换回来不用重传</string>
+    <string name="summary_local_flag_mode">共用最省事，换账号要重传</string>
     <string name="flag_mode_shared">与相册共用（改相册标记）</string>
     <string name="flag_mode_per_target">按目标分开记（不动相册标记）</string>
 
     <string name="action_reset_uploaded">重置已上传标记</string>
-    <string name="summary_reset_uploaded">把相册里标成"已上传"的照片全部退回未上传，让它们重新完整传一遍。用于远端文件缺失、相册却显示已传完的情况</string>
+    <string name="summary_reset_uploaded">把「已上传」全部退回并重传</string>
     <string name="warn_reset_needs_replace">只在「替换：只传 WebDAV」模式下可用</string>
+    <string name="action_rescan_takeover">重新扫描未接管的照片</string>
+    <string name="msg_takeover_running">正在通知相册…</string>
+    <string name="msg_takeover_sent">已通知相册，处理进度见日志</string>
+    <string name="msg_takeover_failed">发送失败：%1$s</string>
+    <string name="msg_app_not_ready">应用未就绪</string>
     <string name="dialog_reset_title">重新完整上传一遍？</string>
     <string name="dialog_reset_summary">相册里所有标成"已上传"的照片都会被退回未上传，然后重新上传一次。照片本身不会被删除或修改，但远端已有的同名文件会被覆盖写，过程可能要很久。此操作不可撤销。</string>
     <string name="action_reset_confirm">开始重置</string>
@@ -118,23 +155,30 @@
     <string name="msg_test_not_writable">服务器可达，但这个目录收不了文件：%1$s</string>
     <string name="msg_fill_url">请先填写服务器地址</string>
 
-    <string name="progress_total">上传总进度</string>
+    <string name="progress_upload_section">上传</string>
+    <string name="progress_download_section">下载</string>
+    <string name="progress_upload_idle">暂无进行中的上传</string>
+    <string name="progress_download_idle">暂无进行中的下载</string>
     <string name="progress_items">已完成 %1$d / %2$d 项</string>
-    <string name="progress_bytes">已传 %1$s / 共 %2$s</string>
-    <string name="progress_queue">队列剩余 %1$d 项 · 图片 %2$d 张 · 视频 %3$d 个</string>
+    <string name="progress_speed">总速度 %1$s</string>
+    <string name="progress_remaining_items">剩余 %1$d 项</string>
+    <string name="progress_eta_seconds">约 %1$d 秒</string>
+    <string name="progress_eta_minutes">约 %1$d 分 %2$d 秒</string>
+    <string name="progress_eta_hours">约 %1$d 小时 %2$d 分</string>
+    <string name="progress_all_done">全部完成</string>
+    <string name="progress_expand_all">展开全部（还剩 %1$d 项）</string>
+    <string name="progress_collapse">收起</string>
     <string name="progress_queued_more">还有 %1$d 项未列出</string>
     <string name="progress_task_queued">排队中</string>
-    <string name="progress_task_queued_down">排队中（下载）</string>
     <string name="progress_percent">%1$d%%</string>
-    <string name="progress_percent_down">下载 %1$d%%</string>
-    <string name="progress_idle">当前没有待上传的照片或视频</string>
+    <string name="progress_task_done">已完成</string>
     <string name="progress_no_data">相册未在备份，或模块未启用</string>
     <string name="progress_stale">进度数据已过期，连接可能已断开</string>
     <string name="progress_unhealthy">WebDAV 暂不可用，正在退避重试；这些照片不会上传到小米云</string>
     <string name="progress_permission_denied">未授予相册读取权限，缩略图不可用（进度仍会更新）</string>
     <string name="action_grant_permission">授予权限</string>
     <string name="label_max_upload_bytes">单文件上限</string>
-    <string name="summary_max_upload_bytes">超过这个大小的文件一个字节都不发，直接跳过（日志记 upload_skip_too_large）。给"挂网盘的后端收不下大文件"准备的逃生口，默认不限</string>
+    <string name="summary_max_upload_bytes">超过就跳过，默认不限</string>
     <string name="size_cap_unlimited">不限</string>
     <string name="size_cap_200mb">200 MB</string>
     <string name="size_cap_500mb">500 MB</string>
