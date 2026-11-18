@@ -947,6 +947,10 @@ public final class DownloadQueue {
                 config = mConfig;
                 generation = mWorkGeneration;
             }
+            // 这一趟计划一共认出多少新项：0 且队列/在传都空，才是"真的没有待下项"
+            int plannedThisPass = 0;
+            // 计划阶段出错时不能把"认出来 0 个"当成"没有待下项"：那可能只是这趟枚举失败了
+            boolean planFailed = false;
             try {
                 if (!refreshPolicyState() || config == null || !config.isReady()) {
                     continue;
@@ -963,9 +967,10 @@ public final class DownloadQueue {
                     mProbeCache.clearListings();
                     planAutoDownloads(config, generation, auto, "registry");
                     if (!auto.isEmpty()) {
-                        enqueue(auto, generation);
+                        plannedThisPass += enqueue(auto, generation);
                     }
                 } catch (Throwable t) {
+                    planFailed = true;
                     Logger.w("event=auto_download_plan_failed phase=registry detail=" + t);
                 }
                 int rounds = mBatchRounds;
@@ -986,12 +991,14 @@ public final class DownloadQueue {
                     try {
                         added = plan(config, generation);
                     } catch (Throwable t) {
+                        planFailed = true;
                         Logger.w("event=download_round_failed detail=" + t);
                         break;
                     }
                     if (added <= 0) {
                         break;
                     }
+                    plannedThisPass += added;
                     if (round == rounds - 1) {
                         Logger.i("event=download_batch_limit rounds=" + rounds);
                     }
@@ -1005,10 +1012,11 @@ public final class DownloadQueue {
                         List<Pending> afterWalk = new ArrayList<>();
                         planAutoDownloads(config, generation, afterWalk, "after_walk");
                         if (!afterWalk.isEmpty()) {
-                            enqueue(afterWalk, generation);
+                            plannedThisPass += enqueue(afterWalk, generation);
                         }
                     }
                 } catch (Throwable t) {
+                    planFailed = true;
                     Logger.w("event=auto_download_plan_failed phase=after_walk detail=" + t);
                 }
                 // 这一轮自动下载的探测缓存收尾：hit = 因为"本轮已经知道答案"而省掉的握手次数，
@@ -1025,6 +1033,12 @@ public final class DownloadQueue {
                     }
                     mLock.notifyAll();
                 }
+            }
+            // 上面 continue 掉的分支走不到这里 —— 只有"完整跑完一趟计划却没认出任何新项"
+            // 才可能是真的没活了，交给发布端在静默期后再决定收尾
+            if (plannedThisPass == 0 && !planFailed) {
+                Logger.i("event=download_plan_idle generation=" + generation);
+                notifyDownloadDrainedIfIdle();
             }
         }
     }
@@ -1057,6 +1071,7 @@ public final class DownloadQueue {
     private int enqueue(List<Pending> found, int generation) {
         int added = 0;
         int damaged = 0;
+        long addedBytes = 0L;
         synchronized (mLock) {
             if (generation != mWorkGeneration || !mRunning) {
                 return 0;
@@ -1074,6 +1089,7 @@ public final class DownloadQueue {
                 }
                 mPending.add(pending);
                 added++;
+                addedBytes += Math.max(pending.size, 0L);
             }
             if (added > 0) {
                 mPendingVersion++;
@@ -1082,7 +1098,38 @@ public final class DownloadQueue {
         }
         Logger.i("event=download_round_planned found=" + found.size() + " added=" + added
                 + " damaged=" + damaged + " queued=" + mPending.size());
+        // 只往进度通道报"这一轮又计划了多少"：会话总量由发布端累加，绝不在这里扣减 ——
+        // 拿"这一轮还剩多少"当总任务，就是进度页上"总任务一直变小"的根因。
+        // 放在锁外调：发布端有自己的锁，别在同一线程里造出队列→发布→队列的反向等待
+        UploadProgressPublisher progressPublisher = mPublisher;
+        if (progressPublisher != null && added > 0) {
+            progressPublisher.autoDownloadPlanned(added, addedBytes);
+        }
         return added;
+    }
+
+    /**
+     * 告诉进度通道"下载这边真的没活了"。
+     *
+     * <p>判据是四条同时成立：队列空、没有在传项、计划线程空闲、也没有还没处理的枚举请求。
+     * 只在**一整趟计划什么都没认出来**之后才调（见 {@link #plannerLoop()}）：
+     * 仅仅"这一批下完了"不能算结束 —— 相册还会再发下一次批事件，把下一批计划出来。
+     * 进度页的下载总任务因此不会在批次之间被打回 0。
+     */
+    private void notifyDownloadDrainedIfIdle() {
+        UploadProgressPublisher publisher = mPublisher;
+        if (publisher == null) {
+            return;
+        }
+        boolean idle;
+        synchronized (mLock) {
+            idle = mRunning && mPending.isEmpty() && mInflight.isEmpty()
+                    && !mPlannerBusy && !mNativeRequestPending;
+        }
+        if (idle) {
+            Logger.i("event=download_drained queued=0 inflight=0");
+            publisher.autoDownloadDrained();
+        }
     }
 
     /** Walk one bounded round and collect remote files that have no local match. */

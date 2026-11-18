@@ -134,6 +134,23 @@ public final class ProgressProtocol {
     public static final String DIR_UP = "up";
     public static final String DIR_DOWN = "down";
 
+    /**
+     * 下载会话的帧字段（后加的，老接收端不认识就忽略；{@code s*} 那组语义不变）。
+     *
+     * <p>为什么必须另开一组：`sTotalItems/sTotalBytes` 是"已完成 + 在传 + 排队里还没轮到的"，
+     * 会随着队列被消费而**单调变小**，拿它当"总任务"就是"12/266 → 12/240"那种观感；
+     * 而"这一轮计划里还剩多少"更是每轮 {@code auto_download_planned} 都重算。下载方向的
+     * 总任务必须是"本次会话里计划过的累计量"，只增不减，只有会话真的结束才归零。
+     */
+    public static final String DOWN_PLANNED_ITEMS = "dPlanItems";
+    public static final String DOWN_PLANNED_BYTES = "dPlanBytes";
+    public static final String DOWN_DONE_ITEMS = "dDoneItems";
+    public static final String DOWN_DONE_BYTES = "dDoneBytes";
+    /** 在传项的已下字节：只用来让进度条在单张图内部也往前走，完成数仍只按整个文件算 */
+    public static final String DOWN_ACTIVE_BYTES = "dActiveBytes";
+    /** 本次下载会话是否已经明确结束（队列与注册表都没有待下项）。true 时客户端可以重置 */
+    public static final String DOWN_ENDED = "dEnded";
+
     private ProgressProtocol() {
     }
 }

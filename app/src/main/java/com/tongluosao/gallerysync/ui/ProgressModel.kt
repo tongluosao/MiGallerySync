@@ -102,6 +102,12 @@ data class ProgressUiState(
     val completed: List<ProgressTask> = emptyList(),
     /** 下载栏里有几项正在传（排队与刚完成都不算） */
     val activeDownloads: Int = 0,
+    /**
+     * 下载会话的累计计数（见 [DownloadSessionCounter]）：总任务只增不减、完成数不超过它。
+     *
+     * <p>帧里没有 `d*` 字段（相册进程还是旧版本）时保持默认值，进度页会退回按行累加。
+     */
+    val downloadSession: DownloadSessionState = DownloadSessionState.EMPTY,
     val pending: Int = 0,
     val pendingPhotos: Int = 0,
     val pendingVideos: Int = 0,
@@ -205,6 +211,12 @@ class ProgressModel {
      * 免得列表里同时出现"已完成"和"排队中"两条同 key。
      */
     private val finishedDown = ArrayList<ProgressTask>()
+
+    /**
+     * 下载会话计数。跨帧有状态，所以挂在模型上而不是帧里：
+     * 帧只给"本帧的累计量"，单调性与重置时机由 [DownloadSessionCounter] 统一管。
+     */
+    private val downloadSessionCounter = DownloadSessionCounter()
 
     private var lastDownCount = 0
 
@@ -362,6 +374,18 @@ class ProgressModel {
             recordFinished(active, now)
             updateSpeedSamples(active, now)
             taskSpeeds = ProgressSections.trackTaskSpeeds(taskSpeeds, active, now)
+            // 下载会话计数：帧里的 `d*` 是发布端累加的"本次会话累计计划量/完成量"，
+            // 这里只负责"只增不减 + 明确结束才重置"，不让渲染层再算一遍
+            val downloadSession = downloadSessionCounter.advance(
+                DownloadSessionFrame(
+                    plannedItems = root.optInt(ProgressProtocol.DOWN_PLANNED_ITEMS, 0),
+                    plannedBytes = root.optLong(ProgressProtocol.DOWN_PLANNED_BYTES, 0L),
+                    doneItems = root.optInt(ProgressProtocol.DOWN_DONE_ITEMS, 0),
+                    doneBytes = root.optLong(ProgressProtocol.DOWN_DONE_BYTES, 0L),
+                    activeBytes = root.optLong(ProgressProtocol.DOWN_ACTIVE_BYTES, 0L),
+                    ended = root.optBoolean(ProgressProtocol.DOWN_ENDED, false)
+                )
+            )
             ProgressUiState(
                 state = root.optString("state", ProgressProtocol.STATE_IDLE),
                 active = active,
@@ -369,6 +393,7 @@ class ProgressModel {
                 tasks = tasks,
                 completed = ArrayList(finishedDown),
                 activeDownloads = tasks.count { it.downloading && it.uploading },
+                downloadSession = downloadSession,
                 pending = root.optInt("pending", 0),
                 pendingPhotos = root.optInt("ph", 0),
                 pendingVideos = root.optInt("pv", 0),

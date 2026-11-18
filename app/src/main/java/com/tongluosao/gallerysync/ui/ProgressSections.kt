@@ -45,6 +45,109 @@ data class SectionProgress(
 }
 
 /**
+ * 下载会话的累计计数（进度页下载区块直接用这一份，渲染层不再自己算）。
+ *
+ * [totalItems]/[totalBytes] 是"进入本次下载会话后计划要下的总量"，只增不减；
+ * [doneItems]/[doneBytes] 是"已经下完的量"，同样只增，并且永远不超过总量。
+ * [ended] 只在收到明确的"没有待下项了"信号后为 true —— 那一帧之后计数归零，
+ * 下一轮下载才有新的会话。
+ */
+data class DownloadSessionState(
+    val totalItems: Int = 0,
+    val doneItems: Int = 0,
+    val totalBytes: Long = 0L,
+    val doneBytes: Long = 0L,
+    val ended: Boolean = false
+) {
+    companion object {
+        val EMPTY = DownloadSessionState()
+    }
+}
+
+/**
+ * 一帧里下载方向的原始计数（发布端给的累计量）。
+ *
+ * @param plannedItems 本次会话累计计划条数（不是"这一轮还剩多少"）
+ * @param plannedBytes 本次会话累计计划字节
+ * @param doneItems 已完成的条数（只算真的落地了的）
+ * @param doneBytes 已完成项的字节（不含在传）
+ * @param activeBytes 在传项已下字节：让进度条在单张图内部也往前走
+ * @param ended 明确的会话结束信号
+ */
+data class DownloadSessionFrame(
+    val plannedItems: Int = 0,
+    val plannedBytes: Long = 0L,
+    val doneItems: Int = 0,
+    val doneBytes: Long = 0L,
+    val activeBytes: Long = 0L,
+    val ended: Boolean = false
+)
+
+/**
+ * 下载会话的计数器：把逐帧的原始计数变成"只增不减"的会话总量。
+ *
+ * <p>这条规则曾经写在渲染层，取的是"当前这一轮计划里还没做完的数量"—— 每轮重新计划一次，
+ * 总任务就掉一截（266 → 240 → 180），完成数还停在当前批次里。现在总量取**累计最大值**，
+ * 完成数按总量夹住，只有会话真的结束才重置。
+ *
+ * <p>纯逻辑：不碰 Android、不读时钟、不存帧以外的东西，单测直接喂数据。
+ */
+class DownloadSessionCounter {
+
+    private var totalItems = 0
+    private var doneItems = 0
+    private var totalBytes = 0L
+    private var doneBytes = 0L
+    /** 上一帧已经明确结束过：下一次有活动的帧从 0 重新累计 */
+    private var ended = false
+
+    /** 吃一帧，返回这一帧之后会话应该显示的计数 */
+    fun advance(frame: DownloadSessionFrame): DownloadSessionState {
+        if (frame.ended) {
+            reset()
+            ended = true
+            return snapshot()
+        }
+        // 上一轮已经结束过：新会话从 0 开始数，不能接着上一轮的 266 往下走
+        if (ended) {
+            reset()
+        }
+        // 总量只增：帧里给的即使是"这一轮还剩多少"（更小的数），也绝不把总量改小
+        totalItems = maxOf(totalItems, frame.plannedItems.coerceAtLeast(0))
+        totalBytes = maxOf(totalBytes, frame.plannedBytes.coerceAtLeast(0L))
+        // 完成数按总量夹住：重试/重复计数不会让"已完成"超过总数
+        doneItems = if (totalItems > 0) {
+            maxOf(doneItems, frame.doneItems.coerceAtLeast(0)).coerceAtMost(totalItems)
+        } else {
+            0
+        }
+        doneBytes = if (totalBytes > 0L) {
+            val raw = frame.doneBytes.coerceAtLeast(0L) + frame.activeBytes.coerceAtLeast(0L)
+            maxOf(doneBytes, raw).coerceAtMost(totalBytes)
+        } else {
+            0L
+        }
+        return snapshot()
+    }
+
+    private fun reset() {
+        totalItems = 0
+        doneItems = 0
+        totalBytes = 0L
+        doneBytes = 0L
+        ended = false
+    }
+
+    private fun snapshot(): DownloadSessionState = DownloadSessionState(
+        totalItems = totalItems,
+        doneItems = doneItems,
+        totalBytes = totalBytes,
+        doneBytes = doneBytes,
+        ended = ended
+    )
+}
+
+/**
  * 列表折叠结果。
  *
  * [hidden] 是**当前**被藏起来的条数（展开后为 0）；[collapsible] 表示这份列表本来就能折
@@ -137,11 +240,42 @@ object ProgressSections {
     /**
      * 下载区块的汇总。
      *
-     * <p>发布端没有下载方向的汇总字段，所以只能按"已列出的行"累加：在传的按 [ProgressTask.sent]
-     * 计、刚完成的按整份体积计、排队的算 0。行本身是帧里带过来的前几十项，
-     * 因此这里的总量是"已列出部分"的意思 —— 界面上不写"共 N 项"这种承诺。
+     * <p>数字取会话计数（[DownloadSessionState]）：总任务 = 本次会话计划累计，完成 = 已下完，
+     * 两者只增不减。这一层不再从"已列出的行"里重算总量 —— 那些行只是帧里带过来的前几十项，
+     * 而且每轮计划都会换一批，拿它当总任务就是"总任务一直变小"的来源。
+     *
+     * <p>唯一的例外是**相册进程还是旧版本**（帧里没有 `d*` 字段）：那时会话计数恒为 0，
+     * 退回按行累加，至少还能看到一个近似值。会话明确结束（[DownloadSessionState.ended]）
+     * 之后不再退回去，否则结束的瞬间又会拿"这一轮的行数"顶上。
      */
     fun download(state: ProgressUiState, speedBytesPerSecond: Long): SectionProgress {
+        val session = state.downloadSession
+        val speed = speedBytesPerSecond.coerceAtLeast(0L)
+        if (session.ended) {
+            // 本轮下载已经真的结束：计数归零，界面回到空态（下一轮从 0 重新累计）
+            return SectionProgress(kind = SectionKind.DOWNLOAD, speedBytesPerSecond = speed)
+        }
+        if (session.totalItems > 0 || session.totalBytes > 0L) {
+            val totalItems = session.totalItems.coerceAtLeast(0)
+            val doneItems = if (totalItems > 0) session.doneItems.coerceIn(0, totalItems) else 0
+            val totalBytes = session.totalBytes.coerceAtLeast(0L)
+            val doneBytes = if (totalBytes > 0L) {
+                session.doneBytes.coerceIn(0L, totalBytes)
+            } else {
+                0L
+            }
+            return SectionProgress(
+                kind = SectionKind.DOWNLOAD,
+                doneItems = doneItems,
+                totalItems = totalItems,
+                doneBytes = doneBytes,
+                totalBytes = totalBytes,
+                speedBytesPerSecond = speed,
+                remainingItems = (totalItems - doneItems).coerceAtLeast(0),
+                remainingBytes = (totalBytes - doneBytes).coerceAtLeast(0L)
+            )
+        }
+        // 旧版本帧的兜底：按已列出的行累加（不写"共 N 项"这种承诺）
         val rows = state.downloads
         var doneBytes = 0L
         var totalBytes = 0L
@@ -160,7 +294,7 @@ object ProgressSections {
             totalItems = rows.size,
             doneBytes = doneBytes,
             totalBytes = totalBytes,
-            speedBytesPerSecond = speedBytesPerSecond.coerceAtLeast(0L),
+            speedBytesPerSecond = speed,
             remainingItems = rows.count { !it.completed },
             remainingBytes = (totalBytes - doneBytes).coerceAtLeast(0L)
         )

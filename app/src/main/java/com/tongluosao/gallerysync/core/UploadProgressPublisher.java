@@ -43,6 +43,20 @@ public final class UploadProgressPublisher {
     private static final long SESSION_GAP_MS = 30_000;
 
     /**
+     * 下载会话收尾前的静默期。
+     *
+     * <p>{@link DownloadQueue} 只有在"计划线程完整跑过一遍、一个新项都没认出、队列与在传集合
+     * 都空"的时候才会报 {@code autoDownloadDrained} —— 那是"没有待下项"的强信号。这里再等
+     * 一个静默期才真的收尾，是为了盖住"相册下一次批事件刚好在路上"的竞态：那一批若是
+     * 又计划出东西，{@link #autoDownloadPlanned} 会先把 drained 清掉，会话继续累计，
+     * 总任务也就不会在批次之间掉下来。
+     */
+    private static final long DOWN_SETTLE_MS = 20_000;
+
+    /** 下载会话采样日志的间隔：2 秒一行，够看出单调性又不刷屏 */
+    private static final long DOWN_PROGRESS_LOG_MS = 2_000;
+
+    /**
      * 一帧里最多带多少个排队中的项。
      *
      * <p>全量首备时队列里能有上万项，全塞进广播就是每帧几百 KB。列表本身是给人看的，
@@ -174,6 +188,28 @@ public final class UploadProgressPublisher {
     private long mDoneBytes;
 
     /**
+     * 下载方向的会话计数，与上面的 {@code mDoneItems/mDoneBytes} 分开。
+     *
+     * <p>上面的累计是**上传下载混在一起**的（{@code s*} 那组字段的语义，不能动）；
+     * 进度页的下载区块要的是"本次要下多少、下完了多少"，混进上传项就会越算越多。
+     */
+    private boolean mDownSessionOpen;
+    /** 会话已经明确结束：帧里带 {@code dEnded}，客户端据此重置 */
+    private boolean mDownEnded;
+    /** 下载队列自己确认过"没有待下项"（计划线程跑完一轮、队列与在传都空） */
+    private boolean mDownDrained;
+    /** 本次下载会话累计计划过的条数/字节（只增，批次之间不清零） */
+    private int mDownPlannedItems;
+    private long mDownPlannedBytes;
+    /** 本次下载会话已完成（成功落地）的条数/字节 */
+    private int mDownDoneItems;
+    private long mDownDoneBytes;
+    /** 下载方向最近一次有动静的时刻：静默期从它开始算 */
+    private long mDownLastActivityAt;
+    /** 上一次打下载会话采样日志的时刻（只在心跳线程里读写） */
+    private long mLastDownProgressLogAt;
+
+    /**
      * 上一次序列化好的排队列表对应的队列版本（每个队列视图一个），以及上次重建的时刻。
      *
      * <p>只有心跳线程碰它，不需要加锁。初始给 MIN_VALUE，保证第一帧一定带上列表。
@@ -217,12 +253,18 @@ public final class UploadProgressPublisher {
     public void taskStart(String key, String name, String path, long size, boolean video,
             String dir) {
         boolean sessionStarted = false;
+        boolean downStarted = false;
         synchronized (mLock) {
             if (!mSessionOpen) {
                 mSessionOpen = true;
                 mDoneItems = 0;
                 mDoneBytes = 0;
                 sessionStarted = true;
+            }
+            if (ProgressProtocol.DIR_DOWN.equals(dir)) {
+                downStarted = openDownloadSessionLocked();
+                mDownDrained = false;
+                mDownLastActivityAt = System.currentTimeMillis();
             }
             mActive.put(key, new Active(key, name, path, size, video, dir));
             mDirty = true;
@@ -231,8 +273,79 @@ public final class UploadProgressPublisher {
         if (sessionStarted) {
             Logger.i("event=progress_session_start key=" + key + " size=" + size);
         }
+        if (downStarted) {
+            Logger.i("event=auto_download_session_start key=" + key + " size=" + size);
+        }
         Logger.d("event=progress_task_start key=" + key + " name=" + name + " size=" + size
                 + " dir=" + dir);
+    }
+
+    /**
+     * 打开下载会话（已经在开着的就不动）。返回 true 表示这次真的开始了一轮新的。
+     *
+     * <p>会话一开始计数就清零：上一轮结束时已经把 {@code dEnded} 发给客户端了，
+     * 这一轮必须从 0 重新累计，不能接着上一轮的 266 往下走。
+     */
+    private boolean openDownloadSessionLocked() {
+        if (mDownSessionOpen) {
+            return false;
+        }
+        mDownSessionOpen = true;
+        mDownEnded = false;
+        mDownPlannedItems = 0;
+        mDownPlannedBytes = 0L;
+        mDownDoneItems = 0;
+        mDownDoneBytes = 0L;
+        mDownDrained = false;
+        mDownLastActivityAt = System.currentTimeMillis();
+        mDirty = true;
+        return true;
+    }
+
+    /**
+     * 下载队列报"这一轮计划进了多少项"。
+     *
+     * <p><b>只增</b>：每次计划都往会话总量上加，批次跑完不清零 —— 那正是"总任务一直变小"
+     * 的根因（旧实现拿到的是"这一轮还剩多少"）。会话结束由 {@link #autoDownloadDrained()}
+     * 通知，不是"这一批跑完了"就算。
+     *
+     * @param items 这一轮新入队的条数
+     * @param bytes 这一轮新入队项的总字节
+     */
+    public void autoDownloadPlanned(int items, long bytes) {
+        if (items <= 0 && bytes <= 0L) {
+            return;
+        }
+        boolean started;
+        synchronized (mLock) {
+            started = openDownloadSessionLocked();
+            mDownPlannedItems += Math.max(items, 0);
+            mDownPlannedBytes += Math.max(bytes, 0L);
+            mDownDrained = false;
+            mDownLastActivityAt = System.currentTimeMillis();
+            mDirty = true;
+            mLock.notifyAll();
+        }
+        if (started) {
+            Logger.i("event=auto_download_session_start items=" + items + " bytes=" + bytes);
+        }
+        Logger.d("event=auto_download_planned_publish items=" + items + " bytes=" + bytes);
+    }
+
+    /**
+     * 下载队列确认"没有待下项了"：计划线程完整跑过一轮却一个新项都没认出，且队列与在传
+     * 集合都空。真正的收尾还要再等 {@link #DOWN_SETTLE_MS} 的静默期，见 {@link #loop()}。
+     *
+     * <p>之所以要由队列来报而不是发布端自己猜：只有队列知道"注册表里也没有待下项"
+     * （那一轮计划跑完、什么都没认出来）；光看"在传集合空了"会把批次之间的间隙
+     * 当成结束，总任务就会在批次之间被打回 0。
+     */
+    public void autoDownloadDrained() {
+        synchronized (mLock) {
+            mDownDrained = true;
+            mDirty = true;
+            mLock.notifyAll();
+        }
     }
 
     /** 兼容"只有上传"的旧调用点：方向按上传处理 */
@@ -336,6 +449,16 @@ public final class UploadProgressPublisher {
                 mDoneItems++;
                 mDoneBytes += removed.size;
             }
+            if (removed != null && ProgressProtocol.DIR_DOWN.equals(removed.dir)) {
+                // 下载的完成数只算"真的落地了"的项：失败/取消的会退回队列重试，
+                // 记进完成数就等于把还没下完的东西算成下完了
+                if (ok) {
+                    mDownDoneItems++;
+                    mDownDoneBytes += Math.max(removed.size, 0L);
+                }
+                mDownDrained = false;
+                mDownLastActivityAt = System.currentTimeMillis();
+            }
             if (mActive.isEmpty()) {
                 mSessionIdleSince = System.currentTimeMillis();
             }
@@ -346,6 +469,54 @@ public final class UploadProgressPublisher {
             Logger.d("event=progress_task_end key=" + key + " ok=" + ok
                     + " sent=" + removed.sent + " size=" + removed.size);
         }
+    }
+
+    /** 在传集合里还有没有下载项（上传项不影响下载会话的收尾） */
+    private boolean hasActiveDownloadLocked() {
+        for (Active active : mActive.values()) {
+            if (ProgressProtocol.DIR_DOWN.equals(active.dir)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 下载会话的采样日志（2 秒一行）。
+     *
+     * <p>现场要判断的就是"总任务有没有变小、完成数有没有停住"，光看 2Hz 的广播是看不出来的
+     * （模块 App 侧不一定在跑）。所以会话开着的时候把累加量按 2 秒记一行：日志里
+     * {@code total} 只增不减、{@code done} 单调向上，就是这条链路的验收证据。
+     */
+    private void logDownloadSessionProgress() {
+        int totalItems;
+        long totalBytes;
+        int doneItems;
+        long doneBytes;
+        long activeBytes = 0L;
+        synchronized (mLock) {
+            if (!mDownSessionOpen) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (now - mLastDownProgressLogAt < DOWN_PROGRESS_LOG_MS) {
+                return;
+            }
+            mLastDownProgressLogAt = now;
+            totalItems = mDownPlannedItems;
+            totalBytes = mDownPlannedBytes;
+            doneItems = mDownDoneItems;
+            doneBytes = mDownDoneBytes;
+            for (Active active : mActive.values()) {
+                if (ProgressProtocol.DIR_DOWN.equals(active.dir)) {
+                    activeBytes += Math.min(Math.max(active.sent, 0L),
+                            Math.max(active.size, 0L));
+                }
+            }
+        }
+        Logger.i("event=download_session_progress total_items=" + totalItems
+                + " done_items=" + doneItems + " total_bytes=" + totalBytes
+                + " done_bytes=" + doneBytes + " active_bytes=" + activeBytes);
     }
 
     /** 关停心跳线程；热重载交接与队列 shutdown 时调 */
@@ -366,6 +537,10 @@ public final class UploadProgressPublisher {
         while (mRunning) {
             boolean dirty;
             int activeCount;
+            boolean downEndedNow = false;
+            int endedItems = 0;
+            long endedBytes = 0L;
+            int endedPlanned = 0;
             synchronized (mLock) {
                 dirty = mDirty;
                 mDirty = false;
@@ -376,8 +551,30 @@ public final class UploadProgressPublisher {
                         && System.currentTimeMillis() - mSessionIdleSince >= SESSION_GAP_MS) {
                     mSessionOpen = false;
                 }
+                // 下载会话收尾：队列确认过"没有待下项"、下载侧也没有在传项、且静默够久。
+                // 三条同时成立才算结束 —— 少任何一条都会在批次之间把总任务打回 0
+                if (mDownSessionOpen && mDownDrained && !hasActiveDownloadLocked()
+                        && System.currentTimeMillis() - mDownLastActivityAt >= DOWN_SETTLE_MS) {
+                    endedPlanned = mDownPlannedItems;
+                    endedItems = mDownDoneItems;
+                    endedBytes = mDownDoneBytes;
+                    mDownSessionOpen = false;
+                    mDownEnded = true;
+                    mDownDrained = false;
+                    mDownPlannedItems = 0;
+                    mDownPlannedBytes = 0L;
+                    mDownDoneItems = 0;
+                    mDownDoneBytes = 0L;
+                    downEndedNow = true;
+                    mDirty = true;
+                }
+            }
+            if (downEndedNow) {
+                Logger.i("event=auto_download_session_end planned=" + endedPlanned
+                        + " done_items=" + endedItems + " done_bytes=" + endedBytes);
             }
             publish();
+            logDownloadSessionProgress();
             long wait = (dirty || activeCount > 0) ? HEARTBEAT_MS : IDLE_WAIT_MS;
             synchronized (mLock) {
                 // 发帧期间又有变化就别睡了，立刻补一帧
@@ -435,16 +632,32 @@ public final class UploadProgressPublisher {
         List<Active> snapshot = new ArrayList<>();
         int doneItems;
         long doneBytes;
+        int downPlannedItems;
+        long downPlannedBytes;
+        int downDoneItems;
+        long downDoneBytes;
+        boolean downEnded;
         synchronized (mLock) {
             snapshot.addAll(mActive.values());
             doneItems = mDoneItems;
             doneBytes = mDoneBytes;
+            downPlannedItems = mDownPlannedItems;
+            downPlannedBytes = mDownPlannedBytes;
+            downDoneItems = mDownDoneItems;
+            downDoneBytes = mDownDoneBytes;
+            downEnded = mDownEnded;
         }
 
         long activeBytes = 0;
+        long downActiveBytes = 0;
         JSONArray activeArray = new JSONArray();
         for (Active active : snapshot) {
             activeBytes += active.size;
+            if (ProgressProtocol.DIR_DOWN.equals(active.dir)) {
+                // 在传项的已下字节：让进度条在一张 20MB 的原图内部也往前走。
+                // 完成数仍只按"整个文件落地"算（见 mDownDoneItems）
+                downActiveBytes += Math.min(Math.max(active.sent, 0L), Math.max(active.size, 0L));
+            }
             JSONObject item = new JSONObject();
             item.put("k", active.key);
             item.put("n", active.name);
@@ -486,6 +699,15 @@ public final class UploadProgressPublisher {
         root.put("sTotalItems", doneItems + snapshot.size() + pendingCount);
         root.put("sDoneBytes", doneBytes);
         root.put("sTotalBytes", doneBytes + activeBytes + pendingBytes);
+        // 下载会话的累计计数（只增）：与上面的 s* 是两套语义，s* 一个字都没改。
+        // s* 里的 total 会随着队列被消费而变小，只能当"还剩多少活"；这里给的才是
+        // "本次要下多少 / 下完了多少"
+        root.put(ProgressProtocol.DOWN_PLANNED_ITEMS, downPlannedItems);
+        root.put(ProgressProtocol.DOWN_PLANNED_BYTES, downPlannedBytes);
+        root.put(ProgressProtocol.DOWN_DONE_ITEMS, downDoneItems);
+        root.put(ProgressProtocol.DOWN_DONE_BYTES, downDoneBytes);
+        root.put(ProgressProtocol.DOWN_ACTIVE_BYTES, downActiveBytes);
+        root.put(ProgressProtocol.DOWN_ENDED, downEnded);
         return root.toString();
     }
 
